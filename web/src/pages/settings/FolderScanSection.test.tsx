@@ -137,4 +137,18 @@ describe('FolderScanSection', () => {
     await waitFor(() => expect(screen.getByText('settings.import.bulkEmpty')).toBeInTheDocument())
     expect(screen.getByText('settings.import.bulkTruncated')).toBeInTheDocument()
   })
+
+  it('clears a stale truncation banner once a later scan reports untruncated', async () => {
+    mockScan.mockResolvedValue({ truncated: true, items: [] })
+    render(<FolderScanSection />)
+    fireEvent.change(screen.getByPlaceholderText('settings.import.bulkPathPlaceholder'), {
+      target: { value: '/dl' },
+    })
+    fireEvent.click(screen.getByText('settings.import.bulkScan'))
+    await waitFor(() => expect(screen.getByText('settings.import.bulkTruncated')).toBeInTheDocument())
+
+    mockScan.mockResolvedValue({ truncated: false, items: [] })
+    fireEvent.click(screen.getByText('settings.import.bulkScan'))
+    await waitFor(() => expect(screen.queryByText('settings.import.bulkTruncated')).not.toBeInTheDocument())
+  })
 })

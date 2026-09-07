@@ -4,6 +4,7 @@ import { api } from '../api/client'
 import { resolveBookQuery } from '../api/booklookup'
 import type { BatchImportItem, BatchImportResult, Book, ScanItem } from '../api/client'
 import { btn, btnSize } from '../components/buttons'
+import { useFolderScan } from '../components/useFolderScan'
 
 // ManualImportPage is the manual-import wizard (#1236). It scans a folder with
 // the recursive bulk-import scan (#1434), groups the discovered units by match
@@ -44,53 +45,31 @@ function groupHeading(match: ScanItem['match']): string {
 
 export default function ManualImportPage() {
   const { t } = useTranslation()
-  const [path, setPath] = useState('')
-  const [scanning, setScanning] = useState(false)
-  const [items, setItems] = useState<ScanItem[] | null>(null)
-  const [truncated, setTruncated] = useState(false)
-  const [showImported, setShowImported] = useState(false)
   const [rows, setRows] = useState<Record<string, RowState>>({})
   const [results, setResults] = useState<Record<string, BatchImportResult>>({})
   const [importingPaths, setImportingPaths] = useState<Set<string>>(() => new Set())
-  const [scanError, setScanError] = useState('')
   const [importError, setImportError] = useState('')
+
+  const folderScan = useFolderScan(scanned => {
+    setResults({})
+    const init: Record<string, RowState> = {}
+    for (const it of scanned) {
+      const chosen = it.match === 'confident' && it.book ? it.book : null
+      init[it.path] = { chosen, format: it.detectedFormat || '', selected: Boolean(chosen) && !it.alreadyImported }
+    }
+    setRows(init)
+  })
+  const { path, setPath, scanning, items, truncated, showImported, error: scanError, toggleShowImported } = folderScan
 
   useEffect(() => {
     document.title = 'Manual Import · Bindery'
     return () => { document.title = 'Bindery' }
   }, [])
 
-  const runScan = async (includeImported: boolean) => {
-    const p = path.trim()
-    if (!p) return
-    setScanning(true)
-    setScanError('')
-    setImportError('')
-    setItems(null)
-    setResults({})
-    try {
-      const r = await api.scanFolder(p, { includeImported })
-      setItems(r.items)
-      setTruncated(r.truncated)
-      const init: Record<string, RowState> = {}
-      for (const it of r.items) {
-        const chosen = it.match === 'confident' && it.book ? it.book : null
-        init[it.path] = { chosen, format: it.detectedFormat || '', selected: Boolean(chosen) && !it.alreadyImported }
-      }
-      setRows(init)
-    } catch (e) {
-      setScanError(e instanceof Error ? e.message : 'Scan failed')
-    } finally {
-      setScanning(false)
-    }
-  }
-
-  const handleScan = () => runScan(showImported)
-
-  const toggleShowImported = (checked: boolean) => {
-    setShowImported(checked)
-    if (items) runScan(checked)
-  }
+  // A scan attempt (fresh or re-triggered by the toggle) supersedes whatever
+  // the last import attempt reported.
+  const handleScan = () => { setImportError(''); folderScan.scan() }
+  const handleToggleShowImported = (checked: boolean) => { setImportError(''); toggleShowImported(checked) }
 
   const patchRow = (unitPath: string, patch: Partial<RowState>) =>
     setRows(prev => ({ ...prev, [unitPath]: { ...prev[unitPath], ...patch } }))
@@ -149,8 +128,11 @@ export default function ManualImportPage() {
   const toggleSelectAll = () => {
     if (!items) return
     // Resolved, not-yet-imported units only — a `none` unit with no book can't
-    // be selected.
+    // be selected. Already-imported units are deliberately left out of "select
+    // all" too: they start unchecked so a bulk action can't silently re-import
+    // them, and a bulk toggle re-including them here would defeat that (#2480).
     const resolvable = items
+      .filter(it => !it.alreadyImported)
       .map(it => it.path)
       .filter(p => rows[p]?.chosen && !results[p]?.accepted)
     const turnOn = !resolvable.every(p => rows[p]?.selected)
@@ -201,7 +183,7 @@ export default function ManualImportPage() {
         <input
           type="checkbox"
           checked={showImported}
-          onChange={e => toggleShowImported(e.target.checked)}
+          onChange={e => handleToggleShowImported(e.target.checked)}
           disabled={scanning}
           className="rounded border-slate-400 dark:border-zinc-600 text-emerald-600 focus:ring-emerald-500 focus:ring-offset-0"
         />
@@ -404,7 +386,7 @@ function ImportRow({ item, row, result, importing, onPick, onToggle, onFormat, o
           <button
             type="button"
             onClick={onImport}
-            disabled={!chosen || importing || Boolean(accepted)}
+            disabled={!chosen || !row?.selected || importing || Boolean(accepted)}
             className={`${btn.secondary} ${btnSize.sm}`}
           >
             {importing ? t('manualImport.importing', 'Importing…') : t('manualImport.import', 'Import')}
