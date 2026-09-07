@@ -287,4 +287,49 @@ describe('ManualImportPage', () => {
     await waitFor(() => expect(screen.getByText('manualImport.empty')).toBeInTheDocument())
     expect(screen.getByText('manualImport.truncated')).toBeInTheDocument()
   })
+
+  it('clears a stale truncation banner once a later scan reports untruncated', async () => {
+    mockScan.mockResolvedValue({ truncated: true, items: [] })
+    render(<ManualImportPage />)
+    fireEvent.change(screen.getByPlaceholderText('manualImport.pathPlaceholder'), { target: { value: '/dl' } })
+    fireEvent.click(screen.getByText('manualImport.scan'))
+    await waitFor(() => expect(screen.getByText('manualImport.truncated')).toBeInTheDocument())
+
+    // A second scan (e.g. after narrowing the folder) that is NOT truncated
+    // must not leave the earlier banner showing.
+    mockScan.mockResolvedValue({ truncated: false, items: [] })
+    fireEvent.click(screen.getByText('manualImport.scan'))
+    await waitFor(() => expect(screen.queryByText('manualImport.truncated')).not.toBeInTheDocument())
+  })
+
+  it('does not let "select all" re-select an already-imported unit', async () => {
+    await scan()
+    mockScan.mockClear()
+    mockScan.mockResolvedValue({
+      truncated: false,
+      items: [{
+        path: '/dl/Already Imported', name: 'Already Imported', match: 'confident',
+        parsedTitle: 'Already Imported', parsedAuthor: '', detectedFormat: 'ebook',
+        book: { id: 33, title: 'Already Imported' } as never, alreadyImported: true,
+      }],
+    })
+    fireEvent.click(screen.getByLabelText('manualImport.showImported'))
+    await screen.findByText('Already Imported')
+
+    // Starts unchecked and the per-row Import button starts disabled — the
+    // whole point of not preselecting an already-imported match.
+    const rowCheckbox = screen.getByLabelText('manualImport.selectUnit name=Already Imported') as HTMLInputElement
+    expect(rowCheckbox.checked).toBe(false)
+    const importButtons = screen.getAllByText('manualImport.import') as HTMLButtonElement[]
+    expect(importButtons[importButtons.length - 1].disabled).toBe(true)
+
+    // "Select all matched" must not silently sweep it in.
+    fireEvent.click(screen.getByLabelText('manualImport.selectAll'))
+    expect(rowCheckbox.checked).toBe(false)
+
+    // Checking it by hand is still how you'd deliberately re-import it.
+    fireEvent.click(rowCheckbox)
+    expect(rowCheckbox.checked).toBe(true)
+    expect(importButtons[importButtons.length - 1].disabled).toBe(false)
+  })
 })

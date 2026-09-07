@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api, BatchImportItem, BatchImportResponse, Book, HardcoverList, ImportList, ImportListSyncProgress, ManagedUser, ManualImportLookup, ScanItem } from '../../api/client'
+import { useFolderScan } from '../../components/useFolderScan'
 import { inputCls } from './formStyles'
 import GoodreadsImportSection from './GoodreadsImportSection'
 
@@ -275,44 +276,23 @@ interface ScanRowState {
 // first); unmatched units are listed but cannot be selected. Exported for tests.
 export function FolderScanSection() {
   const { t } = useTranslation()
-  const [path, setPath] = useState('')
-  const [scanning, setScanning] = useState(false)
-  const [items, setItems] = useState<ScanItem[] | null>(null)
-  const [truncated, setTruncated] = useState(false)
-  const [showImported, setShowImported] = useState(false)
   const [rows, setRows] = useState<ScanRowState[]>([])
   const [importing, setImporting] = useState(false)
   const [summary, setSummary] = useState<BatchImportResponse | null>(null)
-  const [err, setErr] = useState<string | null>(null)
+  const [importErr, setImportErr] = useState<string | null>(null)
 
-  const runScan = async (includeImported: boolean) => {
-    if (!path.trim()) return
-    setScanning(true)
-    setErr(null)
-    setItems(null)
-    setSummary(null)
-    try {
-      const r = await api.scanFolder(path.trim(), { includeImported })
-      setItems(r.items)
-      setTruncated(r.truncated)
-      setRows(r.items.map(it => ({
-        include: it.match === 'confident' && !it.alreadyImported,
-        bookId: it.match === 'confident' && it.book ? it.book.id : null,
-        format: it.detectedFormat || '',
-      })))
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Scan failed')
-    } finally {
-      setScanning(false)
-    }
-  }
+  const folderScan = useFolderScan(items => setRows(items.map(it => ({
+    include: it.match === 'confident' && !it.alreadyImported,
+    bookId: it.match === 'confident' && it.book ? it.book.id : null,
+    format: it.detectedFormat || '',
+  }))))
+  const { path, setPath, scanning, items, truncated, showImported, scan, toggleShowImported } = folderScan
 
-  const handleScan = () => runScan(showImported)
-
-  const toggleShowImported = (checked: boolean) => {
-    setShowImported(checked)
-    if (items) runScan(checked)
-  }
+  // A scan attempt (fresh or re-triggered by the toggle) supersedes whatever
+  // the last import attempt reported.
+  const handleScan = () => { setSummary(null); setImportErr(null); scan() }
+  const handleToggleShowImported = (checked: boolean) => { setSummary(null); setImportErr(null); toggleShowImported(checked) }
+  const err = folderScan.error ?? importErr
 
   const patchRow = (i: number, patch: Partial<ScanRowState>) =>
     setRows(prev => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)))
@@ -327,12 +307,12 @@ export function FolderScanSection() {
     })
     if (batch.length === 0) return
     setImporting(true)
-    setErr(null)
+    setImportErr(null)
     try {
       const res = await api.batchImport(batch)
       setSummary(res)
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Import failed')
+      setImportErr(e instanceof Error ? e.message : 'Import failed')
     } finally {
       setImporting(false)
     }
@@ -359,7 +339,7 @@ export function FolderScanSection() {
           className={inputCls + ' flex-1'}
           placeholder={t('settings.import.bulkPathPlaceholder', '/downloads/books')}
           value={path}
-          onChange={e => { setPath(e.target.value); setItems(null); setSummary(null) }}
+          onChange={e => { setPath(e.target.value); folderScan.clear(); setSummary(null) }}
           onKeyDown={e => { if (e.key === 'Enter') handleScan() }}
         />
         <button
@@ -375,7 +355,7 @@ export function FolderScanSection() {
         <input
           type="checkbox"
           checked={showImported}
-          onChange={e => toggleShowImported(e.target.checked)}
+          onChange={e => handleToggleShowImported(e.target.checked)}
           disabled={scanning}
           className="rounded border-slate-400 dark:border-zinc-600 text-emerald-600 focus:ring-emerald-500 focus:ring-offset-0"
         />
