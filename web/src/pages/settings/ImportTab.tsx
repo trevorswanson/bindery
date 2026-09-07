@@ -279,23 +279,24 @@ export function FolderScanSection() {
   const [scanning, setScanning] = useState(false)
   const [items, setItems] = useState<ScanItem[] | null>(null)
   const [truncated, setTruncated] = useState(false)
+  const [showImported, setShowImported] = useState(false)
   const [rows, setRows] = useState<ScanRowState[]>([])
   const [importing, setImporting] = useState(false)
   const [summary, setSummary] = useState<BatchImportResponse | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
-  const handleScan = async () => {
+  const runScan = async (includeImported: boolean) => {
     if (!path.trim()) return
     setScanning(true)
     setErr(null)
     setItems(null)
     setSummary(null)
     try {
-      const r = await api.scanFolder(path.trim())
+      const r = await api.scanFolder(path.trim(), { includeImported })
       setItems(r.items)
       setTruncated(r.truncated)
       setRows(r.items.map(it => ({
-        include: it.match === 'confident',
+        include: it.match === 'confident' && !it.alreadyImported,
         bookId: it.match === 'confident' && it.book ? it.book.id : null,
         format: it.detectedFormat || '',
       })))
@@ -304,6 +305,13 @@ export function FolderScanSection() {
     } finally {
       setScanning(false)
     }
+  }
+
+  const handleScan = () => runScan(showImported)
+
+  const toggleShowImported = (checked: boolean) => {
+    setShowImported(checked)
+    if (items) runScan(checked)
   }
 
   const patchRow = (i: number, patch: Partial<ScanRowState>) =>
@@ -346,7 +354,7 @@ export function FolderScanSection() {
         {t('settings.import.bulkDescription', 'Scan a folder (e.g. your download directory) and import every book it can match to your library in one go. Matching is against books already in your library, so add the authors first. Unmatched items are listed but skipped.')}
       </p>
 
-      <div className="flex gap-2 mb-3">
+      <div className="flex gap-2 mb-2">
         <input
           className={inputCls + ' flex-1'}
           placeholder={t('settings.import.bulkPathPlaceholder', '/downloads/books')}
@@ -363,15 +371,27 @@ export function FolderScanSection() {
         </button>
       </div>
 
+      <label className="flex items-center gap-1.5 mb-3 text-xs text-slate-600 dark:text-zinc-400 cursor-pointer select-none w-fit">
+        <input
+          type="checkbox"
+          checked={showImported}
+          onChange={e => toggleShowImported(e.target.checked)}
+          disabled={scanning}
+          className="rounded border-slate-400 dark:border-zinc-600 text-emerald-600 focus:ring-emerald-500 focus:ring-offset-0"
+        />
+        {t('settings.import.bulkShowImported', 'Show already imported')}
+      </label>
+
+      {truncated && (
+        <p className="text-xs text-amber-700 dark:text-amber-400 mb-2">{t('settings.import.bulkTruncated', 'Showing the first 1000 items; narrow the folder to see the rest.')}</p>
+      )}
+
       {items && items.length === 0 && (
         <p className="text-sm text-slate-500 dark:text-zinc-600">{t('settings.import.bulkEmpty', 'No book files or folders found here.')}</p>
       )}
 
       {items && items.length > 0 && !summary && (
         <div className="space-y-2">
-          {truncated && (
-            <p className="text-xs text-amber-700 dark:text-amber-400">{t('settings.import.bulkTruncated', 'Showing the first 1000 items; narrow the folder to see the rest.')}</p>
-          )}
           <div className="border border-slate-200 dark:border-zinc-800 rounded divide-y divide-slate-200 dark:divide-zinc-800 max-h-96 overflow-auto">
             {items.map((it, i) => {
               const row = rows[i]
@@ -391,6 +411,11 @@ export function FolderScanSection() {
                       <span className="font-medium truncate">{it.name}</span>
                       {matchBadge(it.match)}
                       <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{it.detectedFormat}</span>
+                      {it.alreadyImported && (
+                        <span className="text-[10px] px-1.5 py-0.5 bg-sky-100 dark:bg-sky-950 text-sky-700 dark:text-sky-400 rounded">
+                          {t('settings.import.bulkAlreadyImported', 'already imported')}
+                        </span>
+                      )}
                     </div>
                     {/* Full source path so the user can tell which file a match
                         (or the ambiguous picker below) refers to — the basename
