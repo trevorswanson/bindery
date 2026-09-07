@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/vavallee/bindery/internal/importer"
 )
 
 // statExistingDevice stats p, walking up to the nearest existing ancestor
@@ -47,34 +49,27 @@ func nearestExistingDir(p string) string {
 }
 
 // confirmedCrossDevice reports whether a and b are POSITIVELY confirmed to
-// reside on different filesystems by comparing their OS device IDs, walking
-// up to b's nearest existing ancestor when b does not exist yet. It returns
-// false — "not confirmed cross-device" — on any stat error or when the
-// device ID isn't exposed, deliberately erring toward the more expensive but
-// always-correct path rather than skipping a check we can't actually verify.
-// Used by the manual-import scan's tracked-file stat sweep (#2480) to skip
-// hardlink detection only for tracked paths that could never be a hardlink of
-// a scanned candidate; mirrors the same-device gate in hardlinkableReason
-// below (kept separate: that one needs the inverse, "confirmed same", plus
-// per-cause error messages this boolean doesn't carry).
+// reside on different filesystems, walking up to b's nearest existing
+// ancestor when b does not exist yet. It returns false — "not confirmed
+// cross-device" — on any stat error, deliberately erring toward the more
+// expensive but always-correct path rather than skipping a check we can't
+// actually verify. Used by the manual-import scan's tracked-file stat sweep
+// (#2480) to skip hardlink detection only for tracked paths that could never
+// be a hardlink of a scanned candidate. The device comparison itself is
+// importer.SameDevice — this package already depends on internal/importer
+// throughout (manual_import.go, scan_walk.go, books.go, ...), so there is no
+// dependency reason to keep a second copy of that comparison here.
 func confirmedCrossDevice(a, b string) bool {
 	if a == "" || b == "" {
 		return false
 	}
-	ai, err := os.Stat(a)
-	if err != nil {
+	if _, err := os.Stat(a); err != nil {
 		return false
 	}
-	bi, err := statExistingDevice(b)
-	if err != nil {
+	if _, err := statExistingDevice(b); err != nil {
 		return false
 	}
-	aStat, aOK := ai.Sys().(*syscall.Stat_t)
-	bStat, bOK := bi.Sys().(*syscall.Stat_t)
-	if !aOK || !bOK {
-		return false
-	}
-	return aStat.Dev != bStat.Dev
+	return !importer.SameDevice(a, b)
 }
 
 // deviceID returns path's OS device ID as a cache key: two paths returning
