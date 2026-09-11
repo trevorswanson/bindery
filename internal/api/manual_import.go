@@ -40,6 +40,9 @@ type ManualImportHandler struct {
 	// drain them before the database closes (#1458, #2371). Optional: without
 	// it they run untracked, which is what tests and non-wired callers get.
 	jobs *jobs.Group
+	// trackedCache holds Scan's already-tracked index, rebuilt only when
+	// book_files changes (see trackedFileIndex, #2480).
+	trackedCache trackedFileCache
 }
 
 func NewManualImportHandler(scanner manualImportScanner, downloads *db.DownloadRepo, books *db.BookRepo) *ManualImportHandler {
@@ -457,30 +460,24 @@ func directoryMatchesTracked(path string, tracked map[string]struct{}, trackedFi
 }
 
 // bookHasImportedFormat reports whether the matched book already has an
-// on-disk file or directory for format. Manual import's idempotency guard will
-// skip such a candidate, so presenting it in the scan only creates a row that
-// appears importable but can never change state.
-func bookHasImportedFormat(book *models.Book, format string) bool {
+// on-disk file or directory for format. Read book_files directly rather than
+// relying on the hydrated compatibility fields on models.Book: LookupBatchLayout
+// may receive a book value from a catalogue projection where those fields are
+// empty even though the tracking row exists. This must match the importer's
+// idempotency guard, or a copied manual-import source will keep reappearing.
+func bookHasImportedFormat(book *models.Book, format string, files []models.BookFile) bool {
 	if book == nil {
 		return false
 	}
-	var path string
-	switch format {
-	case models.MediaTypeAudiobook:
-		path = book.AudiobookFilePath
-	case models.MediaTypeEbook:
-		path = book.EbookFilePath
-		if path == "" {
-			path = book.FilePath
+	for _, file := range files {
+		if file.Format != format {
+			continue
 		}
-	default:
-		return false
+		if _, err := os.Stat(file.Path); err == nil {
+			return true
+		}
 	}
-	if path == "" {
-		return false
-	}
-	_, err := os.Stat(path)
-	return err == nil
+	return false
 }
 
 // ScanItem is one candidate book unit discovered under a folder during Scan.
@@ -493,6 +490,13 @@ type ScanItem struct {
 	DetectedFormat string        `json:"detectedFormat"`
 	Book           *models.Book  `json:"book,omitempty"`
 	Candidates     []models.Book `json:"candidates,omitempty"`
+	// AlreadyImported reports whether this unit is already tracked in
+	// book_files (directly, as a hardlink of a tracked file, or as a
+	// confident catalogue match whose book already has that format on disk).
+	// Such units are excluded by default; includeImported=true surfaces them
+	// instead, labelled, so a corrupt file or one needing a relink can still
+	// be found through this scan (#2480).
+	AlreadyImported bool `json:"alreadyImported"`
 }
 
 // ScanResponse is the result of scanning a folder for importable book units.
@@ -504,6 +508,15 @@ type ScanResponse struct {
 // maxScanEntries caps how many book units a single Scan returns so pointing at
 // an enormous tree can't produce an unbounded response or stall the request.
 const maxScanEntries = 1000
+
+// maxScanRounds bounds how many times Scan re-walks the tree to refill the
+// page after the already-imported filters drop some of a round's candidates
+// (#2480). enumerateImportUnits has no way to resume mid-tree, so each round
+// re-walks from the root; the cap bounds the worst case — a library that has
+// already been entirely re-imported — to a small constant multiple of a
+// single walk's cost, consistent with the existing maxWalkEntries/maxWalkDepth
+// guards.
+const maxScanRounds = 4
 
 // resolveImportFolder validates the user-selected scan folder and returns the
 // symlink-resolved path that is safe for subsequent filesystem operations.
@@ -531,20 +544,57 @@ func (h *ManualImportHandler) resolveImportFolder(ctx context.Context, rawPath s
 	return resolved, 0, ""
 }
 
-// Scan handles GET /api/v1/queue/manual-import/scan?path=...
+// isAlreadyTracked reports whether path (a file or, when isDir, a directory
+// unit) is already present in book_files, either at the exact path (tracked)
+// or as a hardlink of one (trackedFiles, via fileMatchesTracked /
+// directoryMatchesTracked).
+func isAlreadyTracked(path string, isDir bool, tracked map[string]struct{}, trackedFiles []os.FileInfo) bool {
+	if isDir {
+		return directoryMatchesTracked(path, tracked, trackedFiles)
+	}
+	if _, ok := tracked[filepath.Clean(path)]; ok {
+		return true
+	}
+	return fileMatchesTracked(path, trackedFiles)
+}
+
+// Scan handles GET /api/v1/queue/manual-import/scan?path=...&includeImported=...
 // It walks a folder RECURSIVELY (issue #1434), enumerating individual ebook
 // files as units at whatever depth they live while keeping a genuine
 // folder-based audiobook as a single unit, and runs one catalogue-backed batch
 // lookup — matching by embedded EPUB metadata and folder-derived author, not the
 // filename alone — returning a per-unit match list to review and bulk-import. No
 // state is modified.
+//
+// Units already tracked in book_files (directly, via a hardlink, or as a
+// confident match whose book already has that format on disk) are filtered
+// out during the walk itself rather than after enumerateImportUnits' 1000-unit
+// cap — filtering the capped result let an already-imported folder starve the
+// cap and come back empty even though untracked files existed further down
+// the tree (#2480). When the post-lookup format check still drops units from
+// a round, Scan re-walks (bounded by maxScanRounds) to refill the page rather
+// than return a short page while truncated is still true.
+//
+// includeImported=true disables both filters and labels each unit's
+// AlreadyImported status instead of excluding it, so an already-imported file
+// that's corrupt or needs a relink can still be found here.
 func (h *ManualImportHandler) Scan(w http.ResponseWriter, r *http.Request) {
 	path, status, message := h.resolveImportFolder(r.Context(), r.URL.Query().Get("path"))
 	if status != 0 {
 		writeJSON(w, status, map[string]string{"error": message})
 		return
 	}
+	includeImported := r.URL.Query().Get("includeImported") == "true"
 	start := time.Now()
+
+	tracked, trackedFiles, err := h.trackedFileIndex(r.Context(), path)
+	if err != nil {
+		slog.Error("bulk folder import scan failed to load tracked files", "path", path, "error", err)
+		writeServerError(w, r, err)
+		return
+	}
+
+	slog.Info("bulk folder import scan started", "path", path, "includeImported", includeImported)
 
 	// Enumerate importable units by walking the tree RECURSIVELY (issue #1434):
 	// individual ebook files become units at whatever depth they live, while a
@@ -554,99 +604,100 @@ func (h *ManualImportHandler) Scan(w http.ResponseWriter, r *http.Request) {
 	// happened to match. A single catalogue-backed batch lookup then matches them
 	// all at once — the per-item full-table scan that stalled large scans past the
 	// server WriteTimeout stays fixed (issue #1473).
-	cands, truncated := enumerateImportUnits(path, maxScanEntries)
+	items := make([]ScanItem, 0, maxScanEntries)
+	matched := 0
+	truncated := false
+	alreadyConsumed := 0
+	roundsRun := 0
 
-	slog.Info("bulk folder import scan started", "path", path, "entries", len(cands), "truncated", truncated)
+	for round := 0; round < maxScanRounds; round++ {
+		remaining := maxScanEntries - len(items)
+		if remaining <= 0 {
+			break
+		}
+		roundsRun++
+		seen := 0
+		skipToOffset := alreadyConsumed
+		roundSkip := func(p string, isDir bool) bool {
+			if !includeImported && isAlreadyTracked(p, isDir, tracked, trackedFiles) {
+				return true
+			}
+			seen++
+			return seen <= skipToOffset
+		}
+		cands, roundTruncated := enumerateImportUnits(path, remaining, roundSkip)
+		truncated = roundTruncated
+		alreadyConsumed += len(cands)
+		if len(cands) == 0 {
+			break
+		}
 
-	paths := make([]string, len(cands))
-	for i, c := range cands {
-		paths[i] = c.path
-	}
-	trackedPaths, err := h.books.ListAllBookFilePaths(r.Context())
-	if err != nil {
-		slog.Error("bulk folder import scan failed to load tracked files", "path", path, "error", err)
-		writeServerError(w, r, err)
-		return
-	}
-	tracked := make(map[string]struct{}, len(trackedPaths))
-	trackedFiles := make([]os.FileInfo, 0, len(trackedPaths))
-	for _, trackedPath := range trackedPaths {
-		cleaned := filepath.Clean(trackedPath)
-		tracked[cleaned] = struct{}{}
-		if info, statErr := os.Stat(cleaned); statErr == nil {
-			trackedFiles = append(trackedFiles, info)
-			if info.IsDir() {
-				_ = filepath.WalkDir(cleaned, func(p string, entry os.DirEntry, walkErr error) error {
-					if walkErr == nil && !entry.IsDir() && (importer.IsEbookFile(p) || importer.IsAudioFile(p)) {
-						if childInfo, childErr := os.Stat(p); childErr == nil {
-							trackedFiles = append(trackedFiles, childInfo)
-						}
-					}
-					return nil
-				})
+		roundPaths := make([]string, len(cands))
+		for i, c := range cands {
+			roundPaths[i] = c.path
+		}
+		results, err := h.scanner.LookupBatchLayout(r.Context(), path, roundPaths)
+		if err != nil {
+			slog.Error("bulk folder import scan failed to load catalogue", "path", path, "error", err)
+			writeServerError(w, r, err)
+			return
+		}
+
+		// Batch the confident matches' book_files lookup into one query instead
+		// of one round trip per match (#2480).
+		bookIDs := make([]int64, 0, len(results))
+		seenBookIDs := make(map[int64]bool, len(results))
+		for _, res := range results {
+			if res.Match == "confident" && res.Book != nil && !seenBookIDs[res.Book.ID] {
+				seenBookIDs[res.Book.ID] = true
+				bookIDs = append(bookIDs, res.Book.ID)
 			}
 		}
-	}
-	filteredCands := cands[:0]
-	for _, c := range cands {
-		alreadyTracked := false
-		if c.isDir {
-			alreadyTracked = directoryMatchesTracked(c.path, tracked, trackedFiles)
-		} else {
-			_, alreadyTracked = tracked[filepath.Clean(c.path)]
-			alreadyTracked = alreadyTracked || fileMatchesTracked(c.path, trackedFiles)
+		filesByBook, err := h.books.ListFilesForBooks(r.Context(), bookIDs)
+		if err != nil {
+			slog.Warn("bulk folder import scan could not verify matched book files; retaining candidates",
+				"path", path, "error", err)
+			filesByBook = map[int64][]models.BookFile{}
 		}
-		if alreadyTracked {
-			continue
-		}
-		filteredCands = append(filteredCands, c)
-	}
-	cands = filteredCands
-	paths = paths[:0]
-	for _, c := range cands {
-		paths = append(paths, c.path)
-	}
-	results, err := h.scanner.LookupBatchLayout(r.Context(), path, paths)
-	if err != nil {
-		slog.Error("bulk folder import scan failed to load catalogue", "path", path, "error", err)
-		writeServerError(w, r, err)
-		return
-	}
-	filteredCands = cands[:0]
-	filteredResults := results[:0]
-	for i, res := range results {
-		if res.Match == "confident" && bookHasImportedFormat(res.Book, res.DetectedFormat) {
-			continue
-		}
-		filteredCands = append(filteredCands, cands[i])
-		filteredResults = append(filteredResults, res)
-	}
-	cands = filteredCands
-	results = filteredResults
 
-	resp := ScanResponse{Items: make([]ScanItem, 0, len(cands)), Truncated: truncated}
-	matched := 0
-	for i, c := range cands {
-		res := results[i]
-		if res.Match == "confident" {
-			matched++
+		for i, res := range results {
+			c := cands[i]
+			alreadyImported := isAlreadyTracked(c.path, c.isDir, tracked, trackedFiles)
+			if !alreadyImported && res.Match == "confident" && res.Book != nil &&
+				bookHasImportedFormat(res.Book, res.DetectedFormat, filesByBook[res.Book.ID]) {
+				alreadyImported = true
+			}
+			if alreadyImported && !includeImported {
+				continue
+			}
+			if res.Match == "confident" {
+				matched++
+			}
+			items = append(items, ScanItem{
+				Path:            c.path,
+				Name:            c.name,
+				Match:           res.Match,
+				ParsedTitle:     res.ParsedTitle,
+				ParsedAuthor:    res.ParsedAuthor,
+				DetectedFormat:  res.DetectedFormat,
+				Book:            res.Book,
+				Candidates:      res.Candidates,
+				AlreadyImported: alreadyImported,
+			})
 		}
-		resp.Items = append(resp.Items, ScanItem{
-			Path:           c.path,
-			Name:           c.name,
-			Match:          res.Match,
-			ParsedTitle:    res.ParsedTitle,
-			ParsedAuthor:   res.ParsedAuthor,
-			DetectedFormat: res.DetectedFormat,
-			Book:           res.Book,
-			Candidates:     res.Candidates,
-		})
+
+		if !roundTruncated {
+			break // tree exhausted; nothing more to find regardless of round budget
+		}
 	}
+
+	resp := ScanResponse{Items: items, Truncated: truncated}
 	slog.Info("bulk folder import scan complete",
 		"path", path,
 		"duration", time.Since(start),
 		"items", len(resp.Items),
 		"matched", matched,
+		"rounds", roundsRun,
 		"truncated", truncated)
 	writeJSON(w, http.StatusOK, resp)
 }
