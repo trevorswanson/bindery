@@ -152,9 +152,21 @@ export default function ManualImportPage() {
   return (
     <div>
       <div className="mb-6">
-        <h2 className="text-xl font-semibold text-slate-900 dark:text-white">
-          {t('manualImport.title', 'Manual Import')}
-        </h2>
+        <div className="flex items-center gap-3">
+          <h2 className="text-xl font-semibold text-slate-900 dark:text-white">
+            {t('manualImport.title', 'Manual Import')}
+          </h2>
+          <label className="ml-auto flex items-center gap-1.5 text-xs text-slate-600 dark:text-zinc-400 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={showImported}
+              onChange={e => handleToggleShowImported(e.target.checked)}
+              disabled={scanning}
+              className="rounded border-slate-400 dark:border-zinc-600 text-emerald-600 focus:ring-emerald-500 focus:ring-offset-0"
+            />
+            {t('manualImport.showImported', 'Show already imported')}
+          </label>
+        </div>
         <p className="mt-1 text-sm text-slate-600 dark:text-zinc-400">
           {t('manualImport.description', 'Scan a folder of files already on disk, match each book to your library, and import them. A file with no match can be added from a metadata search.')}
         </p>
@@ -178,17 +190,6 @@ export default function ManualImportPage() {
           {scanning ? t('manualImport.scanning', 'Scanning…') : t('manualImport.scan', 'Scan folder')}
         </button>
       </div>
-
-      <label className="mb-4 flex w-fit cursor-pointer select-none items-center gap-1.5 text-xs text-slate-600 dark:text-zinc-400">
-        <input
-          type="checkbox"
-          checked={showImported}
-          onChange={e => handleToggleShowImported(e.target.checked)}
-          disabled={scanning}
-          className="rounded border-slate-400 dark:border-zinc-600 text-emerald-600 focus:ring-emerald-500 focus:ring-offset-0"
-        />
-        {t('manualImport.showImported', 'Show already imported')}
-      </label>
 
       {scanError && (
         <p className="mb-4 text-sm text-red-600 dark:text-red-400">{scanError}</p>
