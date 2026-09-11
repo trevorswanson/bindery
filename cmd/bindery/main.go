@@ -303,7 +303,8 @@ func main() {
 	if s, _ := settingsRepo.Get(ctxBoot, api.SettingMetadataPrimaryProvider); s != nil {
 		configuredPrimary = s.Value
 	}
-	primaryName := resolveMetadataPrimaryProvider(configuredPrimary, api.GetHardcoverAPIToken(ctxBoot, settingsRepo) != "")
+	hardcoverTokenConfigured := api.GetHardcoverAPIToken(ctxBoot, settingsRepo) != ""
+	primaryName := resolveMetadataPrimaryProvider(configuredPrimary, hardcoverTokenConfigured, !cfg.DisableOpenLibrary)
 	var primaryProvider metadata.Provider
 	switch primaryName {
 	case "dnb":
@@ -334,9 +335,11 @@ func main() {
 			slog.Info("hardcover enrichment idle: no api token configured")
 		}
 	}
-	if primaryName != "openlibrary" {
+	if !cfg.DisableOpenLibrary && primaryName != "openlibrary" {
 		enrichers = append(enrichers, olClient)
 		slog.Info("openlibrary enrichment enabled")
+	} else if cfg.DisableOpenLibrary {
+		slog.Info("openlibrary disabled by configuration")
 	}
 	if primaryName != "dnb" {
 		enrichers = append(enrichers, dnbClient)
@@ -1014,6 +1017,11 @@ func main() {
 		r.Get("/setting/{key}", settingsHandler.Get)
 		r.Group(func(r chi.Router) {
 			r.Use(auth.RequireAdmin)
+			// The descriptor registry: key names, types, defaults and
+			// descriptions, never stored values. Admin only for the same
+			// reason the mutations are, and see SettingsHandler.Descriptors
+			// for why the path is plural.
+			r.Get("/settings/descriptors", settingsHandler.Descriptors)
 			r.Put("/setting/{key}", settingsHandler.Set)
 			r.Delete("/setting/{key}", settingsHandler.Delete)
 			r.Post("/hardcover/test", settingsHandler.TestHardcover)
