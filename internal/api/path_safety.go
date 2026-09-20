@@ -329,6 +329,14 @@ func safeRemoveBookPathExact(ctx context.Context, roots *LibraryRoots, owner boo
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) { // #nosec G304 G703 -- p is gated by the configured library roots above
 		return false, err
 	}
+	// Prune the parent directory if it is now empty, mirroring the same
+	// cleanup removeBookPathScoped does for the format-scoped sweep. The
+	// exact delete never sweeps siblings, but a folder this deletion leaves
+	// empty should not linger any more than the scoped sweep's does.
+	parent := filepath.Dir(p)
+	if remaining, readErr := os.ReadDir(parent); readErr == nil && len(remaining) == 0 {
+		_ = os.Remove(parent) // #nosec G304 G703 -- parent = filepath.Dir of a path already gated by the configured library roots above
+	}
 	return false, nil
 }
 

@@ -385,6 +385,42 @@ func TestSafeRemoveBookPathExact_DeletesOnlyTarget(t *testing.T) {
 	}
 }
 
+// TestSafeRemoveBookPathExact_PrunesEmptyParent pins the PR #2486 review
+// follow-up: the exact delete never sweeps same-stem siblings, but it must
+// still prune the parent folder once removing the target leaves it empty,
+// the same cleanup removeBookPathScoped does for the format-scoped sweep.
+func TestSafeRemoveBookPathExact_PrunesEmptyParent(t *testing.T) {
+	dir := t.TempDir()
+	target := mustWrite(t, filepath.Join(dir, "Book.epub"))
+
+	skipped, err := safeRemoveBookPathExact(context.Background(), nil, nil, 1, target, "ebook")
+	if err != nil || skipped {
+		t.Fatalf("safeRemoveBookPathExact = skipped %v, err %v; want false, nil", skipped, err)
+	}
+	if exists(dir) {
+		t.Error("parent directory left empty by the deletion should be pruned")
+	}
+}
+
+// TestSafeRemoveBookPathExact_KeepsNonEmptyParent is the other half: a
+// parent that still holds a sibling file (or anything else) must survive.
+func TestSafeRemoveBookPathExact_KeepsNonEmptyParent(t *testing.T) {
+	dir := t.TempDir()
+	target := mustWrite(t, filepath.Join(dir, "Book.epub"))
+	sibling := mustWrite(t, filepath.Join(dir, "Book.mobi"))
+
+	skipped, err := safeRemoveBookPathExact(context.Background(), nil, nil, 1, target, "ebook")
+	if err != nil || skipped {
+		t.Fatalf("safeRemoveBookPathExact = skipped %v, err %v; want false, nil", skipped, err)
+	}
+	if !exists(dir) {
+		t.Error("parent directory with a surviving sibling must not be pruned")
+	}
+	if !exists(sibling) {
+		t.Error("sibling file must survive the exact delete")
+	}
+}
+
 func TestSafeRemoveBookPathExact_SafetyBranches(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

@@ -743,7 +743,10 @@ func (h *BookHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 
 // deleteTrackedBookFile removes exactly one tracked book_files row and its
 // on-disk payload. Unlike the format-scoped delete, an ebook never sweeps
-// same-stem siblings.
+// same-stem siblings. If the containment or ownership guard refuses the
+// on-disk removal, the request is refused (409) rather than dropping the row
+// for a file that is still there — see safeRemoveBookPathExact's skipped
+// return.
 func (h *BookHandler) deleteTrackedBookFile(w http.ResponseWriter, r *http.Request, id int64, requested string) {
 	files, err := h.books.ListFiles(r.Context(), id)
 	if err != nil {
@@ -763,9 +766,20 @@ func (h *BookHandler) deleteTrackedBookFile(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if _, err := safeRemoveBookPathExact(r.Context(), h.roots, h.books, id, target.Path, target.Format, "id", id); err != nil {
+	skipped, err := safeRemoveBookPathExact(r.Context(), h.roots, h.books, id, target.Path, target.Format, "id", id)
+	if err != nil {
 		slog.Error("failed to remove individual book file", "id", id, "path", target.Path, "error", err)
 		writeServerError(w, r, err)
+		return
+	}
+	// skipped means the containment or ownership guard refused the unlink —
+	// the file is still on disk. Dropping the book_files row and reporting
+	// 200 here would tell the caller a destructive action succeeded when it
+	// didn't, so refuse the request instead: the row and the file stay in
+	// sync, and the caller finds out immediately rather than from a history
+	// event nobody reads.
+	if skipped {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "file could not be removed from disk; refusing to drop the tracked row"})
 		return
 	}
 	if _, err := h.books.RemoveBookFile(r.Context(), target.Path); err != nil {
