@@ -192,6 +192,23 @@ func SignDownloadURLFor(rawURL, indexerURL, apiKey string) string {
 	return signDownloadURL(rawURL, baseHost, apiKey)
 }
 
+// HasAPIKey reports whether a download URL already carries an apikey.
+//
+// It exists so callers can tell "this URL is already signed" apart from "this
+// URL could not be signed": signDownloadURL returns its input unchanged for
+// both, and a caller that treats the second as the first ships an unsigned URL
+// the indexer answers with 401 (#2505).
+func HasAPIKey(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return u.Query().Get("apikey") != ""
+}
+
 // RedactDownloadURL removes the apikey query parameter from a download URL so it
 // can be returned to API clients without leaking the indexer credential. The
 // grab handler restores it server-side via SignDownloadURLFor before dialing the
@@ -882,7 +899,15 @@ func (c *Client) fetchXML(ctx context.Context, rawURL string) ([]byte, error) {
 		if len(snippet) > 512 {
 			snippet = snippet[:512]
 		}
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet)
+		// Typed rather than fmt.Errorf so a rate limit applied at the HTTP
+		// layer (Cloudflare 429, error code 1015) reaches IsRateLimitError
+		// and the searcher's cooldown the same way a Newznab <error
+		// code="500"> does (#2635).
+		return nil, &HTTPStatusError{
+			Status:     resp.StatusCode,
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+			Snippet:    snippet,
+		}
 	}
 
 	return body, nil

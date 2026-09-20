@@ -10,6 +10,7 @@ import { foldedIncludes } from '../util/foldForSearch'
 import { usePolling } from '../components/usePolling'
 import { safeHref } from '../util/safeHref'
 import { formatBytes } from '../util/format'
+import { isAutoGrabRefusal } from '../util/autoGrabRefusal'
 
 // Shared grid template so the header row and every list row line up exactly.
 // columns: checkbox · cover · title+author · format · actions
@@ -154,6 +155,13 @@ export default function WantedPage() {
 
   const { pageItems, paginationProps, reset } = usePagination(filtered, 50, 'wanted')
 
+  // This page's loaded ids, in order — handed to BookDetailPage as router
+  // state (#2548) for Previous/Next; see BookNavState there. Scoped to
+  // pageItems (this page's client-side-paginated slice), not the full
+  // filtered list — matches the "only as far as what's currently loaded"
+  // rule used by BooksPage/AuthorDetailPage.
+  const pageItemIds = pageItems.map(b => b.id)
+
   useEffect(() => { reset() }, [search, reset])
 
   // Keep the select-all checkbox indeterminate state in sync.
@@ -184,7 +192,14 @@ export default function WantedPage() {
     if (selectedIds.size === 0) return
     setBulkBusy(true)
     try {
-      await api.bulkActionWanted([...selectedIds], action)
+      const res = await api.bulkActionWanted([...selectedIds], action)
+      // Nothing was searched because automatic grabbing is off. Say so and
+      // keep the selection, so pressing Search again after flipping the
+      // setting does not mean re-picking every book (#2669).
+      if (isAutoGrabRefusal(res)) {
+        showToast(t('search.autoGrabDisabled'))
+        return
+      }
       clearSelection()
       load()
     } catch (err) {
@@ -300,6 +315,9 @@ export default function WantedPage() {
                   <div className="min-w-0">
                     <Link
                       to={`/book/${book.id}`}
+                      // hopDepth: 1 — first hop into a book detail page from
+                      // this list, not a further Previous/Next chain hop.
+                      state={{ ids: pageItemIds, index: i, hopDepth: 1 }}
                       className="block truncate text-sm font-medium text-slate-800 dark:text-zinc-200 hover:text-emerald-600 dark:hover:text-emerald-400 transition-colors"
                     >
                       {book.title}

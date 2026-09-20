@@ -1,22 +1,140 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 
+	"github.com/vavallee/bindery/internal/auth"
+	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/isbnutil"
 	"github.com/vavallee/bindery/internal/metadata"
 	"github.com/vavallee/bindery/internal/models"
 )
 
 type SearchHandler struct {
 	meta *metadata.Aggregator
+	// books and authors are consulted to stamp each metadata result with the
+	// library row it already corresponds to (#1227). Either may be nil, in
+	// which case results are returned unstamped.
+	books   *db.BookRepo
+	authors *db.AuthorRepo
 }
 
-func NewSearchHandler(meta *metadata.Aggregator) *SearchHandler {
-	return &SearchHandler{meta: meta}
+// bookSearchResult exposes transient provider identifiers without adding them
+// to every Book response. ProviderISBNs exists only while metadata is being
+// searched; persisted books load their identifiers from the editions table.
+//
+// LibraryBookID is set when the result's foreign id already resolves to a book
+// the requesting user owns, so the client can offer "open" instead of "add"
+// (#1227). It is the book row's id, distinct from the embedded Book.ID, which
+// is the provider's transient value (usually 0) on a search result.
+type bookSearchResult struct {
+	models.Book
+	ISBNs         []string `json:"isbns,omitempty"`
+	LibraryBookID *int64   `json:"libraryBookId,omitempty"`
+}
+
+// authorSearchResult is the author counterpart of bookSearchResult.
+// LibraryAuthorID is set when the result's foreign id matches a library author
+// visible to the requesting user, by primary id or alternate identifier.
+type authorSearchResult struct {
+	models.Author
+	LibraryAuthorID *int64 `json:"libraryAuthorId,omitempty"`
+}
+
+// stampLibraryBooks fills LibraryBookID on every result whose foreign id the
+// requesting user already owns, with one query for the whole list. A lookup
+// failure is logged and leaves the results unstamped: the upstream search
+// succeeded and that is what the caller asked for.
+func (h *SearchHandler) stampLibraryBooks(ctx context.Context, results []bookSearchResult) {
+	if h.books == nil || len(results) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(results))
+	for i := range results {
+		if results[i].ForeignID != "" {
+			ids = append(ids, results[i].ForeignID)
+		}
+	}
+	found, err := h.books.LibraryIDsByForeignIDsForUser(ctx, ids, auth.ListScopeUserID(ctx))
+	if err != nil {
+		slog.Warn("search: library book lookup failed, results left unstamped", "error", err)
+		return
+	}
+	for i := range results {
+		if id, ok := found[results[i].ForeignID]; ok {
+			libraryID := id
+			results[i].LibraryBookID = &libraryID
+		}
+	}
+}
+
+// stampLibraryAuthors is stampLibraryBooks for author results.
+func (h *SearchHandler) stampLibraryAuthors(ctx context.Context, results []authorSearchResult) {
+	if h.authors == nil || len(results) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(results))
+	for i := range results {
+		if results[i].ForeignID != "" {
+			ids = append(ids, results[i].ForeignID)
+		}
+	}
+	found, err := h.authors.LibraryIDsByAnyForeignIDsForUser(ctx, ids, auth.ListScopeUserID(ctx))
+	if err != nil {
+		slog.Warn("search: library author lookup failed, results left unstamped", "error", err)
+		return
+	}
+	for i := range results {
+		if id, ok := found[strings.TrimSpace(results[i].ForeignID)]; ok {
+			libraryID := id
+			results[i].LibraryAuthorID = &libraryID
+		}
+	}
+}
+
+const maxBookSearchISBNs = 100
+
+func newBookSearchResult(book models.Book) bookSearchResult {
+	capacity := min(maxBookSearchISBNs, len(book.ProviderISBNs)+len(book.Editions)*2)
+	isbns := make([]string, 0, capacity)
+	seen := make(map[string]bool, capacity)
+	add := func(raw string) {
+		if len(isbns) >= maxBookSearchISBNs {
+			return
+		}
+		normalized := isbnutil.Normalize(raw)
+		if isbnutil.ToISBN13(normalized) == "" || seen[normalized] {
+			return
+		}
+		seen[normalized] = true
+		isbns = append(isbns, normalized)
+	}
+
+	for _, isbn := range book.ProviderISBNs {
+		add(isbn)
+	}
+	for _, edition := range book.Editions {
+		if edition.ISBN13 != nil {
+			add(*edition.ISBN13)
+		}
+		if edition.ISBN10 != nil {
+			add(*edition.ISBN10)
+		}
+	}
+
+	return bookSearchResult{Book: book, ISBNs: isbns}
+}
+
+// NewSearchHandler wires the metadata aggregator plus the library repos used to
+// mark results that are already in the requesting user's library. books and
+// authors may be nil (tests, or callers that do not want stamping).
+func NewSearchHandler(meta *metadata.Aggregator, books *db.BookRepo, authors *db.AuthorRepo) *SearchHandler {
+	return &SearchHandler{meta: meta, books: books, authors: authors}
 }
 
 // writeUpstreamError responds with 502 Bad Gateway and a message that makes
@@ -51,7 +169,12 @@ func (h *SearchHandler) SearchAuthors(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, authors)
+	results := make([]authorSearchResult, len(authors))
+	for i := range authors {
+		results[i] = authorSearchResult{Author: authors[i]}
+	}
+	h.stampLibraryAuthors(r.Context(), results)
+	writeJSON(w, http.StatusOK, results)
 }
 
 func (h *SearchHandler) SearchBooks(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +190,20 @@ func (h *SearchHandler) SearchBooks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, books)
+	results := make([]bookSearchResult, len(books))
+	for i := range books {
+		results[i] = newBookSearchResult(books[i])
+	}
+	h.stampLibraryBooks(r.Context(), results)
+	writeJSON(w, http.StatusOK, results)
+}
+
+// lookupResult wraps a single lookup hit the same way SearchBooks wraps a
+// list, including the library stamp.
+func (h *SearchHandler) lookupResult(ctx context.Context, book models.Book) bookSearchResult {
+	results := []bookSearchResult{newBookSearchResult(book)}
+	h.stampLibraryBooks(ctx, results)
+	return results[0]
 }
 
 // Lookup resolves a single book by a stable identifier passed as a query
@@ -89,9 +225,18 @@ func (h *SearchHandler) Lookup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *SearchHandler) lookupByISBN(w http.ResponseWriter, r *http.Request, isbn string) {
-	book, err := h.meta.GetBookByISBN(r.Context(), isbn)
+	book, outcome, err := h.meta.GetBookByISBNWithOutcome(r.Context(), isbn)
 	if err != nil {
 		writeUpstreamError(w, err)
+		return
+	}
+	// This lookup feeds the Add Book dialog, and adding what it returns makes
+	// the record's provider permanent for the book and its author. A fallback
+	// that only won because the primary never answered is refused, the rule
+	// #2610 applies to the importers. A primary that answered without the ISBN
+	// still lets the fallback through (#2237).
+	if book != nil && !outcome.SafeToBind(book.ForeignID) {
+		writePrimaryProviderUnavailable(w, outcome.Primary)
 		return
 	}
 	if book == nil {
@@ -101,7 +246,7 @@ func (h *SearchHandler) lookupByISBN(w http.ResponseWriter, r *http.Request, isb
 		return
 	}
 
-	writeJSON(w, http.StatusOK, book)
+	writeJSON(w, http.StatusOK, h.lookupResult(r.Context(), *book))
 }
 
 func (h *SearchHandler) lookupByASIN(w http.ResponseWriter, r *http.Request, asin string) {
@@ -126,7 +271,7 @@ func (h *SearchHandler) lookupByASIN(w http.ResponseWriter, r *http.Request, asi
 	}
 	book.MediaType = models.MediaTypeAudiobook
 
-	writeJSON(w, http.StatusOK, book)
+	writeJSON(w, http.StatusOK, h.lookupResult(r.Context(), *book))
 }
 
 // writeServerError logs the underlying error server-side (with request

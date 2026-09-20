@@ -53,7 +53,7 @@ The `internal/` tree is organised by domain, not by layer:
 | `decision` | Quality profiles, language filter, custom formats, delay profiles, blocklist consultation. |
 | `downloader` | SABnzbd, NZBGet, qBittorrent, Transmission, Deluge, rTorrent clients (queue/history polling, submission, deletion). |
 | `importer` | NZO-ID matching, Move/Copy/Hardlink semantics, naming-token expansion, cross-FS-safe moves. |
-| `scheduler` | Cron loops for auto-grab, refresh, recommendations, cleanup. |
+| `scheduler` | Cron loops for auto-grab, refresh, release discovery, recommendations, cleanup. See [Scheduled jobs](#scheduled-jobs). |
 | `recommender` | Discover engine — taste profile, candidate filters, multi-source signals. |
 | `seriesmatch` | Four-tier reconciliation (ASIN → title+author → series+position → fuzzy). |
 | `textutil` | The character-level folds every string comparison shares, and the reasons they differ — see [search-design.md](search-design.md). |
@@ -84,7 +84,7 @@ A typical container has three logical mounts:
 
 | Mount | Purpose | Default |
 |-------|---------|---------|
-| `/config` | SQLite database, backups, image cache, cookie/CSRF secrets | `BINDERY_DATA_DIR`, `BINDERY_DB_PATH` |
+| `/config` | SQLite database, backups, image cache, Calibre library covers (`covers/`), cookie/CSRF secrets | `BINDERY_DATA_DIR`, `BINDERY_DB_PATH` |
 | `/books` | Imported ebook library (and audiobooks unless split out) | `BINDERY_LIBRARY_DIR` |
 | `/downloads` | Where the download client deposits completed jobs | `BINDERY_DOWNLOAD_DIR` |
 
@@ -96,6 +96,25 @@ If audiobooks live on a different volume, set `BINDERY_AUDIOBOOK_DIR` (and optio
 - Background workers (auto-grab sweep, recommendations refresh, indexer probes, ABS import) are scheduled by the `scheduler` package as long-lived goroutines guarded by context cancellation on shutdown.
 - SQLite runs in WAL mode, but the connection pool is pinned to a single connection (`SetMaxOpenConns(1)`), so **reads serialize alongside writes** rather than running concurrently. WAL's concurrent-reader property is not currently being used. This is sufficient for the workload in practice, and [#2147](https://github.com/vavallee/bindery/issues/2147) tracks lifting it, including the reason it is not a one-line change: migrations run a connection-scoped `PRAGMA foreign_keys=OFF`, which a pool would break.
 - All outbound HTTP calls go through a shared client with timeouts, SSRF guards, and User-Agent stamping (`bindery/<version>`).
+
+## Scheduled jobs
+
+Registered by `internal/scheduler`. Every job runs under `SkipIfStillRunning`, so a run that overruns its interval skips the next one rather than queueing behind it, and each run is recorded through `metrics.ObserveSchedulerRun`.
+
+| Job | Interval | What it does |
+|-----|----------|--------------|
+| `check-downloads` | 15s | Polls download clients and imports finished jobs. |
+| `check-stalled` | 5m | Fails, blocklists and re-searches downloads stuck past the stall timeout. |
+| `download-client-health` | 15m | Re-probes download client reachability and paths. |
+| `search-wanted` | `search.interval`, default 12h, read at startup | Searches indexers for wanted books and auto-grabs when enabled. |
+| `refresh-metadata` | 24h | Refreshes four profile fields on monitored authors. Creates no books. |
+| `author-discovery` | hourly tick, cadence from `authors.discovery.interval` (unset and `off` both disable it, which is how it ships; a stored 24h to 720h duration turns it on), read every tick | Runs the author catalogue sync for a batch of monitored authors whose `last_discovery_at` is older than the interval, never checked first. Batch is `ceil(eligible / hours in interval)`, clamped to 1..25, read with 3 spare authors so one whose sync is already running is skipped without costing the slot, with 3 seconds between authors and a 10 minute budget per author (an author over budget is stamped). Checks before every author whether Refresh all or refresh selected is running and stops if so. Stops on a rate limit from any provider (`metadata.ErrRateLimited`, the refused author unstamped), and after 3 consecutive authors failing with the provider unavailable (`metadata.IsProviderUnavailable`: rate limit, 5xx, network error, timeout); the authors of that streak are stamped to be due again in 6 hours (capped at the interval) so they cannot hold the head of the queue. Any other error is about the author, is stamped and resets the streak. Re-reads each author and skips one deleted, unmonitored or set to add no new items, before any provider call. Enriches covers only for works the author does not have, so existing coverless books get covers from a manual refresh only. Same author catalogue syncs serialise from reading the author's books to hydrating the created ones; the lock is released before indexer searches and the announcement, waiting for it ends with the context, and the AddBook single work fallback does not take it. Never grabs; new monitored books reach indexers through `search-wanted`. Publishes `bookAnnounced` ([#2236](https://github.com/vavallee/bindery/issues/2236)). |
+| `scan-library` | 6h | Reconciles files under the library roots against the catalogue. |
+| `calibre-sync` | 24h | Imports from a Calibre library, when configured. |
+| `recommendations` | 24h | Rebuilds Discover recommendations, when enabled. |
+| `hardcover-sync` | `hardcover.sync_interval`, default 24h, read at startup | Syncs Hardcover import lists, when configured. |
+| `telemetry-ping` | 24h | Anonymous install ping, unless opted out. |
+| `log-trim` | 24h | Trims the persistent log store to its retention. |
 
 ## Why these choices
 

@@ -1,12 +1,10 @@
 package main
 
 import (
-	"net/http"
-
 	"github.com/go-chi/chi/v5"
-
 	"github.com/vavallee/bindery/internal/api"
 	"github.com/vavallee/bindery/internal/auth"
+	"net/http"
 )
 
 // systemLogRouteHandler is the surface registerSystemLogRoutes needs.
@@ -135,6 +133,7 @@ type downloadClientRouteHandler interface {
 	Delete(http.ResponseWriter, *http.Request)
 	Test(http.ResponseWriter, *http.Request)
 	TestConfig(http.ResponseWriter, *http.Request)
+	Diagnose(http.ResponseWriter, *http.Request)
 }
 
 // registerDownloadClientRoutes mounts /downloadclient/*. The whole subtree
@@ -151,6 +150,7 @@ func registerDownloadClientRoutes(r chi.Router, h downloadClientRouteHandler) {
 		r.Put("/downloadclient/{id}", h.Update)
 		r.Delete("/downloadclient/{id}", h.Delete)
 		r.Post("/downloadclient/{id}/test", h.Test)
+		r.Post("/downloadclient/{id}/diagnose", h.Diagnose)
 		// Test an unsaved config posted in the body (inline form Test button).
 		r.Post("/downloadclient/test", h.TestConfig)
 	})
@@ -176,5 +176,87 @@ func registerOIDCDiscoveryRoutes(r chi.Router, h oidcDiscoveryRouteHandler) {
 	r.Group(func(r chi.Router) {
 		r.Use(auth.RequireAdmin)
 		r.Post("/auth/oidc/test-discovery", h.TestDiscovery)
+	})
+}
+
+// useAPIAuth installs the auth stack every /api route sits behind: identity
+// and mode resolution, the requester allow list, then the two CSRF guards.
+// Shared by both API trees in main.go (/api and /api/v1) and by the route
+// tests, so a test cannot pass against a stack the server does not run.
+//
+// RestrictRequester sits directly after Middleware because it needs the role
+// Middleware resolves, and before everything else so a requester is refused
+// on any route not on auth.RequesterAllowList, including routes registered
+// after this call.
+func useAPIAuth(r chi.Router, p auth.Provider) {
+	r.Use(auth.Middleware(p))
+	r.Use(auth.RestrictRequester)
+	r.Use(auth.RequireXRequestedWith)
+	r.Use(auth.RequireCSRFToken(p.SessionSecrets))
+}
+
+type storageRouteHandler interface {
+	Get(http.ResponseWriter, *http.Request)
+}
+
+// registerStorageRoutes mounts the read-only view of the env and config
+// driven directories with their exists, writable and hardlink health (#1183).
+// Admin-only: it reveals the server's filesystem layout and writability.
+func registerStorageRoutes(r chi.Router, h storageRouteHandler) {
+	r.Group(func(r chi.Router) {
+		r.Use(auth.RequireAdmin)
+		r.Get("/system/storage", h.Get)
+	})
+}
+
+// adoptionRouteHandler is the surface registerAdoptionRoutes needs.
+type adoptionRouteHandler interface {
+	List(http.ResponseWriter, *http.Request)
+	Summary(http.ResponseWriter, *http.Request)
+	Adopt(http.ResponseWriter, *http.Request)
+	Undo(http.ResponseWriter, *http.Request)
+	Ignore(http.ResponseWriter, *http.Request)
+	Unignore(http.ResponseWriter, *http.Request)
+	IgnoreMany(http.ResponseWriter, *http.Request)
+}
+
+// registerAdoptionRoutes mounts /library/unmatched, library adoption, admin
+// only. The rows carry absolute library paths (the same disclosure
+// registerLibraryScanStatusRoute gates), adopt creates authors and books and
+// writes book_files, and the summary behind the nav badge counts them. No
+// route takes a path: every row is addressed by id.
+func registerAdoptionRoutes(r chi.Router, h adoptionRouteHandler) {
+	r.Group(func(r chi.Router) {
+		r.Use(auth.RequireAdmin)
+		r.Get("/library/unmatched", h.List)
+		r.Get("/library/unmatched/summary", h.Summary)
+		r.Post("/library/unmatched/ignore", h.IgnoreMany)
+		r.Post("/library/unmatched/{id}/adopt", h.Adopt)
+		r.Post("/library/unmatched/{id}/undo", h.Undo)
+		r.Post("/library/unmatched/{id}/ignore", h.Ignore)
+		r.Post("/library/unmatched/{id}/unignore", h.Unignore)
+	})
+}
+
+// libraryScanStatusRouteHandler is the surface registerLibraryScanStatusRoute
+// needs.
+type libraryScanStatusRouteHandler interface {
+	ScanStatus(http.ResponseWriter, *http.Request)
+}
+
+// registerLibraryScanStatusRoute mounts GET /library/scan/status admin only
+// (#2361). The response is the library.lastScan blob verbatim, which carries
+// library_dir, audiobook_dir, scanned_paths and the absolute path of every
+// unmatched file: the server filesystem layout /system/storage is gated for,
+// and the key isAdminOnlySetting already withholds from GET /setting. Leaving
+// this route open kept a second door to the same value.
+//
+// Gated rather than redacted because the only caller is the scan panel in
+// Settings > General, which renders inside that tab's isAdmin block, so no non
+// admin screen loses anything and no third response shape enters the API.
+func registerLibraryScanStatusRoute(r chi.Router, h libraryScanStatusRouteHandler) {
+	r.Group(func(r chi.Router) {
+		r.Use(auth.RequireAdmin)
+		r.Get("/library/scan/status", h.ScanStatus)
 	})
 }

@@ -6,6 +6,9 @@ import type { Page } from './common'
 export interface Author {
   id: number
   foreignAuthorId: string
+  // Set on metadata search results whose foreign id already matches a library
+  // author visible to the current user (#1227). It is the library row id.
+  libraryAuthorId?: number
   authorName: string
   sortName: string
   description: string
@@ -33,6 +36,9 @@ export interface Author {
   // What the last catalogue sync did with the provider's works (#1889).
   // Absent until the server has synced this author since it last started.
   lastSync?: AuthorSyncSummary
+  // True while a catalogue sync for this author is running on the server. Set
+  // on GET /author/{id} only; the page polls it after a manual Refresh (#2601).
+  syncInProgress?: boolean
   // Present on add-flow responses when the linked record syncs from a
   // provider other than the configured primary (#2237).
   providerMismatch?: AuthorProviderMismatch
@@ -122,6 +128,14 @@ export interface RelinkAuthorCandidate {
   authorName?: string
 }
 
+// RelinkAuthorLinkCandidate is one row of the relink picker. previouslyLinked
+// marks a record this author used to be linked to and is no longer (#2688).
+// The server returns those rows instead of hiding them, so relinking is not a
+// one way door; the flag is a label, not a reason to skip the row.
+export interface RelinkAuthorLinkCandidate extends Author {
+  previouslyLinked?: boolean
+}
+
 export interface MergeAuthorsResult {
   BooksReparented: number
   AliasesMigrated: number
@@ -181,6 +195,7 @@ export interface AddAuthorRequest {
   monitored: boolean
   monitorMode?: AuthorMonitorMode
   monitorLatestCount?: number
+  monitorNewItems?: MonitorNewItems
   searchOnAdd: boolean
   metadataProfileId?: number | null
   qualityProfileId?: number | null
@@ -254,7 +269,7 @@ export const authorsApi = {
       body: JSON.stringify({ bookIds }),
     }),
   searchAuthorLinkCandidates: (id: number, term: string) =>
-    request<Author[]>(`/author/${id}/relink-upstream/candidates?term=${encodeURIComponent(term)}`),
+    request<RelinkAuthorLinkCandidate[]>(`/author/${id}/relink-upstream/candidates?term=${encodeURIComponent(term)}`),
   relinkAuthorUpstream: (id: number, candidate?: RelinkAuthorCandidate) =>
     request<Author>(`/author/${id}/relink-upstream`, {
       method: 'POST',

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import { useConfirmDialog } from '../components/useConfirmDialog'
-import { api, Author, AuthorAlias, Book, BookBulkAction, MediaType, Series } from '../api/client'
+import { api, ApiError, Author, AuthorAlias, Book, BookBulkAction, MediaType, Series } from '../api/client'
 import ViewToggle from '../components/ViewToggle'
 import { bookStatusBadge } from '../components/bookStatus'
 import MergeAuthorsModal from '../components/MergeAuthorsModal'
@@ -12,8 +12,9 @@ import RenameFilesModal from '../components/RenameFilesModal'
 import BulkActionBar from '../components/BulkActionBar'
 import { useView } from '../components/useView'
 import MarkdownDescription from '../components/MarkdownDescription'
-import { canLinkAuthorMetadata, hasSparseMetadata } from '../util/authorMetadata'
+import { canLinkAuthorMetadata } from '../util/authorMetadata'
 import { metadataSourceLink } from '../util/metadataSource'
+import { isAutoGrabRefusal } from '../util/autoGrabRefusal'
 import { btn, btnSize } from '../components/buttons'
 import Switch from '../components/Switch'
 import CoverPlaceholder from '../components/CoverPlaceholder'
@@ -63,6 +64,27 @@ function mediaLabel(mediaType?: Book['mediaType']): string {
   return '📖 Ebook'
 }
 
+// Previous/Next navigation (#2548), entirely client-side: AuthorsPage already
+// has its current page loaded and ordered, so it hands that over as router
+// `state` instead of this page re-fetching it. Not shared as an exported
+// type — AuthorsPage builds the same shape independently, same as the
+// seriesId router state between AuthorsPage and SeriesPage.
+//
+// Trade-off: only reaches as far as the loaded list page, and doesn't
+// survive a refresh or a direct link (router state is gone either way) —
+// Previous/Next just don't render then.
+interface AuthorNavState {
+  ids: number[]
+  index: number
+}
+
+// A manual Refresh answers 202 and runs the catalogue sync in the background.
+// The page polls the author until the server says the sync has finished, then
+// shows the result, instead of re-reading straight away and showing the page
+// as it was before the click (#2601).
+const REFRESH_POLL_INTERVAL_MS = 2000
+const REFRESH_POLL_TIMEOUT_MS = 60000
+
 export default function AuthorDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -75,7 +97,26 @@ export default function AuthorDetailPage() {
   const [books, setBooks] = useState<Book[]>([])
   const [allAuthors, setAllAuthors] = useState<Author[]>([])
   const [loading, setLoading] = useState(true)
-  const [refreshing, setRefreshing] = useState(false)
+  // Bumping reloadKey reruns the load effect with the filters in force at
+  // that moment. A manual Refresh reloads this way once its sync ends, so a
+  // filter picked while it waited is honoured (#2601). quietReload keeps the
+  // page on screen for that reload instead of flashing the loading state.
+  const [reloadKey, setReloadKey] = useState(0)
+  const quietReload = useRef(false)
+  // Which author a manual Refresh is running for, so moving to another author
+  // with Previous/Next does not carry the spinner along (#2601).
+  const [refreshingAuthorId, setRefreshingAuthorId] = useState<number | null>(null)
+  const refreshing = refreshingAuthorId === authorId
+  // One session per author shown. A refresh poll stops writing once the page
+  // has moved to another author or unmounted.
+  const pageSession = useRef({ active: true })
+  useEffect(() => {
+    const session = { active: true }
+    pageSession.current = session
+    return () => {
+      session.active = false
+    }
+  }, [authorId])
   const [searchingWanted, setSearchingWanted] = useState(false)
   const [showMerge, setShowMerge] = useState(false)
   const [showEdit, setShowEdit] = useState(false)
@@ -103,6 +144,11 @@ export default function AuthorDetailPage() {
     } catch { return false }
   })
   const [authorSeries, setAuthorSeries] = useState<Series[]>([])
+  // Tracks whose series `authorSeries` currently holds. The page stays
+  // mounted across Previous/Next (only authorId changes), so a plain
+  // "already loaded" check on authorSeries.length kept the previous
+  // author's series and grouped the new author's books against them.
+  const loadedSeriesAuthorId = useRef<number | null>(null)
 
   useEffect(() => {
     try { localStorage.setItem('bindery.group.author-detail.series', String(groupBySeries)) } catch { /* ignore */ }
@@ -112,13 +158,16 @@ export default function AuthorDetailPage() {
   // the default flat view never pays for the extra round trip. Failures fall
   // back to an empty set — every book then lands in the Standalone group.
   useEffect(() => {
-    if (!groupBySeries || authorSeries.length > 0) return
+    if (!groupBySeries || loadedSeriesAuthorId.current === authorId) return
+    // Drop the previous author's series before fetching, so neither the
+    // in flight window nor a failed fetch groups these books against them.
+    setAuthorSeries([])
     let cancelled = false
     api.listAuthorSeries(authorId)
-      .then(s => { if (!cancelled) setAuthorSeries(s) })
+      .then(s => { if (!cancelled) { setAuthorSeries(s); loadedSeriesAuthorId.current = authorId } })
       .catch(() => { /* leave empty: books fall into Standalone */ })
     return () => { cancelled = true }
-  }, [groupBySeries, authorId, authorSeries.length])
+  }, [groupBySeries, authorId])
 
   // Filter / sort state — persisted to localStorage under page-scoped keys
   const [typeFilter, setTypeFilter] = useState<MediaFilter>(() => {
@@ -182,7 +231,12 @@ export default function AuthorDetailPage() {
 
   useEffect(() => {
     let cancelled = false
-    setLoading(true)
+    const quiet = quietReload.current
+    quietReload.current = false
+    if (!quiet) setLoading(true)
+    // The page stays mounted across Previous/Next, so a stale error from the
+    // previous author would otherwise still be showing under the new one.
+    setError(null)
     // listAllBooks pages through the server until the author's complete
     // catalogue is loaded — a plain listBooks call silently capped the list at
     // the server default of 100, corrupting counts/filters/select-all (#1467).
@@ -194,7 +248,20 @@ export default function AuthorDetailPage() {
       .catch(err => setError(err instanceof Error ? err.message : 'Failed to load'))
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
-  }, [authorId, showExcluded])
+  }, [authorId, showExcluded, reloadKey])
+
+  // Validated against authorId: stale state (browser back/forward) or no
+  // state at all (opened from elsewhere) must read as "no nav info", not
+  // point at the wrong neighbour.
+  const navState = (() => {
+    const s = location.state as AuthorNavState | null
+    if (s && Array.isArray(s.ids) && typeof s.index === 'number' && s.ids[s.index] === authorId) {
+      return s
+    }
+    return null
+  })()
+  const prevId = navState && navState.index > 0 ? navState.ids[navState.index - 1] : null
+  const nextId = navState && navState.index < navState.ids.length - 1 ? navState.ids[navState.index + 1] : null
 
   useEffect(() => {
     const params = new URLSearchParams(location.search)
@@ -216,16 +283,55 @@ export default function AuthorDetailPage() {
 
   const handleRefresh = async () => {
     if (!author) return
-    setRefreshing(true)
+    const session = pageSession.current
+    const refreshedId = author.id
+    setRefreshingAuthorId(refreshedId)
+    // Reports whether this click started a sync. 409 means a sync for the
+    // author is already running.
+    const startRefresh = async () => {
+      try {
+        await api.refreshAuthor(refreshedId)
+        return true
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 409) return false
+        throw e
+      }
+    }
+    // Polls until the author's sync ends: 'done', 'timeout' after a minute,
+    // or 'gone' once the page has moved to another author.
+    const waitForSync = async (): Promise<'done' | 'timeout' | 'gone'> => {
+      const deadline = Date.now() + REFRESH_POLL_TIMEOUT_MS
+      while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, REFRESH_POLL_INTERVAL_MS))
+        if (!session.active) return 'gone'
+        const latest = await api.getAuthor(refreshedId)
+        if (!session.active) return 'gone'
+        if (!latest.syncInProgress) return 'done'
+      }
+      return 'timeout'
+    }
     try {
-      await api.refreshAuthor(author.id)
-      const [a, bs] = await Promise.all([api.getAuthor(authorId), api.listAllBooks({ authorId, includeExcluded: showExcluded })])
-      setAuthor(a)
-      setBooks(bs)
+      const started = await startRefresh()
+      let waited = await waitForSync()
+      if (waited === 'gone') return
+      // A 409 means the running sync was not this click's: a scheduled, bulk,
+      // Refresh all or add sync, and none of those read past the metadata
+      // cache. Once it ends, ask once more so the page shows current data. A
+      // second 409 means yet another sync started meanwhile; show what is
+      // there rather than chase it.
+      if (!started && waited === 'done' && await startRefresh()) {
+        waited = await waitForSync()
+        if (waited === 'gone') return
+      }
+      if (!session.active) return
+      // Reload through the load effect, which reads the filters in force now
+      // rather than the ones this click saw.
+      quietReload.current = true
+      setReloadKey(k => k + 1)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Refresh failed')
+      if (session.active) setError(e instanceof Error ? e.message : 'Refresh failed')
     } finally {
-      setRefreshing(false)
+      setRefreshingAuthorId(current => (current === refreshedId ? null : current))
     }
   }
 
@@ -247,6 +353,14 @@ export default function AuthorDetailPage() {
     setError(null)
     try {
       const res = await api.searchAuthorWanted(author.id)
+      // A refusal because automatic grabbing is off is not a failure of this
+      // author's search, it is a setting the user has to change, so it gets
+      // its own message naming the setting instead of a raw server string
+      // (#2669).
+      if (isAutoGrabRefusal(res)) {
+        setError(t('search.autoGrabDisabled'))
+        return
+      }
       const item = res.results[String(author.id)]
       if (item && !item.ok) {
         throw new Error(item.error || 'Search failed')
@@ -334,6 +448,13 @@ export default function AuthorDetailPage() {
     try {
       const ids = Array.from(selected)
       const res = await api.bulkActionBooks(ids, action, mediaType)
+      // Same refusal as the "Search wanted" button: say what did not happen
+      // and keep the selection so the user can retry after flipping the
+      // setting (#2669).
+      if (isAutoGrabRefusal(res)) {
+        setError(t('search.autoGrabDisabled'))
+        return
+      }
       let okCount = 0
       let firstError = ''
       for (const id of ids) {
@@ -473,7 +594,10 @@ export default function AuthorDetailPage() {
   if (!author) return <div className="text-slate-600 dark:text-zinc-500">Author not found</div>
 
   const searchableWantedCount = books.filter(b => b.status === 'wanted' && b.monitored && !b.excluded).length
-  const showMetadataLinkAction = canLinkAuthorMetadata(author) || hasSparseMetadata(author)
+  // Relinking is valid for every author — the backend accepts any record and the
+  // candidate search deliberately does not merge same-person records — so the
+  // action is always offered. The record's fullness only picks the wording below.
+  const showMetadataLinkAction = true
   const metadataLinkLabel = canLinkAuthorMetadata(author)
     ? t('authorMetadataLink.actionLink', 'Link metadata')
     : t('authorMetadataLink.actionFindBetter', 'Find better metadata')
@@ -489,6 +613,24 @@ export default function AuthorDetailPage() {
 
   const dateSortIcon = dateSort === 'asc' ? ' ↑' : dateSort === 'desc' ? ' ↓' : ''
 
+  // This author's filtered books, in order — handed to BookDetailPage as
+  // router state (#2548) for Previous/Next; see BookNavState there. #2548
+  // asks for the order the user sees, so when Group by series is on the
+  // chain follows seriesGroups (each series section top-to-bottom, then
+  // Standalone) instead of filteredBooks' load order. A book in more than
+  // one series appears in more than one group's `books`; Set dedupes to its
+  // first occurrence while preserving insertion order, so it counts once.
+  const bookIds = groupBySeries
+    ? Array.from(new Set(seriesGroups.flatMap(group => group.books.map(b => b.id))))
+    : filteredBooks.map(b => b.id)
+  // Looked up once per render rather than bookIds.indexOf(book.id) inside
+  // bookNavState — that would be an O(n) scan per row, O(n²) across a page.
+  const bookIndexById = new Map(bookIds.map((id, i) => [id, i]))
+  // hopDepth: 1 — this is the first hop into a book detail page from a list,
+  // not a further Previous/Next chain hop; see BookNavState in
+  // BookDetailPage.tsx for how Back uses it to skip the whole chain.
+  const bookNavState = (book: Book) => ({ ids: bookIds, index: bookIndexById.get(book.id) ?? -1, hopDepth: 1 })
+
   // Render helpers shared by the flat and grouped-by-series (#1125) layouts so
   // each series section and the standalone group reuse the exact same table
   // rows / grid cards instead of duplicating the markup.
@@ -500,7 +642,7 @@ export default function AuthorDetailPage() {
         // Client-side, matching the <Link> in this same row. The row used to do
         // a full page reload while the link inside it routed client-side, so
         // one row had two different navigation behaviours.
-        onClick={() => navigate(`/book/${book.id}`)}
+        onClick={() => navigate(`/book/${book.id}`, { state: bookNavState(book) })}
       >
         <td className="px-3 py-2 w-10 align-middle" onClick={e => e.stopPropagation()}>
           <input
@@ -512,7 +654,7 @@ export default function AuthorDetailPage() {
           />
         </td>
         <td className="px-3 py-2 align-middle">
-          <Link to={`/book/${book.id}`} className="flex items-center gap-2 min-w-0" onClick={e => e.stopPropagation()}>
+          <Link to={`/book/${book.id}`} state={bookNavState(book)} className="flex items-center gap-2 min-w-0" onClick={e => e.stopPropagation()}>
             {book.imageUrl ? (
               <img src={book.imageUrl} alt="" className="w-6 h-9 object-cover rounded flex-shrink-0" />
             ) : (
@@ -625,7 +767,7 @@ export default function AuthorDetailPage() {
             className={`absolute top-2 left-2 z-10 rounded border-slate-400 dark:border-zinc-600 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0 ${selected.has(book.id) ? '' : 'bg-white/80 dark:bg-zinc-900/80'}`}
             aria-label={`Select ${book.title}`}
           />
-          <Link to={`/book/${book.id}`} className="block">
+          <Link to={`/book/${book.id}`} state={bookNavState(book)} className="block">
             <div className="aspect-[2/3] bg-slate-200 dark:bg-zinc-800 relative">
               {book.imageUrl ? (
                 <img src={book.imageUrl} alt={book.title} className="w-full h-full object-cover" />
@@ -677,8 +819,38 @@ export default function AuthorDetailPage() {
     // One width shared with BookDetailPage — see the note there.
     <div className={`max-w-7xl ${selected.size > 0 ? 'pb-20' : ''}`}>
       {confirmDialog}
-      <div className="mb-4 flex items-center gap-3 text-sm">
-        <button onClick={() => navigate(-1)} className="text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white">← Back</button>
+      <div className="mb-4 flex items-center justify-between gap-3 text-sm">
+        {/* Only inside a Previous/Next chain does Back go to the Authors
+            list rather than browser history: a few hops through Next/Previous
+            land one page short of where the list actually was. Arriving any
+            other way (Wanted, the Books list, a book page, a direct link)
+            must fall back to navigate(-1) or Back would strand those flows
+            on the Authors list instead of where they came from. */}
+        {navState ? (
+          <Link to="/" className="text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white">← Back</Link>
+        ) : (
+          <button
+            type="button"
+            onClick={() => navigate(-1)}
+            className="text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white"
+          >
+            ← Back
+          </button>
+        )}
+        {navState && (prevId !== null || nextId !== null) && (
+          <div className="flex items-center gap-2">
+            {prevId !== null && (
+              <Link to={`/author/${prevId}`} state={{ ids: navState.ids, index: navState.index - 1 }} aria-label={t('authorDetail.nav.previousAriaLabel', 'Previous author')} className={`${btn.ghost} ${btnSize.sm}`}>
+                {t('authorDetail.nav.previous', '‹ Previous')}
+              </Link>
+            )}
+            {nextId !== null && (
+              <Link to={`/author/${nextId}`} state={{ ids: navState.ids, index: navState.index + 1 }} aria-label={t('authorDetail.nav.nextAriaLabel', 'Next author')} className={`${btn.ghost} ${btnSize.sm}`}>
+                {t('authorDetail.nav.next', 'Next ›')}
+              </Link>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="flex flex-col sm:flex-row gap-6 mb-8">

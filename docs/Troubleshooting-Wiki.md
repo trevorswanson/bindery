@@ -2,6 +2,21 @@
 
 Solutions to recurring problems, organised by symptom. Add new entries here as patterns come up in support.
 
+## A release names a different book or author
+
+Release matching rejects extra meaningful words inside a requested title and
+preserves its numbers: `12 More Rules for Life` cannot satisfy `12 Rules for Life`,
+even when both name the same author. An explicit trailing `by Author` or
+`Title - Author` credit that conflicts with the requested author is also rejected.
+Title-only releases, connecting words, file-format labels and narrator credits
+remain supported. Unrecognised trailing text can be conservatively rejected;
+inspect the release's title and author rather than relying only on shared words.
+
+These checks use the release name. They do not verify the contents of a download
+or repair an existing incorrect import. If a previously imported file is another
+book, use **Fix Match** to assign it to the correct book before requesting a
+replacement for the original.
+
 ## Bindery will not start after upgrading: "foreign_key_check found N violation(s)"
 
 ```
@@ -51,6 +66,16 @@ You may see `add torrent failed: {"added_torrent_ids":...}` or `failed to send t
 
 ### Bindery cannot read the completed files
 
+**Start with Diagnose.** In **Settings → Download clients**, press **Diagnose** on the client. It works out where Bindery's grabs actually land for ebooks and for audiobooks (the save path Bindery sends, the category's folder, or the client default, and it says which), applies the path remap the same way the importer does, checks that Bindery can read and write the result, and tries a hardlink into each library folder. The panel puts the first thing to fix at the top and shows the paths side by side: where the client puts the files, which remap applied, and where Bindery looks. **Copy report** copies the check results and paths without the host, port or username, so it is safe to paste into an issue or Discord.
+
+A few answers need explaining:
+
+* **Outside every folder it is configured to use.** The remapped path is not under `BINDERY_DOWNLOAD_DIR`, `BINDERY_AUDIOBOOK_DOWNLOAD_DIR` or a library folder. Bindery does not look inside such a folder at all. Almost always a missing or wrong path remap.
+* **Differs only in letter case.** Linux folder names are case sensitive, so `/Downloads` and `/downloads` are different folders. Fix the case in the remap.
+* **SABnzbd did not share its folder settings.** SABnzbd only gives its folders to the full API key. With the NZB key the folder rows stay unknown; that is not a failure.
+* **Did not respond within 10 seconds.** A stat on that folder hung, which is what a network mount that has stopped answering does. Check the mount; the request gives up rather than waiting.
+* **Client reaching indexers: unknown.** This row is always unknown. Bindery fetches NZB and torrent files itself, but it cannot test the client's own network, VPN or DNS.
+
 If Bindery and the download client see the storage at different paths (different container mounts), Bindery cannot find the finished download. This usually surfaces as `importFailed` in the Queue with *nothing at `<path>` on this host*.
 
 That message lists three causes, because all three produce the same missing path and only you can tell them apart:
@@ -70,7 +95,17 @@ If the files never appear, it does not wait forever: after about 30 minutes of f
 Clicking **Grab** on a release you already have a Queue entry for is refused with *already grabbed*, and the message now names the state that entry is in.
 
 - **`importFailed`** — the scanner is still working on that download. Use **Queue → Retry import** to re-run the import against the files it already has, or remove the Queue entry if you want to grab the release fresh. If its files are simply not there, it turns into `importBlocked` (see above) and becomes re-grabbable on its own.
-- **`imported`** — you already have it.
+- **`imported`**: you already have it. If you have since deleted that book (or its author), the release is no longer held: grabbing it again goes through and reuses the old Queue entry, and automatic search will pick it too once you add the book back. Usually you can leave your download client as it is; the two exceptions are under the table. What happens next depends on the client:
+
+  | Client | If it still has the release |
+  |---|---|
+  | qBittorrent, Transmission, Deluge, rTorrent | Bindery picks up the torrent the client already holds and imports its files, as long as they are still in the client's download folder. Nothing downloads again. |
+  | SABnzbd, NZBGet | The release downloads again. Bindery adds NZBGet jobs past its duplicate check, and SABnzbd's duplicate detection is off unless you turned it on, in which case SABnzbd may hold or refuse the job. |
+
+  If you removed the torrent from the client, it downloads again like any new grab. In two cases you need to do exactly that: remove the torrent from the client first, then grab again.
+
+  - **Import mode `move`.** The earlier import moved the files out of the client's folder, so the torrent Bindery picks up has nothing left to import. The Queue entry never imports, and every later grab picks up the same empty torrent.
+  - **qBittorrent 5.1 or older.** Bindery recognises a torrent qBittorrent already holds from its `409 Conflict` reply, which qBittorrent sends from 5.2 on. Older versions answer with a plain `Fails.`, the same reply as any other refused add, so the grab fails.
 - **downloading / grabbed / importing** — it's in flight; check the Queue.
 - **`importBlocked`** — a re-grab is allowed and reuses the existing Queue row with a fresh retry budget. Use this when the original files are gone; use **Retry import** instead when they're still on disk.
 
@@ -78,7 +113,7 @@ Clicking **Grab** on a release you already have a Queue entry for is refused wit
 
 The files downloaded fine, but Bindery couldn't tie them to a book in your library, so the item sits in the Queue as `importFailed` with *could not match any book to this download*. This happens when a release was grabbed without a specific book (e.g. from the free-text Search page) or its title didn't parse to a catalogue book.
 
-**Fix:** on the failed Queue item, click **Match to book**, search your library for the correct book, and select it — Bindery imports the already-downloaded files against it and the item flips to **Imported**. If the book isn't in your library yet, add it first (Authors → the author → the book, or Add Book), then match. Once matched, an item shows **Matched to *&lt;book&gt;*** and its **Retry import** button re-runs the import against that book.
+**Fix:** on the failed Queue item, click **Match to book**, search your library for the correct book, and select it — Bindery imports the already-downloaded files against it and the item flips to **Imported**. If the book isn't in your library yet, add it first with **Books → Add Book** (pick the book row, or its author's row to bring the whole catalogue in), then match. Once matched, an item shows **Matched to *&lt;book&gt;*** and its **Retry import** button re-runs the import against that book.
 
 If the item was left unmatched long enough for the scanner to retry it a few times, it turns into `importBlocked` with *import retry limit reached*. That's the same situation — the files are still there — so **Match to book** and **Retry import** work exactly the same on a blocked item; matching it re-imports the recorded files, and Retry import re-arms the scanner with a fresh retry budget.
 
@@ -236,9 +271,9 @@ Bindery's primary metadata provider is OpenLibrary, DNB (the German national lib
 - Behind a VPN: split-tunnel `openlibrary.org` out of the VPN. Metadata lookups do not need VPN protection — only torrent traffic does — so a paid dedicated IP is not required. Switching to a different VPN exit location also often helps, since some exit IPs are blocked and others are not.
 - Not on a VPN: retry later, and check the status of `openlibrary.org` / `archive.org`.
 
-## A book is on hardcover.app but doesn't show up in Add Book / Add Author search
+## A book is on hardcover.app but doesn't show up in the Add to library search
 
-Hardcover does not have to be the primary provider for its titles to show up: it always runs as a **search enricher** too. Add Book and Add Author fan the query out to the primary provider **plus** Hardcover (and Google Books, if an API key is set), then merge in any titles the primary didn't return. Books that only exist on hardcover.app are exactly what that path is meant to surface.
+Hardcover does not have to be the primary provider for its titles to show up: it always runs as a **search enricher** too. The Add to library dialog (behind both **Add Author** and **Add Book**) fans the query out to the primary provider **plus** Hardcover (and Google Books, if an API key is set), then merges in any titles the primary didn't return. Books that only exist on hardcover.app are exactly what that path is meant to surface.
 
 The catch is that **Hardcover's GraphQL API requires an API token for every query, including search** — an unauthenticated request returns `{"error":"Unable to verify token"}`. With no token saved, Bindery skips Hardcover before sending anything, so it contributes nothing silently and you only see OpenLibrary / DNB results. Startup says so too: the log reads `hardcover enrichment idle: no api token configured` instead of `hardcover enrichment enabled`. Saving a token takes effect on the next lookup, with no restart.
 
@@ -288,8 +323,8 @@ co-author or a joint pen name. The log shows lines like:
 DEBUG calibre import: alias record skipped error="alias \"Isaac Asimov\" already points at author 1125 (refusing to reassign to 105)" name="Isaac Asimov"
 ```
 
-The scan then reports those same names under **Unmatched files** with "Parsed
-author isn't in your library", because the name only exists as an alias.
+The scan then lists those books on **Import → In your library** as by an
+author who is not in your library, because the name only exists as an alias.
 
 What happened: for a book credited to several people, the import used to record
 every co-author as an *alias* of the first credited author ([#1684](https://github.com/vavallee/bindery/issues/1684)).
@@ -348,6 +383,29 @@ Two things this does not do:
 - It does not react to a storage outage. If a mount is temporarily unavailable then every path under it looks missing at once, so Bindery deliberately keeps showing what it showed before rather than acting on the absence. Nothing is deleted or reset, and the books come back as they were when the mount does.
 
 If you reshape your library regularly, **Rename files** on the book or author page is the supported way to do it: it moves the file *and* repoints the same tracking row at the new location, so there is never a second row to clean up.
+
+## A scan leaves files unmatched
+
+Go to **Import → In your library**. Every book the last scan could not match
+is listed there, one row per book, with a sentence saying what the scan found
+and what to do: add the missing author and scan again, confirm a suggested
+book, or choose one. Adopting registers the files where they are and can be
+undone. The full walkthrough is in the user guide under [Adopting files
+already in your library](User-Guide-Wiki.md#adopting-files-already-in-your-library).
+
+A few things that look wrong but are not:
+
+- **A file you expected is not listed.** Symlinks are never listed, and a file
+  whose folder resolves outside your library folders is skipped. Replace the
+  link with the file, or add the real folder as a root.
+- **The list did not change after the volume came back.** A scan that finds no
+  files at all changes nothing on the list, so an unmounted library does not
+  erase your decisions. Scan again once it is mounted.
+- **A row you ignored is gone for good.** It is on the **Ignored** list, and
+  **Unignore** brings it back.
+
+If you file a bug about a row, include the reason code that shows when you
+hover its sentence.
 
 ## Collecting logs for a bug report
 

@@ -23,6 +23,7 @@ import (
 	"github.com/vavallee/bindery/internal/auth"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/importer"
+	"github.com/vavallee/bindery/internal/jobs"
 	"github.com/vavallee/bindery/internal/metadata"
 	"github.com/vavallee/bindery/internal/models"
 )
@@ -114,6 +115,14 @@ type stubMetaProvider struct {
 	// author, when non-nil, is returned by GetAuthor so tests can exercise
 	// the author-profile refresh path (Discussion #1226).
 	author *models.Author
+	// getAuthorBypass, when non-nil, receives whether each GetAuthor call
+	// carried metadata.WithCacheBypass, so a test can tell a refresh that
+	// reached the provider from one the aggregator cache answered (#2601).
+	// Buffered by the test; a full channel drops the report, never blocks.
+	getAuthorBypass chan bool
+	// getAuthorGate, when non-nil, blocks every GetAuthor call until it is
+	// closed, after the getAuthorBypass signal. Holds a catalogue sync open.
+	getAuthorGate chan struct{}
 }
 
 func (p *stubMetaProvider) Name() string {
@@ -128,7 +137,16 @@ func (p *stubMetaProvider) SearchAuthors(_ context.Context, _ string) ([]models.
 func (p *stubMetaProvider) SearchBooks(_ context.Context, _ string) ([]models.Book, error) {
 	return nil, nil
 }
-func (p *stubMetaProvider) GetAuthor(_ context.Context, _ string) (*models.Author, error) {
+func (p *stubMetaProvider) GetAuthor(ctx context.Context, _ string) (*models.Author, error) {
+	if p.getAuthorBypass != nil {
+		select {
+		case p.getAuthorBypass <- metadata.CacheBypassed(ctx):
+		default:
+		}
+	}
+	if p.getAuthorGate != nil {
+		<-p.getAuthorGate
+	}
 	return p.author, nil
 }
 func (p *stubMetaProvider) GetBook(_ context.Context, fid string) (*models.Book, error) {
@@ -2313,6 +2331,55 @@ func TestCreateAuthor_UsesGlobalMonitorDefaultsWhenOmitted(t *testing.T) {
 	}
 	if got.MonitorMode != models.AuthorMonitorModeFuture || got.MonitorLatestCount != 4 {
 		t.Fatalf("monitor defaults = %q/%d, want future/4", got.MonitorMode, got.MonitorLatestCount)
+	}
+}
+
+// TestCreateAuthor_AcceptsMonitorNewItems: the Add Author dialog now offers
+// Monitor new items, so Create has to take it. Before this it was Update only,
+// and "catalogue once, never let a refresh grow it" could not be said at add
+// time. Invalid values are rejected the same way Update rejects them.
+func TestCreateAuthor_AcceptsMonitorNewItems(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	settingsRepo := db.NewSettingsRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	ctx := context.Background()
+	provider := &fixedAuthorProvider{
+		result: &models.Author{
+			ForeignID:        "OL-MNI-A",
+			Name:             "New Items",
+			SortName:         "Items, New",
+			MetadataProvider: "openlibrary",
+		},
+	}
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(provider), settingsRepo, profileRepo, nil)
+
+	post := func(body map[string]any) *httptest.ResponseRecorder {
+		raw, _ := json.Marshal(body)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/author", bytes.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.Create(rec, req)
+		return rec
+	}
+
+	if rec := post(map[string]any{"foreignAuthorId": "OL-MNI-A", "authorName": "New Items", "monitored": true, "monitorNewItems": "bogus"}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid monitorNewItems: expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := post(map[string]any{"foreignAuthorId": "OL-MNI-A", "authorName": "New Items", "monitored": true, "monitorNewItems": "none"}); rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	got, err := authorRepo.GetByForeignID(ctx, "OL-MNI-A")
+	if err != nil || got == nil {
+		t.Fatalf("fetch author: %v, got=%+v", err, got)
+	}
+	if got.MonitorNewItems != models.AuthorMonitorNewItemsNone {
+		t.Fatalf("monitorNewItems = %q, want none", got.MonitorNewItems)
 	}
 }
 
@@ -7972,5 +8039,521 @@ func TestSaveAlternateNames_SharedLatinRule(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Name != "Haruki Murakamø" {
 		t.Fatalf("mixed-script author aliases = %+v, want exactly [Haruki Murakamø]", got)
+	}
+}
+
+// TestAddBook_RefusesBookAlreadyOwned covers #1227. Re-adding a book the
+// requesting user already owns used to reuse the row and force it back to
+// monitored. Now it answers 409 with the existing row, before any author
+// creation or upstream fetch, and leaves the row untouched (monitored stays
+// false). Another user's copy of the same foreign id is not a library
+// conflict for this user, but the guard after the poll still refuses to touch
+// or expose it.
+func TestAddBook_RefusesBookAlreadyOwned(t *testing.T) {
+	// Tenancy on: the conflict gate is scoped to the caller, so bob's request
+	// gets past it and exercises the post poll guard instead.
+	auth.SetEnforceTenancyForTests(t, true)
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	database.SetMaxOpenConns(1)
+
+	ctx := context.Background()
+	users := db.NewUserRepo(database)
+	alice, err := users.Create(ctx, "alice", "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := users.Create(ctx, "bob", "h2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+
+	author := &models.Author{
+		ForeignID: "OL-ALICE", Name: "Alice Author", SortName: "Author, Alice",
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := authorRepo.CreateForUser(ctx, author, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+	owned := &models.Book{
+		ForeignID: "OL-BOOK-OWNED", Title: "Owned", SortTitle: "Owned", AuthorID: author.ID,
+		Status: models.BookStatusImported, Monitored: false, Genres: []string{},
+		MetadataProvider: "openlibrary", OwnerUserID: alice.ID,
+	}
+	if err := bookRepo.Create(ctx, owned); err != nil {
+		t.Fatal(err)
+	}
+
+	// Buffered so the stub's non-blocking send lands when GetBook is entered;
+	// an empty channel after the request proves no upstream fetch happened.
+	entered := make(chan struct{}, 1)
+	provider := &stubMetaProvider{getBookEntered: entered}
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(provider), nil, profileRepo, nil)
+
+	// No foreignAuthorId: the pre-#1227 handler would have gone straight to
+	// the provider to resolve the author. The conflict must come first.
+	body, _ := json.Marshal(map[string]any{"foreignBookId": "OL-BOOK-OWNED"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/author/book", bytes.NewReader(body)).
+		WithContext(auth.WithUserID(context.Background(), alice.ID))
+	rec := httptest.NewRecorder()
+	h.AddBook(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("alice re-add: expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var conflict struct {
+		Error          string       `json:"error"`
+		ExistingBookID int64        `json:"existingBookId"`
+		ExistingBook   *models.Book `json:"existingBook"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&conflict); err != nil {
+		t.Fatal(err)
+	}
+	if conflict.ExistingBookID != owned.ID || conflict.ExistingBook == nil || conflict.ExistingBook.ID != owned.ID {
+		t.Fatalf("conflict body = %+v, want existingBookId %d", conflict, owned.ID)
+	}
+	if conflict.Error == "" {
+		t.Fatalf("conflict body has no error message")
+	}
+	select {
+	case <-entered:
+		t.Fatalf("conflict path reached the metadata provider")
+	default:
+	}
+	after, err := bookRepo.GetByID(ctx, owned.ID)
+	if err != nil || after == nil {
+		t.Fatalf("owned book after conflict = %+v err=%v", after, err)
+	}
+	if after.Monitored {
+		t.Fatalf("conflict flipped the owned book to monitored")
+	}
+	if after.Status != models.BookStatusImported {
+		t.Fatalf("conflict changed status to %q", after.Status)
+	}
+	if n, _ := authorRepo.ListByUser(ctx, alice.ID); len(n) != 1 {
+		t.Fatalf("conflict created an author row: %d authors", len(n))
+	}
+
+	// Bob does not own that book, so the library scoped gate does not fire
+	// for him. books.foreign_id is UNIQUE across users though, so the poll
+	// finds alice's row; the guard after it must refuse without touching or
+	// exposing that row.
+	body, _ = json.Marshal(map[string]any{
+		"foreignBookId": "OL-BOOK-OWNED", "foreignAuthorId": "OL-BOB-AUTHOR", "authorName": "Bob Author",
+	})
+	parent, cancel := context.WithTimeout(auth.WithUserID(context.Background(), bob.ID), 200*time.Millisecond)
+	defer cancel()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/author/book", bytes.NewReader(body)).WithContext(parent)
+	rec = httptest.NewRecorder()
+	h.AddBook(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("bob adding alice's book: expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var held map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&held); err != nil {
+		t.Fatal(err)
+	}
+	if held["error"] != "book is held by another user" {
+		t.Fatalf("bob conflict error = %v", held["error"])
+	}
+	if _, leaked := held["existingBook"]; leaked {
+		t.Fatalf("bob's 409 carries alice's row: %v", held)
+	}
+	if _, leaked := held["existingBookId"]; leaked {
+		t.Fatalf("bob's 409 carries alice's book id: %v", held)
+	}
+	// Compare against the row as read back before bob's request, not the
+	// fixture struct: Create fills defaults (media type) the struct lacks.
+	beforeBob := *after
+	after, err = bookRepo.GetByID(ctx, owned.ID)
+	if err != nil || after == nil {
+		t.Fatalf("alice's book after bob's add = %+v err=%v", after, err)
+	}
+	if after.Monitored || after.Status != beforeBob.Status || after.MediaType != beforeBob.MediaType || after.OwnerUserID != alice.ID || !after.UpdatedAt.Equal(beforeBob.UpdatedAt) {
+		t.Fatalf("bob's add changed alice's row: monitored=%v status=%q mediaType=%q owner=%d updatedAt=%v (before %v)", after.Monitored, after.Status, after.MediaType, after.OwnerUserID, after.UpdatedAt, beforeBob.UpdatedAt)
+	}
+	// The author row bob's request created is rolled back by the orphan
+	// cleanup defer, since no book was created for it.
+	if bobAuthors, _ := authorRepo.ListByUser(ctx, bob.ID); len(bobAuthors) != 0 {
+		t.Fatalf("bob's refused add left %d author row(s) behind: %+v", len(bobAuthors), bobAuthors)
+	}
+}
+
+// TestAddBook_RefusesNullOwnedBookForLoggedInUser: with tenancy off, a logged
+// in user re-adding a row with no owner (what any local only or API key
+// request creates) must hit the same conflict. The gate is scoped like the
+// library list, where that row is visible, not by strict owner equality.
+func TestAddBook_RefusesNullOwnedBookForLoggedInUser(t *testing.T) {
+	auth.SetEnforceTenancyForTests(t, false)
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	database.SetMaxOpenConns(1)
+
+	ctx := context.Background()
+	users := db.NewUserRepo(database)
+	alice, err := users.Create(ctx, "alice", "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	author := &models.Author{
+		ForeignID: "OL-NOBODY", Name: "Nobody Author", SortName: "Author, Nobody",
+		MetadataProvider: "openlibrary",
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	unowned := &models.Book{
+		ForeignID: "OL-BOOK-NULL", Title: "Unowned", SortTitle: "Unowned", AuthorID: author.ID,
+		Status: models.BookStatusImported, Monitored: false, Genres: []string{},
+		MetadataProvider: "openlibrary",
+	}
+	if err := bookRepo.Create(ctx, unowned); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := bookRepo.GetByID(ctx, unowned.ID); got == nil || got.OwnerUserID != 0 {
+		t.Fatalf("fixture book should have no owner, got %+v", got)
+	}
+
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(&stubMetaProvider{}), nil, profileRepo, nil)
+	body, _ := json.Marshal(map[string]any{
+		"foreignBookId": "OL-BOOK-NULL", "foreignAuthorId": "OL-NOBODY", "authorName": "Nobody Author",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/author/book", bytes.NewReader(body)).
+		WithContext(auth.WithUserID(context.Background(), alice.ID))
+	rec := httptest.NewRecorder()
+	h.AddBook(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var conflict struct {
+		ExistingBookID int64 `json:"existingBookId"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&conflict); err != nil {
+		t.Fatal(err)
+	}
+	if conflict.ExistingBookID != unowned.ID {
+		t.Fatalf("existingBookId = %d, want %d", conflict.ExistingBookID, unowned.ID)
+	}
+	after, err := bookRepo.GetByID(ctx, unowned.ID)
+	if err != nil || after == nil {
+		t.Fatalf("book after conflict = %+v err=%v", after, err)
+	}
+	if after.Monitored {
+		t.Fatalf("conflict flipped the unowned book to monitored")
+	}
+}
+
+// TestAddBook_AdminGetsConflictForOtherUsersBook: with tenancy on, an admin
+// sees every row in the library list, so re-adding another user's book is a
+// library conflict (409 with the row), not a silent 201 that re monitors it.
+func TestAddBook_AdminGetsConflictForOtherUsersBook(t *testing.T) {
+	auth.SetEnforceTenancyForTests(t, true)
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	database.SetMaxOpenConns(1)
+
+	ctx := context.Background()
+	users := db.NewUserRepo(database)
+	alice, err := users.Create(ctx, "alice", "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := users.Create(ctx, "admin", "h2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	author := &models.Author{
+		ForeignID: "OL-ALICE", Name: "Alice Author", SortName: "Author, Alice",
+		MetadataProvider: "openlibrary",
+	}
+	if err := authorRepo.CreateForUser(ctx, author, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+	owned := &models.Book{
+		ForeignID: "OL-BOOK-OWNED", Title: "Owned", SortTitle: "Owned", AuthorID: author.ID,
+		Status: models.BookStatusImported, Monitored: false, Genres: []string{},
+		MetadataProvider: "openlibrary", OwnerUserID: alice.ID,
+	}
+	if err := bookRepo.Create(ctx, owned); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(&stubMetaProvider{}), nil, profileRepo, nil)
+	body, _ := json.Marshal(map[string]any{
+		"foreignBookId": "OL-BOOK-OWNED", "foreignAuthorId": "OL-ALICE", "authorName": "Alice Author",
+	})
+	adminCtx := auth.WithUserRole(auth.WithUserID(context.Background(), admin.ID), "admin")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/author/book", bytes.NewReader(body)).WithContext(adminCtx)
+	rec := httptest.NewRecorder()
+	h.AddBook(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("admin re-add: expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var conflict struct {
+		ExistingBookID int64 `json:"existingBookId"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&conflict); err != nil {
+		t.Fatal(err)
+	}
+	if conflict.ExistingBookID != owned.ID {
+		t.Fatalf("existingBookId = %d, want %d", conflict.ExistingBookID, owned.ID)
+	}
+	after, err := bookRepo.GetByID(ctx, owned.ID)
+	if err != nil || after == nil {
+		t.Fatalf("book after conflict = %+v err=%v", after, err)
+	}
+	if after.Monitored {
+		t.Fatalf("admin re-add flipped alice's book to monitored")
+	}
+}
+
+// TestAuthorRefresh_ManualRefreshBypassesMetadataCache pins #2601. The metadata
+// aggregator caches author profiles and catalogues for 24 hours, and the manual
+// Refresh Metadata action used to read through that cache, so a bio, photo or
+// new book that appeared upstream stayed invisible for up to a day after the
+// user explicitly asked for it. The bulk paths (selection refresh and Refresh
+// all, both RefreshAuthorBooks) deliberately keep the cache: they fan out over
+// many authors, and the cache is what stops a repeat run refetching them all.
+func TestAuthorRefresh_ManualRefreshBypassesMetadataCache(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	ctx := context.Background()
+
+	author := &models.Author{
+		ForeignID: "OL2601A", Name: "Ann Leckie", SortName: "Leckie, Ann",
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	work := func(id, title string) models.Book {
+		return models.Book{ForeignID: id, Title: title, SortTitle: strings.ToLower(title), Language: "eng",
+			Status: models.BookStatusWanted, Genres: []string{}, MetadataProvider: "openlibrary"}
+	}
+	stub := &stubMetaProvider{
+		works:  []models.Book{work("OL2601W1", "Ancillary Justice")},
+		author: &models.Author{ForeignID: "OL2601A", Name: "Ann Leckie", Description: "old bio", MetadataProvider: "openlibrary"},
+	}
+	agg := metadata.NewAggregator(stub)
+	group := jobs.NewGroup(context.Background())
+	defer group.Shutdown(5 * time.Second) // runs before database.Close
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, agg, nil, profileRepo, nil).WithJobs(group)
+
+	profileAndBooks := func() (string, int) {
+		t.Helper()
+		got, err := authorRepo.GetByID(ctx, author.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		books, err := bookRepo.ListByAuthor(ctx, author.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.Description, len(books)
+	}
+
+	// Warm the aggregator cache the way a bulk refresh does.
+	h.RefreshAuthorBooks(author, false, "")
+	if desc, n := profileAndBooks(); desc != "old bio" || n != 1 {
+		t.Fatalf("after warm refresh: description %q, %d books; want %q and 1", desc, n, "old bio")
+	}
+
+	// Upstream changes: a new bio and a new book.
+	stub.author = &models.Author{ForeignID: "OL2601A", Name: "Ann Leckie", Description: "new bio", MetadataProvider: "openlibrary"}
+	stub.works = []models.Book{work("OL2601W1", "Ancillary Justice"), work("OL2601W2", "Translation State")}
+	stub.getAuthorBypass = make(chan bool, 8)
+
+	// The bulk path keeps reading through the cache.
+	reloaded, err := authorRepo.GetByID(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.RefreshAuthorBooks(reloaded, false, "")
+	if n := len(stub.getAuthorBypass); n != 0 {
+		t.Fatalf("bulk refresh reached the provider %d times; it should be answered by the cache", n)
+	}
+	if desc, n := profileAndBooks(); desc != "old bio" || n != 1 {
+		t.Fatalf("after bulk refresh: description %q, %d books; want the cached %q and 1", desc, n, "old bio")
+	}
+
+	// The manual Refresh Metadata action must go to the provider.
+	id := strconv.FormatInt(author.ID, 10)
+	req := withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/author/"+id+"/refresh", nil), "id", id)
+	rec := httptest.NewRecorder()
+	h.Refresh(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("Refresh status = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case bypassed := <-stub.getAuthorBypass:
+		if !bypassed {
+			t.Fatal("manual refresh reached the provider without metadata.WithCacheBypass")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("manual refresh never reached the provider: the 24 hour metadata cache answered it (#2601)")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		desc, n := profileAndBooks()
+		if desc == "new bio" && n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after manual refresh: description %q, %d books; want %q and 2", desc, n, "new bio")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The fresh profile was written back: an ordinary read serves it from the
+	// cache without another provider call.
+	cached, err := agg.GetAuthor(ctx, author.ForeignID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached == nil || cached.Description != "new bio" {
+		t.Fatalf("ordinary GetAuthor after refresh = %+v, want the refreshed %q from the cache", cached, "new bio")
+	}
+	if n := len(stub.getAuthorBypass); n != 0 {
+		t.Fatalf("ordinary GetAuthor after refresh reached the provider (%d extra calls)", n)
+	}
+}
+
+// TestAuthorRefresh_RefusesSecondRefreshWhileSyncRuns: five clicks on Refresh
+// used to start five concurrent full syncs, each one bypassing the metadata
+// cache (#2601 review). A click while a sync for that author is running is
+// refused with 409, the author payload says a sync is running so the page can
+// wait for it, and a click after it finishes starts a new one.
+func TestAuthorRefresh_RefusesSecondRefreshWhileSyncRuns(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	ctx := context.Background()
+
+	author := &models.Author{
+		ForeignID: "OL2601A", Name: "Ann Leckie", SortName: "Leckie, Ann",
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate) }) }
+	stub := &stubMetaProvider{
+		works: []models.Book{{ForeignID: "OL2601W1", Title: "Ancillary Justice", SortTitle: "ancillary justice", Language: "eng",
+			Status: models.BookStatusWanted, Genres: []string{}, MetadataProvider: "openlibrary"}},
+		author:          &models.Author{ForeignID: "OL2601A", Name: "Ann Leckie", Description: "bio", MetadataProvider: "openlibrary"},
+		getAuthorBypass: make(chan bool, 8),
+		getAuthorGate:   gate,
+	}
+	group := jobs.NewGroup(context.Background())
+	defer group.Shutdown(5 * time.Second) // runs before database.Close
+	defer release()                       // runs before Shutdown, so a held sync can drain
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(stub), nil, profileRepo, nil).WithJobs(group)
+
+	id := strconv.FormatInt(author.ID, 10)
+	click := func() *httptest.ResponseRecorder {
+		t.Helper()
+		req := withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/author/"+id+"/refresh", nil), "id", id)
+		rec := httptest.NewRecorder()
+		h.Refresh(rec, req)
+		return rec
+	}
+	syncing := func() bool {
+		t.Helper()
+		req := withURLParam(httptest.NewRequest(http.MethodGet, "/api/v1/author/"+id, nil), "id", id)
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET author = %d: %s", rec.Code, rec.Body.String())
+		}
+		var got models.Author
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode author: %v", err)
+		}
+		return got.SyncInProgress
+	}
+	waitForProvider := func() {
+		t.Helper()
+		select {
+		case <-stub.getAuthorBypass:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the refresh sync never reached the provider")
+		}
+	}
+
+	if rec := click(); rec.Code != http.StatusAccepted {
+		t.Fatalf("first Refresh = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	waitForProvider() // the first sync is now held inside GetAuthor
+
+	rec := click()
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("second Refresh while the first sync runs = %d, want 409: a second concurrent sync was started", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "already running") {
+		t.Fatalf("409 body = %s, want a message saying a refresh is already running", rec.Body.String())
+	}
+	select {
+	case <-stub.getAuthorBypass:
+		t.Fatal("the refused Refresh still reached the provider")
+	default:
+	}
+	if !syncing() {
+		t.Fatal("author payload does not report the running sync; the page cannot tell when it finishes")
+	}
+
+	release()
+	deadline := time.Now().Add(5 * time.Second)
+	for syncing() {
+		if time.Now().After(deadline) {
+			t.Fatal("author payload still reports a running sync after it finished")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if rec := click(); rec.Code != http.StatusAccepted {
+		t.Fatalf("Refresh after the first sync finished = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	waitForProvider()
+	deadline = time.Now().Add(5 * time.Second)
+	for syncing() {
+		if time.Now().After(deadline) {
+			t.Fatal("the third sync never finished")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

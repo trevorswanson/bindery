@@ -229,8 +229,9 @@ func (r *AuthorRepo) ListPageFiltered(ctx context.Context, f AuthorListFilter, l
 		// the limitation migration 058 already worked around for ordering.
 		//
 		// One clause per token: every word the user typed must appear, in the
-		// name or in one alias.
-		for _, tok := range strings.Fields(folded) {
+		// name or in one alias. Capped at maxSearchTokens (searchrank.go) so
+		// the statement's size is bounded by that constant, not by the input.
+		for _, tok := range searchTokens(folded) {
 			like := "%" + escapeLike(tok) + "%"
 			conds = append(conds, "(authors.search_key LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM author_aliases al WHERE al.author_id = authors.id AND al.search_key LIKE ? ESCAPE '\\'))")
 			args = append(args, like, like)
@@ -395,6 +396,76 @@ func (r *AuthorRepo) GetByAnyForeignID(ctx context.Context, foreignID string) (*
 		return nil, fmt.Errorf("get author by identifier %s: %w", foreignID, err)
 	}
 	return &a, nil
+}
+
+// LibraryIDsByAnyForeignIDsForUser maps each of the given foreign ids that
+// resolves to an author visible to the user, by primary foreign_id or by an
+// alternate identifier, to that author's id in one query. It is the batch form
+// of GetByAnyForeignIDForUser, used to stamp metadata search results with the
+// library author they already correspond to (#1227). Scoping matches the
+// single-row form: owner equal to userID or NULL when userID > 0, global
+// otherwise. When both a primary id and an alternate identifier match the
+// same foreign id the primary wins.
+func (r *AuthorRepo) LibraryIDsByAnyForeignIDsForUser(ctx context.Context, foreignIDs []string, userID int64) (map[string]int64, error) {
+	out := make(map[string]int64, len(foreignIDs))
+	ids := make([]string, 0, len(foreignIDs))
+	seen := make(map[string]bool, len(foreignIDs))
+	for _, id := range foreignIDs {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(ids))
+	inArgs := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		inArgs[i] = id
+	}
+	in := "(" + strings.Join(placeholders, ",") + ")"
+	scope := ""
+	var scopeArgs []any
+	if userID != 0 {
+		scope = " AND (a.owner_user_id = ? OR a.owner_user_id IS NULL)"
+		scopeArgs = []any{userID}
+	}
+	// Primary ids sort first (rank 0) so the first row per foreign id wins.
+	//nolint:gosec // G202: in is generated ? placeholders and scope a fixed owner predicate; every foreign id and the user id are bound via args
+	query := `SELECT a.foreign_id, a.id, 0 AS rank FROM authors a WHERE a.foreign_id IN ` + in + scope + `
+		UNION ALL
+		SELECT ai.foreign_id, a.id, 1 AS rank FROM author_identifiers ai
+		JOIN authors a ON a.id = ai.author_id WHERE ai.foreign_id IN ` + in + scope + `
+		ORDER BY rank`
+	args := make([]any, 0, 2*(len(inArgs)+len(scopeArgs)))
+	args = append(args, inArgs...)
+	args = append(args, scopeArgs...)
+	args = append(args, inArgs...)
+	args = append(args, scopeArgs...)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("library ids by author identifier: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var foreignID string
+		var id int64
+		var rank int
+		if err := rows.Scan(&foreignID, &id, &rank); err != nil {
+			return nil, fmt.Errorf("scan library author id: %w", err)
+		}
+		if _, dup := out[foreignID]; !dup {
+			out[foreignID] = id
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("library ids by author identifier: %w", err)
+	}
+	return out, nil
 }
 
 // GetByAnyForeignIDForUser is the user-scoped form of GetByAnyForeignID.

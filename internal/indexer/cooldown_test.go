@@ -253,3 +253,257 @@ func TestCooldownIsSharedAcrossSearchPaths(t *testing.T) {
 		t.Errorf("auto-grab and freeform search sent %d more request(s) to a held indexer", got-first)
 	}
 }
+
+// cloudflareBlockedIndexer serves the HTTP 429 that Cloudflare answers with
+// when a tracker's rate limit trips (error code 1015): a text body, no
+// Newznab <error> element. It counts how many times it was asked.
+func cloudflareBlockedIndexer(t *testing.T, retryAfter string) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		if retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("error code: 1015"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &hits
+}
+
+// TestSearchBookStopsQueryingAnHTTP429Indexer is #2635's pin: a rate limit
+// applied by the host in front of the indexer must bench it the same way a
+// Newznab <error code="500"> does. Before the fix the 429 was an untyped
+// error, no cooldown was recorded, and every search in a sweep of thousands
+// of books sent the indexer another request it had already refused.
+func TestSearchBookStopsQueryingAnHTTP429Indexer(t *testing.T) {
+	srv, hits := cloudflareBlockedIndexer(t, "")
+	s := newTestSearcher()
+	idxs := []models.Indexer{{ID: 1, Name: "NZB.life", URL: srv.URL, Enabled: true, Categories: []int{7020}}}
+	crit := MatchCriteria{Title: "Redshirts", Author: "John Scalzi", MediaType: models.MediaTypeEbook}
+
+	s.SearchBook(context.Background(), idxs, crit)
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("the first search sent %d requests, want 1: a 429 must also stop tier fall-through", got)
+	}
+	for range 5 {
+		s.SearchBook(context.Background(), idxs, crit)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("the indexer was queried %d more time(s) while in cooldown", got-1)
+	}
+	reason, held := s.cooldowns.active(idxs[0])
+	if !held {
+		t.Fatal("no cooldown recorded for the 429")
+	}
+	if !strings.Contains(reason, "HTTP 429") {
+		t.Errorf("cooldown reason = %q, want it to carry the HTTP status", reason)
+	}
+}
+
+// TestCooldownHonoursRetryAfter: a Retry-After header is the server's own
+// deadline and outranks the default hour, within the usual clamp.
+func TestCooldownHonoursRetryAfter(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	idx := models.Indexer{ID: 7, Name: "abNZB"}
+	cases := []struct {
+		name string
+		err  error
+		want time.Duration
+	}{
+		{"seconds", &newznab.HTTPStatusError{Status: 429, RetryAfter: 20 * time.Minute}, 20 * time.Minute},
+		{"absent falls back to the default", &newznab.HTTPStatusError{Status: 429}, defaultRateLimitCooldown},
+		{"clamped to the maximum", &newznab.HTTPStatusError{Status: 429, RetryAfter: 72 * time.Hour}, maxRateLimitCooldown},
+		{"503 with Retry-After", &newznab.HTTPStatusError{Status: 503, RetryAfter: 5 * time.Minute}, 5 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &indexerCooldowns{now: func() time.Time { return now }}
+			if !c.note(idx, tc.err) {
+				t.Fatalf("%v did not record a cooldown", tc.err)
+			}
+			if got := c.entries[idx.ID].until.Sub(now); got != tc.want {
+				t.Errorf("cooldown = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCooldownIgnoresAPlain503: a 503 with no Retry-After is maintenance or
+// a proxy hiccup, not an instruction to stay away, so the next search may
+// try again.
+func TestCooldownIgnoresAPlain503(t *testing.T) {
+	c := &indexerCooldowns{}
+	idx := models.Indexer{ID: 3, Name: "NZB Finder"}
+	if c.note(idx, &newznab.HTTPStatusError{Status: 503, Snippet: "maintenance"}) {
+		t.Error("a plain 503 recorded a cooldown")
+	}
+}
+
+// TestCooldownEscalatesOnRepeatedRateLimits: an indexer that keeps refusing
+// is left alone for longer each time, up the same ladder Sonarr and Radarr
+// climb, and stays at the top rather than wrapping.
+func TestCooldownEscalatesOnRepeatedRateLimits(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	c := &indexerCooldowns{now: func() time.Time { return now }}
+	idx := models.Indexer{ID: 1, Name: "NZB.life"}
+	err := &newznab.HTTPStatusError{Status: 429, Snippet: "error code: 1015"}
+
+	want := []time.Duration{time.Hour, 3 * time.Hour, 6 * time.Hour, 12 * time.Hour, 24 * time.Hour, 24 * time.Hour}
+	for i, d := range want {
+		if !c.note(idx, err) {
+			t.Fatalf("limit %d: no cooldown recorded", i+1)
+		}
+		if got := c.entries[idx.ID].until.Sub(now); got != d {
+			t.Errorf("limit %d: cooldown = %s, want %s", i+1, got, d)
+		}
+		// Wait it out, so the next limit is the first request after it.
+		now = c.entries[idx.ID].until.Add(time.Second)
+		if _, held := c.active(idx); held {
+			t.Fatalf("limit %d: still held after the cooldown expired", i+1)
+		}
+	}
+}
+
+// TestCooldownRelaxesOnSuccess: a search the indexer answers steps the ladder
+// down one rung, so a limit that clears and comes back a week later costs an
+// hour again rather than a day.
+func TestCooldownRelaxesOnSuccess(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	c := &indexerCooldowns{now: func() time.Time { return now }}
+	idx := models.Indexer{ID: 1, Name: "NZB.life"}
+	err := &newznab.IndexerError{Code: 500, Description: "Request limit reached."}
+
+	// Each limit lands after the previous hold has expired: a limit during a
+	// running hold is the same burst and does not climb.
+	expire := func() { now = c.entries[idx.ID].until.Add(time.Second) }
+	c.note(idx, err) // 1h, level now 1
+	expire()
+	c.note(idx, err) // 3h, level now 2
+	expire()
+	c.relax(idx) // level 1
+	c.note(idx, err)
+	if got := c.entries[idx.ID].until.Sub(now); got != 3*time.Hour {
+		t.Errorf("after one success the next limit = %s, want 3h", got)
+	}
+	expire()
+	c.relax(idx)
+	c.relax(idx)
+	c.relax(idx) // cannot go below the first rung
+	c.note(idx, err)
+	if got := c.entries[idx.ID].until.Sub(now); got != time.Hour {
+		t.Errorf("after several successes the next limit = %s, want 1h", got)
+	}
+}
+
+// TestCooldownHintOutranksLadder: the indexer's own deadline is what it
+// asked for, whichever rung the ladder is on.
+func TestCooldownHintOutranksLadder(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	c := &indexerCooldowns{now: func() time.Time { return now }}
+	idx := models.Indexer{ID: 1, Name: "NZB.life"}
+	for range 3 {
+		c.note(idx, &newznab.HTTPStatusError{Status: 429})
+		now = c.entries[idx.ID].until.Add(time.Second)
+	}
+	c.note(idx, &newznab.HTTPStatusError{Status: 429, RetryAfter: 20 * time.Minute})
+	if got := c.entries[idx.ID].until.Sub(now); got != 20*time.Minute {
+		t.Errorf("Retry-After on rung 4 gave %s, want 20m", got)
+	}
+	now = c.entries[idx.ID].until.Add(time.Second)
+	c.note(idx, &newznab.IndexerError{Code: 500, Description: "Request limit reached. Retry in 485 minutes."})
+	if got := c.entries[idx.ID].until.Sub(now); got != 485*time.Minute {
+		t.Errorf("text hint on rung 5 gave %s, want 485m", got)
+	}
+}
+
+// TestCooldownEditResetsLadder: editing the indexer forgets the rung along
+// with the entry; a new key or account starts over at an hour.
+func TestCooldownEditResetsLadder(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	c := &indexerCooldowns{now: func() time.Time { return now }}
+	idx := models.Indexer{ID: 1, Name: "NZB.life"}
+	err := &newznab.HTTPStatusError{Status: 429}
+	c.note(idx, err)
+	c.note(idx, err)
+	idx.UpdatedAt = now.Add(time.Minute)
+	if _, held := c.active(idx); held {
+		t.Fatal("still held after the indexer was edited")
+	}
+	c.note(idx, err)
+	if got := c.entries[idx.ID].until.Sub(now); got != time.Hour {
+		t.Errorf("first limit after an edit = %s, want 1h", got)
+	}
+}
+
+// TestSearcherReportsCooldownForTheIndexersTab: the exported view the API
+// fills into the indexer list.
+func TestSearcherReportsCooldownForTheIndexersTab(t *testing.T) {
+	srv, _ := cloudflareBlockedIndexer(t, "")
+	s := newTestSearcher()
+	idxs := []models.Indexer{{ID: 1, Name: "NZB.life", URL: srv.URL, Enabled: true, Categories: []int{7020}}}
+	if _, _, held := s.Cooldown(idxs[0]); held {
+		t.Fatal("held before any search")
+	}
+	s.SearchBook(context.Background(), idxs, MatchCriteria{Title: "Redshirts", Author: "John Scalzi", MediaType: models.MediaTypeEbook})
+	until, reason, held := s.Cooldown(idxs[0])
+	if !held {
+		t.Fatal("not held after a 429")
+	}
+	if d := time.Until(until); d < 59*time.Minute || d > 61*time.Minute {
+		t.Errorf("until is %s away, want about an hour", d)
+	}
+	if !strings.Contains(reason, "HTTP 429") {
+		t.Errorf("reason = %q, want the indexer's message", reason)
+	}
+}
+
+// TestCooldownBurstClimbsOneRung is the v1.36.2 review finding: searches
+// already in flight when an indexer starts refusing each get a 429 and each
+// call note. The burst must count once, or a first ever limit with two
+// sweep searches running held the indexer for three hours.
+func TestCooldownBurstClimbsOneRung(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	c := &indexerCooldowns{now: func() time.Time { return now }}
+	idx := models.Indexer{ID: 1, Name: "NZB.life"}
+	err := &newznab.HTTPStatusError{Status: 429, Snippet: "error code: 1015"}
+
+	for range 4 {
+		if !c.note(idx, err) {
+			t.Fatal("a 429 during a hold was not reported as a rate limit")
+		}
+	}
+	if got := c.entries[idx.ID].until.Sub(now); got != time.Hour {
+		t.Errorf("four 429s in one burst held for %s, want 1h", got)
+	}
+
+	// Once that hold has expired, the next limit is the second rung.
+	now = now.Add(time.Hour + time.Second)
+	c.note(idx, err)
+	if got := c.entries[idx.ID].until.Sub(now); got != 3*time.Hour {
+		t.Errorf("the next limit after the burst = %s, want 3h", got)
+	}
+}
+
+// TestCooldownHintDoesNotClimb: a limit that names its own time takes that
+// time and leaves the ladder where it was, and never shortens a running hold.
+func TestCooldownHintDoesNotClimb(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	c := &indexerCooldowns{now: func() time.Time { return now }}
+	idx := models.Indexer{ID: 1, Name: "Prowlarr"}
+
+	c.note(idx, &newznab.HTTPStatusError{Status: 503, RetryAfter: 90 * time.Second})
+	now = now.Add(2 * time.Minute)
+	c.note(idx, &newznab.HTTPStatusError{Status: 503, RetryAfter: 90 * time.Second})
+	now = now.Add(2 * time.Minute)
+	c.note(idx, &newznab.HTTPStatusError{Status: 429})
+	if got := c.entries[idx.ID].until.Sub(now); got != time.Hour {
+		t.Errorf("a plain 429 after two hinted limits = %s, want 1h (hints must not climb)", got)
+	}
+
+	c.note(idx, &newznab.HTTPStatusError{Status: 429, RetryAfter: 5 * time.Minute})
+	if got := c.entries[idx.ID].until.Sub(now); got != time.Hour {
+		t.Errorf("a 5m Retry-After during a 1h hold left %s, want the 1h hold kept", got)
+	}
+}

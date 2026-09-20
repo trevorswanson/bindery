@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router'
+import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import { api, BINDERY_BASE, Book, HistoryEvent, MediaType, SearchResult, SearchDebug, Series } from '../api/client'
 import SearchDebugPanel from '../components/SearchDebugPanel'
@@ -7,7 +7,8 @@ import CoverPlaceholder from '../components/CoverPlaceholder'
 import MarkdownDescription from '../components/MarkdownDescription'
 import MoreMenu from '../components/MoreMenu'
 import Section from '../components/Section'
-import { btn, btnSize } from '../components/buttons'
+import Switch from '../components/Switch'
+import { btn, btnSize, dangerLink } from '../components/buttons'
 import MediaBadge from '../components/MediaBadge'
 import { bookStatusBadge } from '../components/bookStatus'
 import RebindModal from '../components/RebindModal'
@@ -20,6 +21,7 @@ import { metadataSourceLink, providerDisplayName, providerFromBookForeignId } fr
 import FixMatchModal from '../components/FixMatchModal'
 import EditBookModal from '../components/EditBookModal'
 import { formatBytes } from '../util/format'
+import MetadataLinksMenu from '../components/MetadataLinksMenu'
 
 function formatDuration(seconds?: number): string {
   if (!seconds || seconds <= 0) return ''
@@ -242,10 +244,42 @@ export function SearchResultsSection({
 // to prevent.
 const actionBtnCls = `${btn.secondary} ${btnSize.md}`
 
+// Previous/Next navigation (#2548, book side), entirely client-side:
+// BooksPage, AuthorDetailPage's own book list, and WantedPage already have
+// their current page loaded and ordered, so each hands it over as router
+// `state` instead of this page re-fetching it. Not shared as an exported type
+// — each list page builds the same shape independently.
+interface BookNavState {
+  ids: number[]
+  index: number
+  // How many consecutive book-detail pages deep this hop is from the
+  // originating list page — 1 on the first hop in from a list, +1 on every
+  // further Previous/Next. Back uses it to jump back over the WHOLE chain in
+  // one step (navigate(-hopDepth)) instead of landing one book short after a
+  // few hops. Not a hard-coded destination (e.g. always "/") because a book
+  // can be reached from five different lists, so there's no single canonical
+  // one to jump to instead — counting hops and walking back that many history
+  // entries works regardless of where the chain started.
+  hopDepth: number
+}
+
 export default function BookDetailPage() {
+  const { id } = useParams<{ id: string }>()
+  // Remounts on every id change rather than trying to individually reset the
+  // many book-scoped state variables below (search results, delete/
+  // deregister/fix-match targets, series membership, ASIN draft, clipboard
+  // flags, ...). A Previous/Next hop only changes the :id param — react-router
+  // does not remount the element for that alone — and auditing every one of
+  // those ~10 async handlers for staleness one by one would be easy to get
+  // wrong; a full remount resets all of it at once and can't miss one.
+  return <BookDetailPageInner key={id} />
+}
+
+function BookDetailPageInner() {
   const { t } = useTranslation()
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const location = useLocation()
   const bookId = Number(id)
 
   const [book, setBook] = useState<Book | null>(null)
@@ -287,8 +321,13 @@ export default function BookDetailPage() {
   const idClipboard = useClipboardCopy()
   const [copiedId, setCopiedId] = useState<string | null>(null)
   // Series membership for the meta row. series_books has been populated since
-  // v0.7.0 but this page never surfaced it.
-  const [series, setSeries] = useState<{ title: string; position: string }[]>([])
+  // v0.7.0 but this page never surfaced it. Carries the series id and the
+  // primary flag as of #2525, because a book in two series needs to say which
+  // one names its files and to leave the one it does not belong in.
+  const [series, setSeries] = useState<{ id: number; title: string; position: string; primary: boolean }[]>([])
+  const [seriesBusy, setSeriesBusy] = useState(false)
+  const [removeSeries, setRemoveSeries] = useState<{ id: number; title: string } | null>(null)
+  const [seriesNonce, setSeriesNonce] = useState(0)
 
   useEffect(() => {
     if (book?.title) {
@@ -322,17 +361,56 @@ export default function BookDetailPage() {
     api.listAuthorSeries(authorId)
       .then((list: Series[]) => {
         if (cancelled) return
-        const mine: { title: string; position: string }[] = []
+        const mine: { id: number; title: string; position: string; primary: boolean }[] = []
         for (const s of list) {
           for (const entry of s.books ?? []) {
-            if (entry.bookId === id) mine.push({ title: s.title, position: entry.positionInSeries })
+            if (entry.bookId === id) {
+              mine.push({
+                id: s.id,
+                title: s.title,
+                position: entry.positionInSeries,
+                primary: entry.primarySeries === true,
+              })
+            }
           }
         }
         setSeries(mine)
       })
       .catch(() => { /* no series row */ })
     return () => { cancelled = true }
-  }, [book?.authorId, book?.id])
+  }, [book?.authorId, book?.id, seriesNonce])
+
+  // #2525: the renamer reads one series per book. When a book sits in both its
+  // real series and an umbrella "Universe" one, these are how the user says
+  // which, and how they leave the one that should never have been linked.
+  const makePrimarySeries = async (seriesId: number) => {
+    if (!book) return
+    setSeriesBusy(true)
+    setError(null)
+    try {
+      await api.setPrimarySeriesForBook(seriesId, book.id)
+      setSeriesNonce(n => n + 1)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('bookDetail.series.setPrimaryFailed'))
+    } finally {
+      setSeriesBusy(false)
+    }
+  }
+
+  const confirmRemoveSeries = async () => {
+    if (!book || !removeSeries) return
+    setSeriesBusy(true)
+    setError(null)
+    try {
+      await api.removeBookFromSeries(removeSeries.id, book.id)
+      setRemoveSeries(null)
+      setSeriesNonce(n => n + 1)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('bookDetail.series.removeFailed'))
+    } finally {
+      setSeriesBusy(false)
+    }
+  }
 
   const saveField = async (patch: Partial<Book>) => {
     if (!book) return
@@ -496,8 +574,95 @@ export default function BookDetailPage() {
     await idClipboard.copy(value)
   }
 
-  if (loading) return <div className="text-slate-600 dark:text-zinc-500">{t('common.loading')}</div>
-  if (!book) return <div className="text-slate-600 dark:text-zinc-500">{t('bookDetail.notFound')}</div>
+  // Validated against bookId: stale state (browser back/forward) or no state
+  // at all (opened from somewhere that never set it) must read as "no nav
+  // info", not point at the wrong neighbour. hopDepth normalizes to 1 rather
+  // than invalidating the whole state if a producer ever omits it.
+  const navState = (() => {
+    const s = location.state as Partial<BookNavState> | null
+    if (s && Array.isArray(s.ids) && typeof s.index === 'number' && s.ids[s.index] === bookId) {
+      const hopDepth = typeof s.hopDepth === 'number' && s.hopDepth > 0 ? s.hopDepth : 1
+      return { ids: s.ids, index: s.index, hopDepth }
+    }
+    return null
+  })()
+  const prevId = navState && navState.index > 0 ? navState.ids[navState.index - 1] : null
+  const nextId = navState && navState.index < navState.ids.length - 1 ? navState.ids[navState.index + 1] : null
+  // Back skips the entire Previous/Next chain in one jump rather than landing
+  // one book short — see the hopDepth comment on BookNavState above.
+  const backSteps = navState ? navState.hopDepth : 1
+  // Both Prev/Next Links below carry the same ids and incremented hopDepth,
+  // only the index differs — built once rather than duplicating the object
+  // at each Link.
+  const navStateFor = (index: number): BookNavState | undefined =>
+    navState ? { ids: navState.ids, index, hopDepth: navState.hopDepth + 1 } : undefined
+
+  // Depends only on navState/backSteps, not on `book`, so it renders the same
+  // above the loading and not-found returns below as it does in the loaded
+  // page — otherwise every hop blanked the header while the next book
+  // loaded, and a book deleted since the list loaded stranded the visitor on
+  // "Book not found" with no Back or Previous to get out with. (Focus itself
+  // lands on <body> on every hop either way, since key={id} on the outer
+  // component remounts this whole subtree regardless of where this row sits
+  // within it — not something this change affects.)
+  const navRow = (
+    <div className="mb-4 flex items-center justify-between gap-3 text-sm">
+      {/* No hard-coded destination — a book can be reached from five
+          different lists (Books, an author's own book list, Wanted, a
+          series, a direct link), so there is no single canonical "the
+          list" to name. Instead this walks back exactly as many history
+          entries as the Previous/Next chain is deep (backSteps), landing
+          on whichever list actually started it rather than one book
+          short. */}
+      <button
+        onClick={() => navigate(-backSteps)}
+        className="text-emerald-600 dark:text-emerald-400 hover:underline"
+      >
+        {t('bookDetail.back')}
+      </button>
+      {navState && (prevId !== null || nextId !== null) && (
+        <div className="flex items-center gap-2">
+          {prevId !== null && (
+            <Link
+              to={`/book/${prevId}`}
+              state={navStateFor(navState.index - 1)}
+              aria-label={t('bookDetail.nav.previousAriaLabel', 'Previous book')}
+              className={`${btn.ghost} ${btnSize.sm}`}
+            >
+              {t('bookDetail.nav.previous', '‹ Previous')}
+            </Link>
+          )}
+          {nextId !== null && (
+            <Link
+              to={`/book/${nextId}`}
+              state={navStateFor(navState.index + 1)}
+              aria-label={t('bookDetail.nav.nextAriaLabel', 'Next book')}
+              className={`${btn.ghost} ${btnSize.sm}`}
+            >
+              {t('bookDetail.nav.next', 'Next ›')}
+            </Link>
+          )}
+        </div>
+      )}
+    </div>
+  )
+
+  if (loading) {
+    return (
+      <div className="max-w-7xl">
+        {navRow}
+        <div className="text-slate-600 dark:text-zinc-500">{t('common.loading')}</div>
+      </div>
+    )
+  }
+  if (!book) {
+    return (
+      <div className="max-w-7xl">
+        {navRow}
+        <div className="text-slate-600 dark:text-zinc-500">{t('bookDetail.notFound')}</div>
+      </div>
+    )
+  }
 
   const mt: MediaType = book.mediaType || 'ebook'
 
@@ -534,6 +699,7 @@ export default function BookDetailPage() {
     }
     return rows
   })()
+  const sourceLinks = identityRows.flatMap(row => row.link ? [row.link] : [])
 
   // Display truth is the file inventory, never the declared media type.
   const rows = fileRows(book)
@@ -589,14 +755,7 @@ export default function BookDetailPage() {
     // (7xl vs 4xl), so author → book collapsed the content by 384px and
     // left-aligned it mid-navigation.
     <div className="max-w-7xl">
-      <div className="mb-4 flex items-center gap-3 text-sm">
-        <button
-          onClick={() => navigate(-1)}
-          className="text-emerald-600 dark:text-emerald-400 hover:underline"
-        >
-          {t('bookDetail.back')}
-        </button>
-      </div>
+      {navRow}
 
       {/* ===== Header: cover + metadata ===== */}
       <div className="flex flex-col sm:flex-row gap-6">
@@ -642,6 +801,17 @@ export default function BookDetailPage() {
                 </span>
               )
             })()}
+            {/* The badge only reports monitoring; changing it meant going back
+                to the Books list and using the bulk action (#2417). No state
+                text next to the switch — the badge already carries it, and the
+                label matches the list's Monitor / Unmonitor wording. */}
+            <Switch
+              checked={book.monitored}
+              onChange={() => saveField({ monitored: !book.monitored })}
+              label={book.monitored ? t('common.unmonitor') : t('common.monitor')}
+              disabled={saving}
+              className="px-1"
+            />
             {book.excluded && (
               <span className="inline-flex items-center px-2 py-0.5 rounded font-medium bg-amber-500/20 text-amber-700 dark:text-amber-400">
                 {t('bookDetail.excludedBadge')}
@@ -681,7 +851,7 @@ export default function BookDetailPage() {
               </>
             ) : null}
             {series.map(s => (
-              <span key={`${s.title}-${s.position}`} className="contents">
+              <span key={s.id} className="contents">
                 <span aria-hidden className="text-slate-400 dark:text-zinc-600">·</span>
                 <span className="text-slate-600 dark:text-zinc-400">
                   {s.position
@@ -694,22 +864,12 @@ export default function BookDetailPage() {
                 </span>
               </span>
             ))}
-            {(() => {
-              const src = metadataSourceLink(book.foreignBookId, 'book')
-              return src ? (
-                <>
-                  <span aria-hidden className="text-slate-400 dark:text-zinc-600">·</span>
-                  <a
-                    href={src.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-emerald-600 dark:text-emerald-400 hover:underline"
-                  >
-                    {t('common.viewOnSource', { source: src.label, defaultValue: 'View on {{source}} ↗' })}
-                  </a>
-                </>
-              ) : null
-            })()}
+            {sourceLinks.length > 0 && (
+              <>
+                <span aria-hidden className="text-slate-400 dark:text-zinc-600">·</span>
+                <MetadataLinksMenu links={sourceLinks} />
+              </>
+            )}
           </div>
 
           {/* Clamped with show more/less, matching AuthorDetailPage. max-w-prose
@@ -757,6 +917,51 @@ export default function BookDetailPage() {
         <div className="mt-6 px-3 py-2 bg-red-100 dark:bg-red-950/30 border border-red-300 dark:border-red-900 rounded text-sm text-red-800 dark:text-red-300">
           {error}
         </div>
+      )}
+
+      {/* ===== Series membership (#2525) =====
+          Only when a book is in more than one series. With a single membership
+          there is nothing to choose and nothing to correct, so the meta row
+          above already says everything. */}
+      {series.length > 1 && (
+        <Section title={t('bookDetail.series.heading')}>
+          <p className="text-xs text-slate-500 dark:text-zinc-500">{t('bookDetail.series.explainer')}</p>
+          <ul className="mt-3 space-y-2">
+            {series.map(s => (
+              <li key={s.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+                <span className="text-slate-700 dark:text-zinc-300">
+                  {s.position
+                    ? t('bookDetail.seriesPosition', {
+                        series: s.title,
+                        position: s.position,
+                        defaultValue: '{{series}} #{{position}}',
+                      })
+                    : s.title}
+                </span>
+                {s.primary ? (
+                  <span className="text-xs text-slate-500 dark:text-zinc-500">{t('bookDetail.series.namesFiles')}</span>
+                ) : (
+                  <button
+                    type="button"
+                    className={`${btn.ghost} ${btnSize.sm}`}
+                    disabled={seriesBusy}
+                    onClick={() => makePrimarySeries(s.id)}
+                  >
+                    {t('bookDetail.series.useForNaming')}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className={`${dangerLink} text-xs disabled:opacity-50`}
+                  disabled={seriesBusy}
+                  onClick={() => setRemoveSeries({ id: s.id, title: s.title })}
+                >
+                  {t('bookDetail.series.remove')}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </Section>
       )}
 
       {/* ===== File section ===== */}
@@ -961,6 +1166,25 @@ export default function BookDetailPage() {
                   disabled: !hasAnyFile || deletingFile || deregistering || deletingBook,
                   onSelect: () => setDeleteTarget({ paths: rows.map(r => r.path) }),
                 },
+                {
+                  // Was a "Danger zone" section of its own: a heading, a
+                  // rose-tinted full-width card and the page's only solid red
+                  // button, for one action. AuthorDetailPage has always put the
+                  // equivalent Delete in this menu with danger styling, so the
+                  // two pages disagreed about what deleting a thing looks like
+                  // and the book page shouted.
+                  //
+                  // Nothing is hidden: the item is one click from where it
+                  // always was, it keeps its own confirm dialog, and unlike
+                  // every other item here it is NOT gated on hasAnyFile,
+                  // because a wanted book with no file is still a book you may
+                  // want to delete.
+                  label: t('bookDetail.deleteBook'),
+                  title: t('bookDetail.dangerBody'),
+                  danger: true,
+                  disabled: deletingBook || deletingFile,
+                  onSelect: () => setShowDeleteBook(true),
+                },
               ]}
             />
           </div>
@@ -1129,27 +1353,6 @@ export default function BookDetailPage() {
         </Section>
       )}
 
-      {/* ===== Danger zone ===== */}
-      <Section
-        title={t('bookDetail.dangerHeading')}
-        tone="danger"
-        cardClassName="p-4 flex flex-col sm:flex-row sm:items-center gap-4"
-      >
-        <p className="text-sm text-slate-600 dark:text-zinc-400 flex-1">
-          {t('bookDetail.dangerBody')}
-        </p>
-        {/* The only solid-red control on the page. Deleting the book and every
-            file on disk is the one genuinely irreversible action here. */}
-        <button
-          type="button"
-          onClick={() => setShowDeleteBook(true)}
-          disabled={deletingBook || deletingFile}
-          className={`shrink-0 ${btn.dangerSolid} ${btnSize.md}`}
-        >
-          {t('bookDetail.deleteBook')}
-        </button>
-      </Section>
-
       {showEdit && (
         <EditBookModal
           book={book}
@@ -1240,6 +1443,23 @@ export default function BookDetailPage() {
           confirming={deregistering}
           onConfirm={deregisterFile}
           onClose={() => setDeregisterTarget(null)}
+        />
+      )}
+
+      {removeSeries && (
+        <ConfirmDialog
+          title={t('bookDetail.series.removeTitle')}
+          body={
+            <p>
+              {t('bookDetail.series.removeBody1')}{' '}
+              <span className="font-medium text-slate-800 dark:text-zinc-200">{removeSeries.title}</span>{' '}
+              {t('bookDetail.series.removeBody2')}
+            </p>
+          }
+          confirmLabel={t('bookDetail.series.remove')}
+          confirming={seriesBusy}
+          onConfirm={confirmRemoveSeries}
+          onClose={() => setRemoveSeries(null)}
         />
       )}
 

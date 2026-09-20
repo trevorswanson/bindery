@@ -1,14 +1,16 @@
 package main
 
 import (
+	"context"
+	"github.com/go-chi/chi/v5"
+	"github.com/vavallee/bindery/internal/api"
+	"github.com/vavallee/bindery/internal/auth"
+	"github.com/vavallee/bindery/internal/config"
+	"github.com/vavallee/bindery/internal/db"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/go-chi/chi/v5"
-
-	"github.com/vavallee/bindery/internal/auth"
 )
 
 // stubSensitiveHandler stands in for the indexer, prowlarr, and download
@@ -27,57 +29,79 @@ func (h *stubSensitiveHandler) record(name string, w http.ResponseWriter) {
 func (h *stubSensitiveHandler) List(w http.ResponseWriter, _ *http.Request) {
 	h.record("list", w)
 }
+
 func (h *stubSensitiveHandler) Get(w http.ResponseWriter, _ *http.Request) {
 	h.record("get", w)
 }
+
 func (h *stubSensitiveHandler) Create(w http.ResponseWriter, _ *http.Request) {
 	h.record("create", w)
 }
+
 func (h *stubSensitiveHandler) Update(w http.ResponseWriter, _ *http.Request) {
 	h.record("update", w)
 }
+
 func (h *stubSensitiveHandler) Delete(w http.ResponseWriter, _ *http.Request) {
 	h.record("delete", w)
 }
+
 func (h *stubSensitiveHandler) Test(w http.ResponseWriter, _ *http.Request) {
 	h.record("test", w)
 }
+
 func (h *stubSensitiveHandler) TestConfig(w http.ResponseWriter, _ *http.Request) {
 	h.record("test-config", w)
 }
+
+func (h *stubSensitiveHandler) Diagnose(w http.ResponseWriter, _ *http.Request) {
+	h.record("diagnose", w)
+}
+
 func (h *stubSensitiveHandler) Sync(w http.ResponseWriter, _ *http.Request) {
 	h.record("sync", w)
 }
+
 func (h *stubSensitiveHandler) SearchQuery(w http.ResponseWriter, _ *http.Request) {
 	h.record("search-query", w)
 }
+
 func (h *stubSensitiveHandler) LastSearchDebug(w http.ResponseWriter, _ *http.Request) {
 	h.record("last-search-debug", w)
 }
+
 func (h *stubSensitiveHandler) ImportCSV(w http.ResponseWriter, _ *http.Request) {
 	h.record("import-csv", w)
 }
+
 func (h *stubSensitiveHandler) ImportReadarr(w http.ResponseWriter, _ *http.Request) {
 	h.record("import-readarr", w)
 }
+
 func (h *stubSensitiveHandler) ImportReadarrStatus(w http.ResponseWriter, _ *http.Request) {
 	h.record("import-readarr-status", w)
 }
+
 func (h *stubSensitiveHandler) ImportGoodreadsPreview(w http.ResponseWriter, _ *http.Request) {
 	h.record("import-goodreads-preview", w)
 }
+
 func (h *stubSensitiveHandler) ImportGoodreadsCommit(w http.ResponseWriter, _ *http.Request) {
 	h.record("import-goodreads-commit", w)
 }
+
 func (h *stubSensitiveHandler) Export(w http.ResponseWriter, _ *http.Request) {
 	h.record("export-logs", w)
 }
+
 func (h *stubSensitiveHandler) TestDiscovery(w http.ResponseWriter, _ *http.Request) {
 	h.record("oidc-test-discovery", w)
 }
+
 func (h *stubSensitiveHandler) GetLevel(w http.ResponseWriter, _ *http.Request) {
 	h.record("get-level", w)
 }
+
 func (h *stubSensitiveHandler) SetLevel(w http.ResponseWriter, _ *http.Request) {
 	h.record("set-level", w)
 }
@@ -238,6 +262,7 @@ func TestSensitiveRoutesRequireAdmin(t *testing.T) {
 		{name: "update download client", method: http.MethodPut, path: "/downloadclient/1"},
 		{name: "delete download client", method: http.MethodDelete, path: "/downloadclient/1"},
 		{name: "test download client", method: http.MethodPost, path: "/downloadclient/1/test"},
+		{name: "diagnose download client", method: http.MethodPost, path: "/downloadclient/1/diagnose"},
 		{name: "test download client config", method: http.MethodPost, path: "/downloadclient/test"},
 		// Migrate imports — pull in indexer/client credentials, so admin-only.
 		{name: "import csv", method: http.MethodPost, path: "/migrate/csv"},
@@ -302,6 +327,7 @@ func TestSensitiveRoutesAllowAdmin(t *testing.T) {
 		{name: "update download client", method: http.MethodPut, path: "/downloadclient/1", called: "update"},
 		{name: "delete download client", method: http.MethodDelete, path: "/downloadclient/1", called: "delete"},
 		{name: "test download client", method: http.MethodPost, path: "/downloadclient/1/test", called: "test"},
+		{name: "diagnose download client", method: http.MethodPost, path: "/downloadclient/1/diagnose", called: "diagnose"},
 		{name: "test download client config", method: http.MethodPost, path: "/downloadclient/test", called: "test-config"},
 		// Migrate imports — admin must still reach each handler (guards against
 		// accidentally mounting them outside the group so they 404 instead).
@@ -369,5 +395,168 @@ func TestIndexerPublicReadsAllowNonAdmin(t *testing.T) {
 				t.Fatalf("called = %v; want [%s]", h.called, tt.called)
 			}
 		})
+	}
+}
+
+// TestAdminRoutesAnswerInDisabledAuthMode drives admin routes through the
+// real auth stack and the real DB backed provider, with the mode read from the
+// same setting PUT /auth/mode writes. In disabled mode /auth/status reports
+// role admin, so the UI renders the admin screens; before the fix every one
+// of them answered 403 "admin role required" because the disabled branch let
+// the request through without a role.
+func TestAdminRoutesAnswerInDisabledAuthMode(t *testing.T) {
+	const apiKey = "route-test-api-key"
+	conn, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	ctx := context.Background()
+	settings := db.NewSettingsRepo(conn)
+	users := db.NewUserRepo(conn)
+	hash, err := auth.HashPassword("route-test-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := users.Create(ctx, "admin", hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := users.PromoteFirstUser(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := settings.Set(ctx, api.SettingAuthAPIKey, apiKey); err != nil {
+		t.Fatal(err)
+	}
+	provider := &dbAuthProvider{settings: settings, users: users}
+
+	dir := t.TempDir()
+	storage := api.NewStorageHandler(&config.Config{DownloadDir: dir, LibraryDir: dir})
+	logs := &stubSensitiveHandler{}
+	var seenID int64
+	router := chi.NewRouter()
+	router.Route("/api/v1", func(r chi.Router) {
+		useAPIAuth(r, provider)
+		r.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seenID = auth.UserIDFromContext(r.Context())
+				next.ServeHTTP(w, r)
+			})
+		})
+		registerStorageRoutes(r, storage)
+		registerSystemLogRoutes(r, logs)
+	})
+
+	for _, tc := range []struct {
+		name   string
+		mode   auth.Mode
+		method string
+		path   string
+		apiKey string
+		xrw    bool
+		want   int
+	}{
+		{name: "enabled storage without a cookie", mode: auth.ModeEnabled, method: http.MethodGet, path: "/api/v1/system/storage", want: http.StatusUnauthorized},
+		{name: "disabled storage", mode: auth.ModeDisabled, method: http.MethodGet, path: "/api/v1/system/storage", want: http.StatusOK},
+		{name: "disabled storage with the api key", mode: auth.ModeDisabled, method: http.MethodGet, path: "/api/v1/system/storage", apiKey: apiKey, want: http.StatusOK},
+		{name: "disabled logs", mode: auth.ModeDisabled, method: http.MethodGet, path: "/api/v1/system/logs", want: http.StatusNoContent},
+		{name: "disabled log level change from the UI", mode: auth.ModeDisabled, method: http.MethodPut, path: "/api/v1/system/loglevel", xrw: true, want: http.StatusNoContent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := settings.Set(ctx, api.SettingAuthMode, string(tc.mode)); err != nil {
+				t.Fatal(err)
+			}
+			seenID = 0
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			if tc.apiKey != "" {
+				req.Header.Set("X-Api-Key", tc.apiKey)
+			}
+			if tc.xrw {
+				req.Header.Set("X-Requested-With", "bindery-ui")
+			}
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tc.want, rec.Body.String())
+			}
+			if tc.want < 300 && seenID != admin.ID {
+				t.Errorf("request carried user id %d, want the operator %d", seenID, admin.ID)
+			}
+		})
+	}
+}
+
+// pr2361ScanBlob is a library.lastScan value in the shape the scanner writes:
+// counts plus the resolved roots and the absolute path of every unmatched
+// file. Every path shares one marker so a leak is a substring check.
+const pr2361ScanBlob = `{"ran_at":"2026-09-14T10:00:00Z","files_found":3,"reconciled":1,"unmatched":2,` +
+
+	`"library_dir":"/srv/pr2361-root/books","audiobook_dir":"/srv/pr2361-root/audio",` +
+	`"scanned_paths":["/srv/pr2361-root/books","/srv/pr2361-root/audio"],` +
+	`"unmatched_files":[{"path":"/srv/pr2361-root/books/a.epub","parsed_title":"A","parsed_author":"X"},` +
+	`{"path":"/srv/pr2361-root/audio/b","parsed_title":"B","parsed_author":"Y"}]}`
+
+// newScanStatusRouter mounts the production registrar over the real
+// LibraryHandler backed by an in-memory settings table holding pr2361ScanBlob,
+// so the test exercises the same handler and the same gate as the server.
+func newScanStatusRouter(t *testing.T) chi.Router {
+	t.Helper()
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	settings := db.NewSettingsRepo(database)
+	if err := settings.Set(context.Background(), api.SettingLibraryLastScan, pr2361ScanBlob); err != nil {
+		t.Fatal(err)
+	}
+	router := chi.NewRouter()
+	registerLibraryScanStatusRoute(router, api.NewLibraryHandler(nil).WithSettings(settings))
+	return router
+}
+
+// TestLibraryScanStatusRouteRequiresAdmin is the second door on #2361. #2418
+// stopped GET /setting handing library.lastScan to non admins, but GET
+// /library/scan/status served the same blob verbatim to every authenticated
+// role. A non admin, and a request carrying no role at all, must now be refused
+// before the handler runs and must receive none of the paths.
+func TestLibraryScanStatusRouteRequiresAdmin(t *testing.T) {
+	for _, role := range []string{"user", ""} {
+		t.Run("role="+role, func(t *testing.T) {
+			router := newScanStatusRouter(t)
+
+			req := httptest.NewRequest(http.MethodGet, "/library/scan/status", nil)
+			if role != "" {
+				req = req.WithContext(auth.WithUserRole(req.Context(), role))
+			}
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d; want %d (RequireAdmin should reject role=%q)", rec.Code, http.StatusForbidden, role)
+			}
+			if body := rec.Body.String(); strings.Contains(body, "/srv/") || strings.Contains(body, "pr2361-root") {
+				t.Fatalf("non admin response carries a server path: %s", body)
+			}
+		})
+	}
+}
+
+// TestLibraryScanStatusRouteAllowsAdmin is the symmetry case: the Settings
+// scan panel is admin UI and needs the whole blob, paths included, so an admin
+// must get it back byte for byte.
+func TestLibraryScanStatusRouteAllowsAdmin(t *testing.T) {
+	router := newScanStatusRouter(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/library/scan/status", nil)
+	req = req.WithContext(auth.WithUserRole(req.Context(), "admin"))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != pr2361ScanBlob {
+		t.Fatalf("admin body = %s; want the stored blob unchanged", got)
 	}
 }

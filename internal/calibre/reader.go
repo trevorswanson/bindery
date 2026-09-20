@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,9 +71,11 @@ type CalibreFormat struct {
 }
 
 // Reader opens a Calibre library's metadata.db read-only and returns
-// populated CalibreBook records. It never mutates the Calibre database —
-// we explicitly use `mode=ro&immutable=1` so a concurrent `calibredb`
-// invocation from the same Bindery instance cannot deadlock us.
+// populated CalibreBook records. It never mutates the Calibre database:
+// the handle is opened with `mode=ro`, so a concurrent `calibredb`
+// invocation from the same Bindery instance cannot deadlock us, and
+// SQLite's normal WAL handling still applies so rows Calibre has committed
+// but not yet checkpointed are visible (#2631).
 type Reader struct {
 	libraryPath string
 	db          *sql.DB
@@ -96,14 +99,83 @@ func OpenReader(libraryPath string) (*Reader, error) {
 		}
 		return nil, fmt.Errorf("stat %s: %w", dbPath, err)
 	}
-	// immutable=1 tells SQLite the file will not change under us, letting
-	// it skip locking and rollback journal checks — safe here because we
-	// only read, and Calibre's WAL is only active while its own GUI runs.
-	conn, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro&immutable=1")
+	conn, err := openReadOnly(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	return &Reader{libraryPath: abs, db: conn}, nil
+}
+
+// openReadOnly opens dbPath with `mode=ro` and verifies a read actually
+// works. Plain read-only is what we want: SQLite honours the -wal file, so
+// edits made by a long running Calibre, Calibre-Web-Automated or a
+// `calibredb` call that have not been checkpointed into metadata.db yet
+// are still visible (#2631). The reader used to add `immutable=1`, which
+// tells SQLite the file cannot change and makes it skip the WAL entirely;
+// that silently served a snapshot as of the last checkpoint, and any
+// author or book the user had just fixed in Calibre came back on the next
+// import.
+//
+// A WAL database opened without `immutable=1` needs working shared memory
+// for its metadata.db-shm index. Two common layouts cannot provide it: a
+// library directory mounted read-only with no -shm present (SQLite cannot
+// create one), and a library on NFS or SMB, where SQLite's WAL shared
+// memory does not work at all. Those fail with a spread of result codes
+// (READONLY, CANTOPEN, the IOERR_SHM family, BUSY), so rather than try to
+// classify them, any probe failure on the plain open retries with
+// `immutable=1` and warns, naming the consequence. That keeps such
+// libraries importable, as they were before, without the stale read being
+// silent. Only when the immutable open cannot read either (not a SQLite
+// file, unreadable, corrupt) does the error reach the caller.
+func openReadOnly(dbPath string) (*sql.DB, error) {
+	return openReadOnlyWith(dbPath, probeRead)
+}
+
+// probeFunc checks that conn can serve a read. immutable says which of the
+// two opens is being probed; the production probe ignores it, and tests use
+// it to fail only the plain open.
+type probeFunc func(ctx context.Context, conn *sql.DB, immutable bool) error
+
+func openReadOnlyWith(dbPath string, probe probeFunc) (*sql.DB, error) {
+	// OpenReader has no context parameter and its one caller runs the
+	// import in the background, so bound the probe locally: a metadata.db
+	// that cannot answer a trivial query in this long is broken, not busy.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	conn, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", dbPath, err)
 	}
-	return &Reader{libraryPath: abs, db: conn}, nil
+	// sql.Open is lazy; the -shm requirement only surfaces on the first
+	// read transaction, so probe with a real query rather than Ping.
+	probeErr := probe(ctx, conn, false)
+	if probeErr == nil {
+		return conn, nil
+	}
+	_ = conn.Close()
+
+	conn, err = sql.Open("sqlite", "file:"+dbPath+"?mode=ro&immutable=1")
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", dbPath, err)
+	}
+	if err := probe(ctx, conn, true); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("open %s: %w (read-only open failed first with: %w)", dbPath, err, probeErr)
+	}
+	slog.Warn("calibre: cannot read metadata.db with WAL support, so it was opened immutable instead. "+
+		"Edits made in Calibre will not be visible to Bindery until Calibre checkpoints its WAL. "+
+		"Usual causes: the library directory is not writable to Bindery and metadata.db-shm does not exist, "+
+		"or the library is on a network filesystem (NFS, SMB) that cannot share the WAL index.",
+		"path", dbPath, "error", probeErr)
+	return conn, nil
+}
+
+// probeRead runs the cheapest query that forces SQLite to actually open
+// the database file and, in WAL mode, its -shm.
+func probeRead(ctx context.Context, conn *sql.DB, _ bool) error {
+	var n int
+	return conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master`).Scan(&n)
 }
 
 // Close releases the SQLite handle. Safe to call on a nil receiver so the
@@ -237,6 +309,15 @@ func (r *Reader) loadAuthors(ctx context.Context, bookID int64) ([]CalibreAuthor
 		if err := rows.Scan(&a.CalibreID, &a.Name, &a.Sort); err != nil {
 			return nil, fmt.Errorf("scan author: %w", err)
 		}
+		// Calibre stores a literal comma in an author name as "|": a comma
+		// separates authors in its comma-joined author columns, and the
+		// authors table keeps that escaping so the joined form stays
+		// unambiguous. Calibre's own read path turns the pipe back into a
+		// comma per author (calibre/db/write.py get_adapter), and both the
+		// name and sort columns carry the escaped form. Doing it here, row by
+		// row, keeps the books_authors_link rows as separate authors (#2666).
+		a.Name = strings.ReplaceAll(a.Name, "|", ",")
+		a.Sort = strings.ReplaceAll(a.Sort, "|", ",")
 		out = append(out, a)
 	}
 	return out, rows.Err()

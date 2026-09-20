@@ -1,6 +1,7 @@
+import { useEffect } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { MemoryRouter, Route, Routes } from 'react-router'
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router'
 import BookDetailPage, { SearchResultsSection } from './BookDetailPage'
 import { api } from '../api/client'
 import type { Author, Book, BookFile, Download, HistoryEvent, Indexer, SearchResult } from '../api/client'
@@ -56,6 +57,8 @@ vi.mock('../api/client', async importOriginal => {
       toggleExcluded: vi.fn(),
       enrichAudiobook: vi.fn(),
       listAuthorSeries: vi.fn(),
+      setPrimarySeriesForBook: vi.fn(),
+      removeBookFromSeries: vi.fn(),
     },
   }
 })
@@ -166,13 +169,45 @@ function makeDownload(overrides: Partial<Download> = {}): Download {
   }
 }
 
-function renderBookDetailPage() {
+type NavEntry = string | { pathname: string; state?: unknown }
+
+function LocationProbe({ onLocation }: { onLocation?: (location: string) => void }) {
+  const location = useLocation()
+  useEffect(() => {
+    onLocation?.(`${location.pathname}${location.search}${location.hash}`)
+  }, [location, onLocation])
+  return null
+}
+
+// Unlike LocationProbe above, this also exposes router `state` — needed to
+// verify the exact {ids, index, hopDepth} payload a Previous/Next hop
+// carries, not just where it lands.
+function StateProbe({ onState }: { onState?: (state: unknown) => void }) {
+  const location = useLocation()
+  useEffect(() => {
+    onState?.(location.state)
+  }, [location, onState])
+  return null
+}
+
+function renderBookDetailPage(
+  initialPath: NavEntry | NavEntry[] = '/book/42',
+  onLocation?: (location: string) => void,
+  onState?: (state: unknown) => void,
+) {
+  // A multi-entry array simulates real browser history (e.g. arriving from
+  // the Books list) so Back's navigate(-1) has somewhere to land.
+  const initialEntries = Array.isArray(initialPath) ? initialPath : [initialPath]
+
   return render(
-    <MemoryRouter initialEntries={['/book/42']}>
+    <MemoryRouter initialEntries={initialEntries} initialIndex={initialEntries.length - 1}>
+      <LocationProbe onLocation={onLocation} />
+      <StateProbe onState={onState} />
       <Routes>
         <Route path="/book/:id" element={<BookDetailPage />} />
         <Route path="/settings" element={<div>Settings Page</div>} />
         <Route path="/author/:id" element={<div>Author Page</div>} />
+        <Route path="/books" element={<div>Books Page</div>} />
       </Routes>
     </MemoryRouter>,
   )
@@ -841,7 +876,8 @@ describe('BookDetailPage — danger zone', () => {
   it('opens the confirm modal and keeps confirm disabled until acknowledged', async () => {
     renderBookDetailPage()
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Delete book + files…' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'More' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete book + files…' }))
 
     const confirm = await screen.findByRole('button', { name: 'Delete book + files' })
     expect(confirm).toBeDisabled()
@@ -853,7 +889,8 @@ describe('BookDetailPage — danger zone', () => {
   it('calls api.deleteBook only after acknowledging and confirming', async () => {
     renderBookDetailPage()
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Delete book + files…' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'More' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete book + files…' }))
     fireEvent.click(screen.getByRole('checkbox', { name: /I understand/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Delete book + files' }))
 
@@ -863,7 +900,8 @@ describe('BookDetailPage — danger zone', () => {
   it('does not call api.deleteBook when the modal is cancelled', async () => {
     renderBookDetailPage()
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Delete book + files…' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'More' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete book + files…' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
 
     await waitFor(() =>
@@ -876,7 +914,8 @@ describe('BookDetailPage — danger zone', () => {
     vi.mocked(api.getBook).mockResolvedValue(makeBook({ filePath: '/library/book.epub' }))
     renderBookDetailPage()
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Delete book + files…' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'More' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete book + files…' }))
     fireEvent.click(screen.getByRole('checkbox', { name: /I understand/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Delete book + files' }))
 
@@ -967,6 +1006,105 @@ describe('BookDetailPage — header', () => {
     expect(screen.queryByText(/Long Earth/)).toBeNull()
   })
 
+  it('offers no membership controls when the book is in one series', async () => {
+    // Nothing to choose between, so the section would be pure noise (#2525).
+    vi.mocked(api.listAuthorSeries).mockResolvedValue([
+      {
+        id: 7,
+        foreignSeriesId: 'ol:s7',
+        title: 'Discworld',
+        description: '',
+        monitored: true,
+        books: [{ seriesId: 7, bookId: 42, positionInSeries: '3', primarySeries: true }],
+      },
+    ] as unknown as Awaited<ReturnType<typeof api.listAuthorSeries>>)
+
+    renderBookDetailPage()
+    await screen.findByText('Discworld #3')
+    expect(screen.queryByText(resolveKey('bookDetail.series.heading')!)).toBeNull()
+  })
+
+  it('names the series the renamer uses and lets you change it', async () => {
+    // #2525: two primary rows meant the renamer picked one by query-plan order
+    // and nothing on the page said which, or let the user say otherwise.
+    const memberships = [
+      {
+        id: 7,
+        foreignSeriesId: 'hc-series:kdt',
+        title: "King's Dark Tidings",
+        description: '',
+        monitored: true,
+        books: [{ seriesId: 7, bookId: 42, positionInSeries: '1', primarySeries: true }],
+      },
+      {
+        id: 8,
+        foreignSeriesId: 'hc-series:universe',
+        title: "King's Dark Tidings Universe",
+        description: '',
+        monitored: true,
+        books: [{ seriesId: 8, bookId: 42, positionInSeries: '', primarySeries: false }],
+      },
+    ]
+    vi.mocked(api.listAuthorSeries).mockResolvedValue(
+      memberships as unknown as Awaited<ReturnType<typeof api.listAuthorSeries>>,
+    )
+    vi.mocked(api.setPrimarySeriesForBook).mockResolvedValue(
+      {} as Awaited<ReturnType<typeof api.setPrimarySeriesForBook>>,
+    )
+
+    renderBookDetailPage()
+    const heading = await screen.findByText(resolveKey('bookDetail.series.heading')!)
+    const section = heading.closest('section')!
+    const rows = within(section).getAllByRole('listitem')
+    expect(rows).toHaveLength(2)
+    // The primary one is labelled and offers no promote button.
+    expect(within(rows[0]).getByText(resolveKey('bookDetail.series.namesFiles')!)).toBeInTheDocument()
+    expect(
+      within(rows[0]).queryByRole('button', { name: resolveKey('bookDetail.series.useForNaming')! }),
+    ).toBeNull()
+
+    fireEvent.click(
+      within(rows[1]).getByRole('button', { name: resolveKey('bookDetail.series.useForNaming')! }),
+    )
+    await waitFor(() => expect(api.setPrimarySeriesForBook).toHaveBeenCalledWith(8, 42))
+  })
+
+  it('removes a single membership behind a confirmation, without touching the book', async () => {
+    vi.mocked(api.listAuthorSeries).mockResolvedValue([
+      {
+        id: 7,
+        foreignSeriesId: 'hc-series:kdt',
+        title: "King's Dark Tidings",
+        description: '',
+        monitored: true,
+        books: [{ seriesId: 7, bookId: 42, positionInSeries: '1', primarySeries: true }],
+      },
+      {
+        id: 8,
+        foreignSeriesId: 'hc-series:universe',
+        title: "King's Dark Tidings Universe",
+        description: '',
+        monitored: true,
+        books: [{ seriesId: 8, bookId: 42, positionInSeries: '', primarySeries: false }],
+      },
+    ] as unknown as Awaited<ReturnType<typeof api.listAuthorSeries>>)
+    vi.mocked(api.removeBookFromSeries).mockResolvedValue(
+      undefined as Awaited<ReturnType<typeof api.removeBookFromSeries>>,
+    )
+
+    renderBookDetailPage()
+    const heading = await screen.findByText(resolveKey('bookDetail.series.heading')!)
+    const section = heading.closest('section')!
+    const rows = within(section).getAllByRole('listitem')
+    fireEvent.click(within(rows[1]).getByRole('button', { name: resolveKey('bookDetail.series.remove')! }))
+
+    const dialog = await screen.findByTestId('confirm-dialog')
+    expect(within(dialog).getByText("King's Dark Tidings Universe")).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: resolveKey('bookDetail.series.remove')! }))
+    await waitFor(() => expect(api.removeBookFromSeries).toHaveBeenCalledWith(8, 42))
+    expect(api.deleteBook).not.toHaveBeenCalled()
+  })
+
   it('renders no series row when the book is in none', async () => {
     vi.mocked(api.listAuthorSeries).mockResolvedValue([])
     renderBookDetailPage()
@@ -994,14 +1132,32 @@ describe('BookDetailPage — header', () => {
     ).toBeTruthy()
   })
 
-  it('keeps solid red for Delete book and ghost-danger for Delete file', async () => {
+  // Deleting the book used to own a "Danger zone" section: a heading, a
+  // rose-tinted full-width card and the page's only solid red button, for one
+  // action. AuthorDetailPage has always carried the equivalent Delete as a
+  // danger item in its More menu, so the two pages disagreed and the book page
+  // shouted. It now matches: red TEXT in the menu, no solid red anywhere on the
+  // page itself, and the solid red kept for the confirm dialog, which is where
+  // the decision is actually made.
+  it('carries Delete book as a danger menu item, with no solid red on the page', async () => {
     vi.mocked(api.getBook).mockResolvedValue(makeBook({ filePath: '/library/book.epub' }))
     renderBookDetailPage()
+
     const deleteFile = await screen.findByRole('button', { name: /Delete file/ })
-    const deleteBook = screen.getByRole('button', { name: /Delete book/ })
-    // Solid red is reserved for the irreversible one.
-    expect(deleteBook.className).toContain('bg-red-600')
     expect(deleteFile.className).not.toContain('bg-red-600')
+
+    fireEvent.click(screen.getByRole('button', { name: 'More' }))
+    const deleteBook = await screen.findByRole('menuitem', { name: 'Delete book + files…' })
+    expect(deleteBook.className).toContain('text-red-700')
+    expect(deleteBook.className).not.toContain('bg-red-600')
+  })
+
+  // The section is gone, not restyled. A heading that names a zone is the thing
+  // that made one action look like a region of the page.
+  it('no longer renders a Danger zone heading', async () => {
+    renderBookDetailPage()
+    await screen.findByRole('heading', { name: 'File' })
+    expect(screen.queryByRole('heading', { name: /Danger zone/i })).toBeNull()
   })
 })
 
@@ -1061,7 +1217,7 @@ describe('BookDetailPage metadata source (#1707)', () => {
     )
   })
 
-  it('renders a Hardcover-bound book with no link rather than a broken one', async () => {
+  it('keeps an ambiguous numeric Hardcover id visible without linking it', async () => {
     vi.mocked(api.getBook).mockResolvedValue(
       makeBook({ foreignBookId: 'hc:12345', metadataProvider: 'hardcover' }),
     )
@@ -1069,7 +1225,7 @@ describe('BookDetailPage metadata source (#1707)', () => {
 
     const list = await screen.findByTestId('metadata-source-list')
     expect(within(list).getByText('hc:12345')).toBeInTheDocument()
-    expect(within(list).queryByRole('link')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Links' })).not.toBeInTheDocument()
   })
 
   // The identity map from #1705 is what makes "which record am I looking at"
@@ -1108,5 +1264,370 @@ describe('BookDetailPage metadata source (#1707)', () => {
     expect(within(rows[1]).getByText('Hardcover')).toBeInTheDocument()
     expect(within(rows[1]).getByText('hc:12345')).toBeInTheDocument()
     expect(within(rows[1]).queryByText('Current')).not.toBeInTheDocument()
+  })
+
+  it('shows trustworthy upstream links in an operable disclosure', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(
+      makeBook({
+        foreignBookId: 'OL27448W',
+        metadataProvider: 'openlibrary',
+        identifiers: [
+          {
+            bookId: 42,
+            provider: 'hardcover',
+            foreignBookId: 'hc:project-hail-mary',
+            createdAt: '2026-01-01T00:00:00Z',
+            updatedAt: '2026-01-01T00:00:00Z',
+          },
+          {
+            bookId: 42,
+            provider: 'dnb',
+            foreignBookId: 'dnb:1234567890',
+            createdAt: '2026-01-01T00:00:00Z',
+            updatedAt: '2026-01-01T00:00:00Z',
+          },
+          {
+            bookId: 42,
+            provider: 'audiobookshelf',
+            foreignBookId: 'abs:local-item',
+            createdAt: '2026-01-01T00:00:00Z',
+            updatedAt: '2026-01-01T00:00:00Z',
+          },
+        ],
+      }),
+    )
+    renderBookDetailPage()
+
+    const trigger = await screen.findByRole('button', { name: 'Links' })
+    expect(trigger).not.toHaveAttribute('aria-haspopup')
+    expect(trigger).toHaveAttribute('aria-controls')
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.mouseEnter(trigger.parentElement!)
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    fireEvent.pointerDown(document.body)
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.mouseEnter(trigger.parentElement!)
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    fireEvent.click(trigger)
+    fireEvent.mouseLeave(trigger.parentElement!)
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    fireEvent.mouseEnter(trigger.parentElement!)
+    fireEvent.click(trigger)
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    fireEvent.mouseLeave(trigger.parentElement!)
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(trigger)
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    fireEvent.pointerDown(document.body)
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.focus(trigger)
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(trigger)
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    const menu = screen.getByTestId('book-links-menu')
+    expect(trigger).toHaveAttribute('aria-controls', menu.id)
+    expect(menu).not.toHaveAttribute('hidden')
+    const links = within(menu).getAllByRole('link')
+    expect(links).toHaveLength(3)
+    expect(within(menu).getByRole('link', { name: /View on OpenLibrary/ })).toHaveAttribute(
+      'href',
+      'https://openlibrary.org/works/OL27448W',
+    )
+    expect(within(menu).getByRole('link', { name: /View on Hardcover/ })).toHaveAttribute(
+      'href',
+      'https://hardcover.app/books/project-hail-mary',
+    )
+    const dnb = within(menu).getByRole('link', { name: /View on DNB/ })
+    expect(dnb).toHaveAttribute('href', 'https://d-nb.info/1234567890')
+    expect(dnb).toHaveAttribute('target', '_blank')
+    expect(dnb).toHaveAttribute('rel', 'noopener noreferrer')
+    fireEvent.keyDown(dnb, { key: 'Escape' })
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    expect(menu).toHaveAttribute('hidden')
+    expect(trigger).toHaveFocus()
+  })
+
+  it('hides the Links control when no trustworthy upstream URL exists', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(
+      makeBook({ foreignBookId: 'abs:local-item', metadataProvider: 'audiobookshelf' }),
+    )
+    renderBookDetailPage()
+
+    await screen.findByTestId('metadata-source-list')
+    expect(screen.queryByRole('button', { name: 'Links' })).not.toBeInTheDocument()
+  })
+})
+
+describe('BookDetailPage — monitor toggle (#2417)', () => {
+  it('renders a switch carrying the monitored state', async () => {
+    renderBookDetailPage()
+    const toggle = await screen.findByRole('switch', { name: 'Unmonitor' })
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
+  })
+
+  it('unmonitors a monitored book and reflects it in the status badge', async () => {
+    renderBookDetailPage()
+
+    fireEvent.click(await screen.findByRole('switch', { name: 'Unmonitor' }))
+
+    await waitFor(() => expect(api.updateBook).toHaveBeenCalledWith(42, { monitored: false }))
+    expect(await screen.findByRole('switch', { name: 'Monitor' })).toHaveAttribute('aria-checked', 'false')
+    expect(screen.getByText('Not monitored')).toBeInTheDocument()
+  })
+
+  it('monitors an unmonitored book', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ monitored: false }))
+    renderBookDetailPage()
+
+    const toggle = await screen.findByRole('switch', { name: 'Monitor' })
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+    fireEvent.click(toggle)
+
+    await waitFor(() => expect(api.updateBook).toHaveBeenCalledWith(42, { monitored: true }))
+    expect(await screen.findByRole('switch', { name: 'Unmonitor' })).toHaveAttribute('aria-checked', 'true')
+  })
+
+  it('disables the switch while the update is in flight, so one click sends one PUT', async () => {
+    let settle: ((book: Book) => void) | undefined
+    vi.mocked(api.updateBook).mockImplementation(() => new Promise<Book>(resolve => { settle = resolve }))
+
+    renderBookDetailPage()
+    const toggle = await screen.findByRole('switch', { name: 'Unmonitor' })
+    fireEvent.click(toggle)
+
+    await waitFor(() => expect(toggle).toBeDisabled())
+    fireEvent.click(toggle)
+    expect(api.updateBook).toHaveBeenCalledTimes(1)
+
+    await act(async () => { settle?.(makeBook({ monitored: false })) })
+    expect(await screen.findByRole('switch', { name: 'Monitor' })).toBeEnabled()
+  })
+})
+
+describe('BookDetailPage — Previous/Next navigation (#2548, book side)', () => {
+  it('hides the controls when there is no router state at all (opened from Wanted, a search result, or after a refresh)', async () => {
+    renderBookDetailPage()
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+    expect(screen.queryByLabelText('Previous book')).toBeNull()
+    expect(screen.queryByLabelText('Next book')).toBeNull()
+  })
+
+  it('renders Previous/Next from router state and follows Next to the right id, carrying the chain state', async () => {
+    let lastLocation = ''
+    let capturedState: unknown
+    vi.mocked(api.getBook).mockImplementation((id: number) =>
+      Promise.resolve(makeBook({ id, title: id === 42 ? 'The Final Empire' : 'The Well of Ascension' })))
+    renderBookDetailPage(
+      { pathname: '/book/42', state: { ids: [40, 42, 43, 44, 45], index: 1, hopDepth: 1 } },
+      loc => { lastLocation = loc },
+      s => { capturedState = s },
+    )
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+
+    fireEvent.click(screen.getByLabelText('Next book'))
+
+    await waitFor(() => expect(lastLocation).toBe('/book/43'))
+    await screen.findByRole('heading', { name: 'The Well of Ascension' })
+    // index moves 1 -> 2 and hopDepth increments 1 -> 2 — the actual payload
+    // the next hop's Previous/Next links will carry, not just where we landed.
+    expect(capturedState).toEqual({ ids: [40, 42, 43, 44, 45], index: 2, hopDepth: 2 })
+  })
+
+  it('follows Previous to the right id, carrying the chain state (Previous is a separate code path from Next)', async () => {
+    let lastLocation = ''
+    let capturedState: unknown
+    vi.mocked(api.getBook).mockImplementation((id: number) =>
+      Promise.resolve(makeBook({ id, title: id === 42 ? 'The Final Empire' : 'Mistborn Prequel' })))
+    renderBookDetailPage(
+      { pathname: '/book/42', state: { ids: [40, 42, 43, 44, 45], index: 1, hopDepth: 1 } },
+      loc => { lastLocation = loc },
+      s => { capturedState = s },
+    )
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+
+    fireEvent.click(screen.getByLabelText('Previous book'))
+
+    await waitFor(() => expect(lastLocation).toBe('/book/40'))
+    await screen.findByRole('heading', { name: 'Mistborn Prequel' })
+    expect(capturedState).toEqual({ ids: [40, 42, 43, 44, 45], index: 0, hopDepth: 2 })
+  })
+
+  it('hides Previous at the first position and shows only Next', async () => {
+    renderBookDetailPage({ pathname: '/book/42', state: { ids: [42, 43], index: 0 } })
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+    expect(screen.queryByLabelText('Previous book')).toBeNull()
+    expect(screen.getByLabelText('Next book')).toBeInTheDocument()
+  })
+
+  it('hides Next at the last position and shows only Previous', async () => {
+    renderBookDetailPage({ pathname: '/book/42', state: { ids: [41, 42], index: 1 } })
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+    expect(screen.getByLabelText('Previous book')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Next book')).toBeNull()
+  })
+
+  it('hides the controls for a single-book list (both ends null)', async () => {
+    renderBookDetailPage({ pathname: '/book/42', state: { ids: [42], index: 0 } })
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+    expect(screen.queryByLabelText('Previous book')).toBeNull()
+    expect(screen.queryByLabelText('Next book')).toBeNull()
+  })
+
+  it('ignores state that does not match this book (stale browser back/forward state)', async () => {
+    // ids[index] is 99, not 42 — a mismatch that must be treated as no
+    // navigation info rather than pointing at the wrong neighbour.
+    renderBookDetailPage({ pathname: '/book/42', state: { ids: [98, 99, 100], index: 1 } })
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+    expect(screen.queryByLabelText('Previous book')).toBeNull()
+    expect(screen.queryByLabelText('Next book')).toBeNull()
+  })
+
+  it('Back always uses browser history, even inside a Previous/Next chain, since there is no single canonical list to jump to', async () => {
+    let lastLocation = ''
+    renderBookDetailPage(
+      ['/books', { pathname: '/book/42', state: { ids: [40, 42, 43], index: 1 } }],
+      loc => { lastLocation = loc },
+    )
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+
+    fireEvent.click(screen.getByText('← Books'))
+
+    await waitFor(() => expect(lastLocation).toBe('/books'))
+  })
+
+  it('Back skips the entire Previous/Next chain in one jump, not just the immediately previous book, after several hops', async () => {
+    let lastLocation = ''
+    vi.mocked(api.getBook).mockImplementation((id: number) => Promise.resolve(makeBook({
+      id,
+      title: id === 42 ? 'The Final Empire' : id === 43 ? 'The Well of Ascension' : 'The Hero of Ages',
+    })))
+    // History: /books (index 0), then two real hops in via Next (indices 1
+    // and 2) before landing here — hopDepth on the current page reflects
+    // that depth, and Back must walk back all of it in a single navigate(),
+    // not just the one entry a plain navigate(-1) would undo.
+    renderBookDetailPage(
+      ['/books', { pathname: '/book/42', state: { ids: [42, 43, 44], index: 0, hopDepth: 1 } }],
+      loc => { lastLocation = loc },
+    )
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+
+    fireEvent.click(screen.getByLabelText('Next book'))
+    await screen.findByRole('heading', { name: 'The Well of Ascension' })
+
+    fireEvent.click(screen.getByLabelText('Next book'))
+    await screen.findByRole('heading', { name: 'The Hero of Ages' })
+
+    fireEvent.click(screen.getByText('← Books'))
+
+    // Without hopDepth, navigate(-1) would only undo the last hop, landing
+    // back on "The Well of Ascension" — one book short of the list.
+    await waitFor(() => expect(lastLocation).toBe('/books'))
+  })
+
+  it('clears stale search results from the previous book after Next, proving the key-remount actually resets state', async () => {
+    vi.mocked(api.getBook).mockImplementation((id: number) =>
+      Promise.resolve(makeBook({ id, title: id === 42 ? 'The Final Empire' : 'The Well of Ascension' })))
+    vi.mocked(api.listIndexers).mockResolvedValue([makeIndexer()])
+    vi.mocked(api.searchBook).mockResolvedValue({
+      results: [makeResult({ guid: 'r1', title: 'A Result For Book 42' })],
+      debug: null,
+    })
+
+    renderBookDetailPage({ pathname: '/book/42', state: { ids: [42, 43], index: 0 } })
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+
+    fireEvent.click(screen.getByRole('button', { name: /Search ebook indexers/ }))
+    expect(await screen.findByText('A Result For Book 42')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Next book'))
+    await screen.findByRole('heading', { name: 'The Well of Ascension' })
+
+    // Without the remount, `results` would still hold book 42's search hit.
+    expect(screen.queryByText('A Result For Book 42')).not.toBeInTheDocument()
+  })
+
+  // The load effect's own setAsinDraft(b.asin || '') on every id change would
+  // mask a removed key={id} here — asinDraft resets whether or not the page
+  // remounts, so this doesn't actually prove the remount does anything.
+  it('clears a typed ASIN draft from the previous book after Next (remount resets more than just search results)', async () => {
+    vi.mocked(api.getBook).mockImplementation((id: number) => Promise.resolve(makeBook({
+      id,
+      title: id === 42 ? 'The Final Empire' : 'The Well of Ascension',
+      mediaType: 'audiobook',
+    })))
+
+    renderBookDetailPage({ pathname: '/book/42', state: { ids: [42, 43], index: 0 } })
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+
+    const asinInput = screen.getByLabelText('ASIN (Audible identifier)') as HTMLInputElement
+    fireEvent.change(asinInput, { target: { value: 'B0DRAFTVALUE' } })
+    expect(asinInput).toHaveValue('B0DRAFTVALUE')
+
+    fireEvent.click(screen.getByLabelText('Next book'))
+    await screen.findByRole('heading', { name: 'The Well of Ascension' })
+
+    // Without the remount, asinDraft would still hold book 42's typed value.
+    expect(screen.getByLabelText('ASIN (Audible identifier)')).toHaveValue('')
+  })
+
+  // Unlike asinDraft above, nothing in the load effect touches `error` on a
+  // successful load — it's only ever cleared by the action that set it. If
+  // key={id} were removed, book 43's page would render with book 42's stale
+  // save-failure banner still up, since nothing else resets it.
+  it('clears a failed-save error banner from the previous book after Next', async () => {
+    vi.mocked(api.getBook).mockImplementation((id: number) =>
+      Promise.resolve(makeBook({ id, title: id === 42 ? 'The Final Empire' : 'The Well of Ascension' })))
+    vi.mocked(api.updateBook).mockRejectedValue(new Error('Save failed'))
+
+    renderBookDetailPage({ pathname: '/book/42', state: { ids: [42, 43], index: 0 } })
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+
+    fireEvent.click(screen.getByRole('switch', { name: 'Unmonitor' }))
+    expect(await screen.findByText('Save failed')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Next book'))
+    await screen.findByRole('heading', { name: 'The Well of Ascension' })
+
+    // Without the remount, the banner from book 42's failed save would still
+    // be showing here — the load effect never clears `error` on success.
+    expect(screen.queryByText('Save failed')).not.toBeInTheDocument()
+  })
+
+  // The nav row used to sit below the loading/not-found early returns, so a
+  // book deleted since the list loaded stranded the visitor on "Book not
+  // found" with no way out except a manual URL edit.
+  it('keeps Back and Previous/Next available when the current book in the chain is not found', async () => {
+    vi.mocked(api.getBook).mockImplementation((id: number) =>
+      id === 43 ? Promise.reject(new Error('not found')) : Promise.resolve(makeBook({ id })))
+
+    renderBookDetailPage({ pathname: '/book/43', state: { ids: [42, 43, 44], index: 1, hopDepth: 1 } })
+
+    await screen.findByText('Book not found')
+    expect(screen.getByText('← Books')).toBeInTheDocument()
+    expect(screen.getByLabelText('Previous book')).toBeInTheDocument()
+    expect(screen.getByLabelText('Next book')).toBeInTheDocument()
+  })
+
+  // The loading branch is the one every single hop passes through (briefly),
+  // unlike not-found above which only hits on a deleted book — so this is the
+  // common case the reordered nav row actually fixes.
+  it('keeps Back and Previous/Next available while the next book is still loading', async () => {
+    let settle: ((book: Book) => void) | undefined
+    vi.mocked(api.getBook)
+      .mockResolvedValueOnce(makeBook({ id: 42 }))
+      .mockImplementationOnce(() => new Promise<Book>(resolve => { settle = resolve }))
+
+    renderBookDetailPage({ pathname: '/book/42', state: { ids: [42, 43, 44], index: 0 } })
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+
+    fireEvent.click(screen.getByLabelText('Next book'))
+
+    expect(await screen.findByText('Loading...')).toBeInTheDocument()
+    expect(screen.getByText('← Books')).toBeInTheDocument()
+    expect(screen.getByLabelText('Previous book')).toBeInTheDocument()
+    expect(screen.getByLabelText('Next book')).toBeInTheDocument()
+
+    await act(async () => { settle?.(makeBook({ id: 43, title: 'The Well of Ascension' })) })
+    await screen.findByRole('heading', { name: 'The Well of Ascension' })
   })
 })

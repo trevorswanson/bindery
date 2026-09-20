@@ -287,7 +287,7 @@ Set a download-client path remap in **Settings → Download clients** or set the
 
 Per-client remaps are stored on each download client, so separate qBittorrent / SABnzbd / NZBGet instances can map different mount points. Existing download clients keep an empty remap after upgrade, which preserves the previous global-only behavior until you add a client-specific value.
 
-For a per-client remap, open **Settings → Download clients**, edit the client, and set **Download client path remap**. The left side is the path the client reports; the right side is the path Bindery can read. For qBittorrent this normally means mapping the qBittorrent category save path or torrent content path to Bindery's download mount. Example: if qBittorrent reports `/downloads/books/My.Book` and Bindery sees that same folder as `/media/books/My.Book`, set `/downloads:/media/books`.
+For a per-client remap, open **Settings → Download clients**, edit the client, and set **Download client path remap**. To see what a remap actually resolves to, press **Diagnose** on the client: it reports where that client says ebook and audiobook grabs land, which remap applies, and whether Bindery can read the result. The left side is the path the client reports; the right side is the path Bindery can read. For qBittorrent this normally means mapping the qBittorrent category save path or torrent content path to Bindery's download mount. Example: if qBittorrent reports `/downloads/books/My.Book` and Bindery sees that same folder as `/media/books/My.Book`, set `/downloads:/media/books`.
 
 **Common scenario — SABnzbd or qBittorrent and Bindery on the same NAS storage, different mount points:**
 
@@ -379,7 +379,7 @@ Bindery parks the download as *handed off* and reconciles the managed copy the e
 | `BINDERY_PORT` | `8787` | HTTP server port |
 | `BINDERY_URL_BASE` | _(empty)_ | URL path prefix when hosting Bindery under a reverse-proxy subpath (e.g. `/bindery`). Accepts a bare path or full URL — only the path component is used. No trailing slash needed. See the [Reverse-proxy & SSO wiki](https://github.com/vavallee/bindery/wiki/Reverse-proxy-and-SSO) for Nginx / Caddy / Traefik examples. |
 | `BINDERY_DB_PATH` | `/config/bindery.db` on Linux; `%APPDATA%\Bindery\bindery.db` on Windows; `~/Library/Application Support/Bindery/bindery.db` on macOS | SQLite database path |
-| `BINDERY_DATA_DIR` | `/config` on Linux; `%APPDATA%\Bindery` on Windows; `~/Library/Application Support/Bindery` on macOS | Config directory (backups live here) |
+| `BINDERY_DATA_DIR` | `/config` on Linux; `%APPDATA%\Bindery` on Windows; `~/Library/Application Support/Bindery` on macOS | Config directory. Backups live here, as do the proxied cover cache (`image-cache/`, evicted after 30 days and refetched on demand) and the covers Bindery owns outright (`covers/`, the `cover.jpg` copied from each book of an imported Calibre library, never evicted). Keep it on persistent storage. |
 | `BINDERY_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `BINDERY_API_KEY` | _(empty)_ | **Seed only.** Bootstraps the initial API key on first launch if set; after that the key lives in the database and can be regenerated from the UI. |
 | `BINDERY_DOWNLOAD_DIR` | `/downloads` | Where the download client places completed downloads. **Not a watch folder** — per-job import paths come from the client's API; this feeds validation, storage health, the hardlink probe, and qBittorrent save paths (see [above](#bindery_download_dir-is-not-a-watch-folder)). Manual/bulk import may also read from here (and from `BINDERY_AUDIOBOOK_DOWNLOAD_DIR`), so a migration backlog sitting in the download folder can be scanned and attached in bulk. |
@@ -417,7 +417,7 @@ Outbound URLs are validated against an SSRF policy. Two trust levels apply:
 
 - **Indexer-provided download links** — the `.torrent` / `.nzb` URL Bindery fetches from a search result. This is data chosen by the indexer's response rather than an admin-typed value, so it keeps the stricter posture: RFC1918 LAN targets are allowed, but **loopback is blocked** unless you set `BINDERY_DOWNLOAD_ALLOW_LOOPBACK=true`. That is the gotcha when Prowlarr runs on `localhost` — configuring the indexer succeeds (admin-typed URL), but the download link it returns also points at loopback and is rejected at fetch time. Set the env var, or reach Prowlarr by a LAN IP / Docker gateway / service name so the returned links are RFC1918. Link-local and cloud-metadata stay blocked either way.
 
-- **Untrusted / outbound URLs** — proxied cover images (URLs that come from metadata providers and book data) and outbound notification webhooks. These keep blocking loopback, link-local, and cloud-metadata. Webhooks additionally block RFC1918 unless `BINDERY_NOTIFICATIONS_ALLOW_PRIVATE=true`.
+- **Untrusted / outbound URLs** — proxied cover images (URLs that come from metadata providers and book data) and outbound notification webhooks. These keep blocking loopback, link-local, and cloud-metadata. Webhooks additionally block RFC1918 unless `BINDERY_NOTIFICATIONS_ALLOW_PRIVATE=true`. Covers from an imported Calibre library never go through this policy: the import copies each `cover.jpg` into `covers/` under `BINDERY_DATA_DIR` and the image endpoint serves that copy, so no cover server on the LAN and no exception to the policy is needed (#2564).
 
 If a same-host service still isn't reachable, the usual cause is that the service is bound to an interface your URL doesn't match (for example SABnzbd listening only on `127.0.0.1` while you used the LAN IP, or vice versa). Either point Bindery at the interface the service actually listens on, or set the service to listen on `0.0.0.0`.
 
@@ -452,6 +452,21 @@ environment:
 
 Use your actual LAN subnet. If the target services sit on a different subnet than gluetun, list both comma separated. Restart gluetun after changing it.
 
+### Services behind a private certificate authority
+
+Bindery trusts the certificate bundle built into the image and has no option to skip TLS verification. To reach a download client, indexer or Audiobookshelf server whose certificate is signed by your own CA (step-ca, an internal PKI, a homelab root), add that CA to the trust store from outside: mount the CA certificate in PEM form into a directory and point `SSL_CERT_DIR` at it. The built in bundle still loads, so public services keep working and your CA is added on top.
+
+```yaml
+services:
+  bindery:
+    environment:
+      - SSL_CERT_DIR=/certs
+    volumes:
+      - ./step-ca/root_ca.crt:/certs/root_ca.crt:ro
+```
+
+On Kubernetes, mount the CA from a ConfigMap or Secret into the same directory and set the same variable. Restart after changing either. Setting `SSL_CERT_FILE` instead replaces the built in bundle entirely, so only use it with a file that also contains the public roots.
+
 ## First-run setup
 
 On first launch Bindery bootstraps itself — **no environment variables are required for auth.**
@@ -466,6 +481,10 @@ On first launch Bindery bootstraps itself — **no environment variables are req
 
   **Pick this mode only when clients reach Bindery directly, or set `BINDERY_TRUSTED_PROXY`.** Behind a reverse proxy (Traefik, Caddy, nginx) or a Kubernetes ingress, the connecting peer is the proxy, and its address on the container network is private. Unless `BINDERY_TRUSTED_PROXY` names that proxy so the real client IP can be resolved from `X-Forwarded-For`, every request the proxy forwards is treated as a local client and served without a login. Set `BINDERY_TRUSTED_PROXY` to the proxy's IP or CIDR, or choose `enabled` mode. Bindery logs a warning at startup, and when the mode is changed, if it sees local-only with `BINDERY_TRUSTED_PROXY` unset.
 - `disabled` — no auth at all. Only safe behind a trusted reverse proxy that handles authentication upstream.
+
+  Every request acts as the administrator, so the admin screens and admin API routes answer to anyone who can reach Bindery. A request with no session is attributed to the first admin account; a browser still holding a session from before authentication was turned off keeps that account's own id, so what it adds is owned by that account, but it gets the admin role like everyone else. Browser changes still need the page's own request header, which a cross site form cannot send.
+
+  That includes reading the API key from Settings, adding admin accounts and resetting passwords, and all of it stays in place after you turn authentication back on. If anyone else could reach Bindery while it was off, regenerate the API key and check the Users page once authentication is back.
 
 ## Database foreign-key integrity
 
@@ -513,6 +532,10 @@ migration as applied while missing `books.excluded`. On startup, Bindery now
 checks the live schema and restores that additive column automatically. Take a
 normal SQLite backup before upgrading; no manual SQL is required for this
 specific repair.
+
+### Calibre library covers repair
+
+Versions before the #2564 fix stored each Calibre-imported book's cover as the library's absolute path in `editions.image_url`, which nothing could serve. On every start Bindery now runs a background pass over such rows: each readable `cover.jpg` is copied into `covers/` under `BINDERY_DATA_DIR` and the edition (and the book, when it has no provider cover) is repointed at the copy. No schema migration is involved. The Calibre library must be mounted at the path recorded in the rows for the pass to read the files; rows it cannot read are left untouched and retried on the next start, and a library import rewrites them as well. Progress is logged as `calibre cover repair finished` at `info`.
 
 ### ABS import deployment note
 
@@ -603,7 +626,7 @@ auth:
 
 **Schema:** no changes. Drop-in binary or image replacement is safe.
 
-**Behavior change — auto-search on add is on by default.** Adding a new author or flipping a book to `wanted` now immediately fires an indexer search. Previously the scheduler waited up to 12 hours. If this is unwanted (e.g. you want to batch-add many authors before any searches fire), uncheck the new **Start search for books on add** box in the Add Author modal. Books that transition to `wanted` via API always trigger a search; a `search_on_status_change` setting will be added later if opt-out is requested — file an issue if you need it.
+**Behavior change — auto-search on add is on by default.** Adding a new author or flipping a book to `wanted` now immediately fires an indexer search. Previously the scheduler waited up to 12 hours. If this is unwanted (e.g. you want to batch-add many authors before any searches fire), uncheck the **Auto-grab books on add** box on the author step of the Add to library dialog. Books that transition to `wanted` via API always trigger a search; a `search_on_status_change` setting will be added later if opt-out is requested — file an issue if you need it.
 
 **Backfill existing libraries (series data):** The `series` and `series_books` tables have existed since v0.1 but were never populated. Authors added before this release therefore have no series rows. After upgrading, run the one-shot reconcile command to backfill series data from OpenLibrary:
 

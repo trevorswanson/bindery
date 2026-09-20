@@ -481,6 +481,18 @@ func (i *Importer) enrichBook(ctx context.Context, cfg ImportConfig, item Normal
 
 	full, matchedBy, ambiguous, err := i.lookupUpstreamBook(ctx, author, item)
 	if err != nil {
+		// A primary provider that did not answer is reported to the operator
+		// rather than buried in the log, as on the author side: relinking to
+		// the fallback's record would make it the book's provider for good
+		// (#2642).
+		var unavailable *PrimaryProviderUnavailableError
+		if errors.As(err, &unavailable) {
+			slog.Warn("abs import: book left on its current identity, primary metadata provider unavailable",
+				"title", item.Title, "error", err)
+			return metadataMergeResult{Messages: []string{
+				"book relink skipped: " + unavailable.Error() + ", so it was not relinked to a fallback provider",
+			}}, nil
+		}
 		slog.Warn("abs import: book metadata lookup failed", "title", item.Title, "error", err)
 		return metadataMergeResult{}, nil
 	}
@@ -566,11 +578,28 @@ func (i *Importer) mergeUpstreamBook(ctx context.Context, cfg ImportConfig, item
 
 func (i *Importer) lookupUpstreamBook(ctx context.Context, author *models.Author, item NormalizedLibraryItem) (*models.Book, string, bool, error) {
 	if isbn := absLookupISBN(item.ISBN); isbn != "" {
-		match, err := i.meta.GetBookByISBN(ctx, isbn)
+		match, outcome, err := i.meta.GetBookByISBNWithOutcome(ctx, isbn)
 		if err != nil {
 			return nil, "", false, err
 		}
 		if match != nil {
+			// The ISBN walk steps past a primary that timed out, so a
+			// fallback's record can win here only because the primary never
+			// answered. Writing its id onto the row re-links the book to that
+			// provider for good, and a later lookup by the primary's key then
+			// misses it, which is how the duplicates start (#2117, #2271,
+			// #2332, #2642). Leaving the row on its current identity costs a
+			// relink this run and nothing permanent.
+			if !outcome.SafeToBind(match.ForeignID) {
+				slog.Warn("abs import: refusing to relink book to a fallback provider",
+					"title", item.Title, "isbn", isbn, "primary", outcome.Primary,
+					"failed", outcome.FailureSummary(), "wouldHaveLinked", match.ForeignID)
+				return nil, "", false, &PrimaryProviderUnavailableError{
+					Primary: outcome.Primary,
+					Failed:  outcome.FailureSummary(),
+					Err:     outcome.FirstErr,
+				}
+			}
 			return match, "isbn", false, nil
 		}
 	}
@@ -586,7 +615,11 @@ func (i *Importer) lookupUpstreamBook(ctx context.Context, author *models.Author
 	if author == nil || author.ForeignID == "" || author.MetadataProvider == providerAudiobookshelf {
 		return nil, "", false, nil
 	}
-	works, err := i.meta.GetAuthorWorks(ctx, author.ForeignID)
+	// Unenriched: this only matches a title against the list. GetAuthorWorks
+	// would first run the aggregator's per-work cover enrichment over every
+	// coverless work, which for a prolific author (OpenLibrary's 2,000 work
+	// cap) is thousands of rate-limited requests inside one ABS item (#2578).
+	works, err := i.meta.GetAuthorWorksUnenriched(ctx, author.ForeignID)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -1024,7 +1057,10 @@ func (i *Importer) applyBookFields(ctx context.Context, book *models.Book, autho
 	}
 	// observedMediaType, not deriveMediaType — see applyABSFormatFields (#2169).
 	book.MediaType = mergeMediaType(book.MediaType, observedMediaType(item))
-	book.Monitored = true
+	// Monitored is deliberately not touched (#2632): this is the update path
+	// for a book the user already has, and re-monitoring it undid deliberate
+	// unmonitoring across a whole library in one run. Only the create paths
+	// stamp Monitored, same decision as the list syncer in #2221.
 	if book.Status == "" {
 		book.Status = models.BookStatusWanted
 	}
@@ -1162,7 +1198,7 @@ func (i *Importer) upsertSeries(ctx context.Context, cfg ImportConfig, runID, bo
 			"identity":  true,
 		})
 	}
-	membershipCreated, err := i.series.LinkBookIfMissing(ctx, existing.ID, bookID, strings.TrimSpace(ref.Sequence), true)
+	membershipCreated, err := i.series.LinkBookPreservingPrimary(ctx, existing.ID, bookID, strings.TrimSpace(ref.Sequence))
 	if err != nil {
 		return seriesUpsertResult{}, err
 	}

@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { api, DownloadClient, DownloadClientUpdate } from '../../api/client'
+import { api, DiagnoseResult, DownloadClient, DownloadClientUpdate } from '../../api/client'
 import { inputCls } from './formStyles'
 import Toggle from './Toggle'
 import PathRemapField from './PathRemapField'
 import { downloadClientPathRemapHelp, rtorrentScgiIgnoredFields } from './helpers'
 import { dangerLink } from '../../components/buttons'
+import ClientDiagnosePanel from './ClientDiagnosePanel'
 
 // clients is owned by SettingsPage so it can be fetched eagerly on page mount
 // (matching the pre-refactor monolith), not on tab open.
@@ -31,6 +32,28 @@ export default function ClientsTab({ clients, setClients }: Props) {
   const [editingClient, setEditingClient] = useState<number | null>(null)
   const [clientTestResult, setClientTestResult] = useState<Record<number, { ok: boolean; msg: string; warn?: string }>>({})
   const [confirmDeleteClient, setConfirmDeleteClient] = useState<number | null>(null)
+  // Diagnose runs only for a saved client (it takes the id, never a form).
+  const [diagnosing, setDiagnosing] = useState<number | null>(null)
+  const [diagnosis, setDiagnosis] = useState<Record<number, { result?: DiagnoseResult; error?: string }>>({})
+
+  const runDiagnose = async (id: number) => {
+    setDiagnosing(id)
+    try {
+      const result = await api.diagnoseDownloadClient(id)
+      setDiagnosis(prev => ({ ...prev, [id]: { result } }))
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err.message : t('settings.clients.unknownError')
+      setDiagnosis(prev => ({ ...prev, [id]: { error } }))
+    } finally {
+      setDiagnosing(null)
+    }
+  }
+
+  const closeDiagnosis = (id: number) => setDiagnosis(prev => {
+    const next = { ...prev }
+    delete next[id]
+    return next
+  })
 
   return (
     <div>
@@ -75,7 +98,7 @@ export default function ClientsTab({ clients, setClients }: Props) {
                           : undefined
                         setClientTestResult(prev => ({ ...prev, [c.id]: { ok: true, msg: t('common.connOk'), warn } }))
                       } catch (err: unknown) {
-                        const error = err instanceof Error ? err.message : 'Unknown error'
+                        const error = err instanceof Error ? err.message : t('settings.clients.unknownError')
                         const warn = isLoopbackConnFailure(c.host, error) ? t('settings.clients.loopbackHint') : undefined
                         setClientTestResult(prev => ({ ...prev, [c.id]: { ok: false, msg: t('common.connFail', { error }), warn } }))
                       }
@@ -83,6 +106,14 @@ export default function ClientsTab({ clients, setClients }: Props) {
                     className="text-xs text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white"
                   >
                     {t('common.test')}
+                  </button>
+                  <button
+                    onClick={() => { void runDiagnose(c.id) }}
+                    disabled={diagnosing === c.id}
+                    aria-expanded={!!diagnosis[c.id]?.result}
+                    className="text-xs text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white disabled:opacity-50"
+                  >
+                    {diagnosing === c.id ? t('settings.clients.diagnose.running') : t('settings.clients.diagnose.button')}
                   </button>
                   {confirmDeleteClient === c.id ? (
                     <span className="flex items-center gap-1.5">
@@ -136,6 +167,15 @@ export default function ClientsTab({ clients, setClients }: Props) {
                   <span className="inline-block w-2 h-2 mt-1 rounded-full flex-shrink-0 bg-amber-500" />
                   {clientTestResult[c.id].warn}
                 </div>
+              )}
+              {diagnosis[c.id]?.error && (
+                <div role="alert" className="mt-1 px-3 py-1.5 rounded text-xs flex items-center gap-2 bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300">
+                  <span className="inline-block w-2 h-2 rounded-full flex-shrink-0 bg-red-500" />
+                  {t('settings.clients.diagnose.failed', { error: diagnosis[c.id].error })}
+                </div>
+              )}
+              {diagnosis[c.id]?.result && (
+                <ClientDiagnosePanel result={diagnosis[c.id].result as DiagnoseResult} onClose={() => closeDiagnosis(c.id)} />
               )}
             </div>
           ))}
@@ -253,7 +293,7 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
         : undefined
       setTestResult({ ok: true, msg: t('common.connOk'), warn })
     } catch (err: unknown) {
-      const error = err instanceof Error ? err.message : 'Unknown error'
+      const error = err instanceof Error ? err.message : t('settings.clients.unknownError')
       const warn = isLoopbackConnFailure(host, error) ? t('settings.clients.loopbackHint') : undefined
       setTestResult({ ok: false, msg: t('common.connFail', { error }), warn })
     } finally {
@@ -465,7 +505,7 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
         : undefined
       setTestResult({ ok: true, msg: t('common.connOk'), warn })
     } catch (err: unknown) {
-      const error = err instanceof Error ? err.message : 'Unknown error'
+      const error = err instanceof Error ? err.message : t('settings.clients.unknownError')
       const warn = isLoopbackConnFailure(host, error) ? t('settings.clients.loopbackHint') : undefined
       setTestResult({ ok: false, msg: t('common.connFail', { error }), warn })
     } finally {

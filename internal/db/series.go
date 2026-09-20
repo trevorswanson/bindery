@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/vavallee/bindery/internal/models"
+	"github.com/vavallee/bindery/internal/textutil"
 )
 
 type SeriesRepo struct {
@@ -158,7 +160,7 @@ func (r *SeriesRepo) listWithBooksForUser(ctx context.Context, userID int64, ser
 		SELECT s.id, s.foreign_id, s.title, s.description, s.monitored, s.genre_override, s.created_at,
 		       sb.series_id, sb.book_id, sb.position_in_series, sb.primary_series,
 		       b.id, b.foreign_id, b.author_id, b.title, b.sort_title, b.status,
-		       b.monitored, b.image_url, b.release_date, b.created_at, b.updated_at
+		       b.monitored, b.image_url, b.release_date, b.created_at, b.updated_at, b.excluded
 		FROM series s
 		LEFT JOIN series_books sb ON sb.series_id = s.id
 		`+bookJoin+where+`
@@ -176,14 +178,14 @@ func (r *SeriesRepo) listWithBooksForUser(ctx context.Context, userID int64, ser
 		var genreOverride sql.NullString
 		var sbSeriesID, sbBookID, bookID, authorID sql.NullInt64
 		var position sql.NullString
-		var primarySeries, bookMonitored sql.NullInt64
+		var primarySeries, bookMonitored, bookExcluded sql.NullInt64
 		var foreignID, title, sortTitle, status, imageURL sql.NullString
 		var releaseDate, bookCreatedAt, bookUpdatedAt sql.NullTime
 		if err := rows.Scan(
 			&s.ID, &s.ForeignID, &s.Title, &s.Description, &monitored, &genreOverride, &s.CreatedAt,
 			&sbSeriesID, &sbBookID, &position, &primarySeries,
 			&bookID, &foreignID, &authorID, &title, &sortTitle, &status,
-			&bookMonitored, &imageURL, &releaseDate, &bookCreatedAt, &bookUpdatedAt,
+			&bookMonitored, &imageURL, &releaseDate, &bookCreatedAt, &bookUpdatedAt, &bookExcluded,
 		); err != nil {
 			return nil, fmt.Errorf("scan series with books: %w", err)
 		}
@@ -210,6 +212,7 @@ func (r *SeriesRepo) listWithBooksForUser(ctx context.Context, userID int64, ser
 			SortTitle: sortTitle.String,
 			Status:    status.String,
 			Monitored: bookMonitored.Int64 == 1,
+			Excluded:  bookExcluded.Int64 == 1,
 			ImageURL:  imageURL.String,
 		}
 		if releaseDate.Valid {
@@ -436,7 +439,7 @@ func (r *SeriesRepo) GetByIDForUser(ctx context.Context, id, userID int64) (*mod
 	q := `
 		SELECT sb.series_id, sb.book_id, sb.position_in_series, sb.primary_series,
 		       b.id, b.foreign_id, b.author_id, b.title, b.sort_title, b.status,
-		       b.monitored, b.image_url, b.created_at, b.updated_at
+		       b.monitored, b.image_url, b.created_at, b.updated_at, b.excluded
 		FROM series_books sb
 		JOIN books b ON b.id = sb.book_id
 		` + scope + `
@@ -450,16 +453,17 @@ func (r *SeriesRepo) GetByIDForUser(ctx context.Context, id, userID int64) (*mod
 	for bookRows.Next() {
 		var sb models.SeriesBook
 		var b models.Book
-		var monitored, primarySeries int
+		var monitored, excluded, primarySeries int
 		err := bookRows.Scan(
 			&sb.SeriesID, &sb.BookID, &sb.PositionInSeries, &primarySeries,
 			&b.ID, &b.ForeignID, &b.AuthorID, &b.Title, &b.SortTitle, &b.Status,
-			&monitored, &b.ImageURL, &b.CreatedAt, &b.UpdatedAt,
+			&monitored, &b.ImageURL, &b.CreatedAt, &b.UpdatedAt, &excluded,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan series book: %w", err)
 		}
 		b.Monitored = monitored == 1
+		b.Excluded = excluded == 1
 		sb.PrimarySeries = primarySeries == 1
 		sb.Book = &b
 		s.Books = append(s.Books, sb)
@@ -737,6 +741,38 @@ func (r *SeriesRepo) LinkBookIfMissing(ctx context.Context, seriesID, bookID int
 	return affected > 0, nil
 }
 
+// LinkBookPreservingPrimary links bookID into seriesID and reports whether it
+// created the membership, marking the new row primary only when the book does
+// not already have a primary series elsewhere (#2525).
+//
+// Callers that link an already-stored book used to pass primary=true
+// unconditionally, so filling an umbrella series stamped a second
+// primary_series=1 row onto books that were already filed under their real
+// series, and the renamer then chose between them by query-plan order. A book
+// created by this same run has no other membership yet, so those sites keep
+// passing true through LinkBookIfMissing.
+func (r *SeriesRepo) LinkBookPreservingPrimary(ctx context.Context, seriesID, bookID int64, position string) (bool, error) {
+	has, err := r.HasPrimarySeries(ctx, bookID)
+	if err != nil {
+		return false, err
+	}
+	return r.LinkBookIfMissing(ctx, seriesID, bookID, position, !has)
+}
+
+// UpdateBookLinkPosition refreshes an existing membership's position without
+// touching primary_series. Re-importing a library must not silently promote a
+// series the user has already demoted (#2525); UpsertBookLink rewrites both
+// columns and is for callers that mean to set the flag.
+func (r *SeriesRepo) UpdateBookLinkPosition(ctx context.Context, seriesID, bookID int64, position string) error {
+	_, err := r.exec.ExecContext(ctx,
+		`UPDATE series_books SET position_in_series = ? WHERE series_id = ? AND book_id = ?`,
+		strings.TrimSpace(position), seriesID, bookID)
+	if err != nil {
+		return fmt.Errorf("update position for book %d in series %d: %w", bookID, seriesID, err)
+	}
+	return nil
+}
+
 func (r *SeriesRepo) UpsertBookLink(ctx context.Context, seriesID, bookID int64, position string, primary bool) error {
 	primaryInt := 0
 	if primary {
@@ -884,6 +920,80 @@ func (r *SeriesRepo) ListBookSeriesByAuthor(ctx context.Context, authorID int64)
 	return out, rows.Err()
 }
 
+// BookSeriesMembership is one series_books row joined to the series it points
+// at. The series foreign id travels with it because the catalogue sync decides
+// whether a membership already exists by comparing against what the provider
+// sent, and the provider names a series by foreign id and never by our row id.
+type BookSeriesMembership struct {
+	BookID          int64
+	SeriesID        int64
+	SeriesForeignID string
+	SeriesTitle     string
+	Position        string
+	Primary         bool
+}
+
+// ListBookSeriesMembershipsByAuthor returns every series membership held by
+// the author's books, keyed by book id. One query stands in for the
+// GetSeriesIDsForBook plus HasPrimarySeries pair a catalogue sync would
+// otherwise run per book while linking series onto rows that already exist
+// (#2328).
+//
+// A manually created series carries a synthetic "manual:series:" foreign id,
+// so it comes back like any other and simply never matches a provider ref. A
+// row that somehow holds no foreign id at all comes back with an empty one
+// rather than being dropped, because it still counts towards the book already
+// having a primary series, which is the other thing the caller reads here.
+func (r *SeriesRepo) ListBookSeriesMembershipsByAuthor(ctx context.Context, authorID int64) (map[int64][]BookSeriesMembership, error) {
+	out, err := r.scanBookSeriesMemberships(ctx, `
+		SELECT sb.book_id, sb.series_id, COALESCE(s.foreign_id, ''), COALESCE(s.title, ''),
+		       COALESCE(sb.position_in_series, ''), COALESCE(sb.primary_series, 0)
+		FROM books b
+		JOIN series_books sb ON sb.book_id = b.id
+		JOIN series s ON s.id = sb.series_id
+		WHERE b.author_id = ?`, authorID)
+	if err != nil {
+		return nil, fmt.Errorf("list series memberships for author %d: %w", authorID, err)
+	}
+	return out, nil
+}
+
+// ListBookSeriesMembershipsForBook is the single-book form, for the rows an
+// author-scoped snapshot cannot describe: a globally id-matched book that
+// still belongs to another author, and any row whose author changed after the
+// snapshot was taken (#2328).
+func (r *SeriesRepo) ListBookSeriesMembershipsForBook(ctx context.Context, bookID int64) ([]BookSeriesMembership, error) {
+	out, err := r.scanBookSeriesMemberships(ctx, `
+		SELECT sb.book_id, sb.series_id, COALESCE(s.foreign_id, ''), COALESCE(s.title, ''),
+		       COALESCE(sb.position_in_series, ''), COALESCE(sb.primary_series, 0)
+		FROM series_books sb
+		JOIN series s ON s.id = sb.series_id
+		WHERE sb.book_id = ?`, bookID)
+	if err != nil {
+		return nil, fmt.Errorf("list series memberships for book %d: %w", bookID, err)
+	}
+	return out[bookID], nil
+}
+
+func (r *SeriesRepo) scanBookSeriesMemberships(ctx context.Context, query string, arg int64) (map[int64][]BookSeriesMembership, error) {
+	rows, err := r.db.QueryContext(ctx, query, arg)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64][]BookSeriesMembership)
+	for rows.Next() {
+		var m BookSeriesMembership
+		var primary int
+		if err := rows.Scan(&m.BookID, &m.SeriesID, &m.SeriesForeignID, &m.SeriesTitle, &m.Position, &primary); err != nil {
+			return nil, fmt.Errorf("scan series membership: %w", err)
+		}
+		m.Primary = primary != 0
+		out[m.BookID] = append(out[m.BookID], m)
+	}
+	return out, rows.Err()
+}
+
 // GetSeriesIDsForBook returns the IDs of every series the book currently belongs to.
 func (r *SeriesRepo) GetSeriesIDsForBook(ctx context.Context, bookID int64) ([]int64, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT series_id FROM series_books WHERE book_id = ?`, bookID)
@@ -910,20 +1020,105 @@ func (r *SeriesRepo) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
-// GetPrimarySeriesForBook returns the title and position of the primary series
-// for the given book. Returns ("", "", nil) when the book has no primary series.
+// GetPrimarySeriesForBook returns the title and position of the series the
+// renamer should use for the given book. Returns ("", "", nil) only when the
+// book is in no series at all.
+//
+// The ORDER BY is load bearing (#2525). series_books has no unique index on
+// book_id, primary_series defaults to 1, and several link sites stamp 1
+// unconditionally, so a book in an umbrella "Universe" series alongside its
+// real one carries two primary rows. Without an ORDER BY the bare LIMIT 1
+// returned whichever row the query planner reached first, which decided the
+// {Series} segment of every renamed file and could flip on an index or
+// ANALYZE change. The tie break is:
+//
+//  1. a primary membership beats a secondary one;
+//  2. then a membership that carries a position beats one that does not,
+//     because a book with a number in a series is in the sequence rather
+//     than filed under an umbrella;
+//  3. then the lowest series id, which is the earliest linked series.
+//
+// Rule 1 replaced a WHERE on primary_series = 1 (#2527). Filtering meant a
+// book whose every membership was secondary matched nothing and got the same
+// empty answer as a book in no series, so the renamer dropped its series
+// segment entirely while the UI went on showing the series. That is reachable
+// through the ABS sibling-catalog walk, which links books it is not importing
+// with primary = false. primary_series breaks a tie between several
+// memberships; with nothing else to choose it should not be able to suppress
+// the only series a book has.
+//
+// The ordering only decides the cases the user has not decided.
+// SetPrimarySeries demotes every sibling, so once someone picks, one row sorts
+// above every other and the rest of the tie break never comes into play.
 func (r *SeriesRepo) GetPrimarySeriesForBook(ctx context.Context, bookID int64) (seriesTitle, position string, err error) {
 	row := r.db.QueryRowContext(ctx, `
 		SELECT s.title, sb.position_in_series
 		FROM series_books sb
 		JOIN series s ON s.id = sb.series_id
-		WHERE sb.book_id = ? AND sb.primary_series = 1
+		WHERE sb.book_id = ?
+		ORDER BY sb.primary_series DESC,
+		         CASE WHEN trim(sb.position_in_series) = '' THEN 1 ELSE 0 END,
+		         sb.series_id
 		LIMIT 1`, bookID)
 	err = row.Scan(&seriesTitle, &position)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", nil
 	}
 	return seriesTitle, position, err
+}
+
+// HasPrimarySeries reports whether the book already has a primary series.
+// Link sites call it so that adding a book to a further series does not
+// silently promote that series over the one the book was already filed
+// under (#2525).
+func (r *SeriesRepo) HasPrimarySeries(ctx context.Context, bookID int64) (bool, error) {
+	var one int
+	err := r.exec.QueryRowContext(ctx,
+		`SELECT 1 FROM series_books WHERE book_id = ? AND primary_series = 1 LIMIT 1`, bookID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("primary series lookup for book %d: %w", bookID, err)
+	}
+	return true, nil
+}
+
+// SetPrimarySeries makes seriesID the one primary series for bookID and
+// demotes every other membership the book has. Returns sql.ErrNoRows when
+// the book is not a member of that series, so callers can answer 404 rather
+// than silently creating nothing.
+//
+// The two statements run in one transaction: a demote that committed without
+// its promote would leave the book with no primary series at all, and the
+// renamer would then drop the {Series} segment entirely.
+func (r *SeriesRepo) SetPrimarySeries(ctx context.Context, seriesID, bookID int64) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("set primary series: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var one int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM series_books WHERE series_id = ? AND book_id = ?`, seriesID, bookID).Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return sql.ErrNoRows
+		}
+		return fmt.Errorf("set primary series: membership lookup: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE series_books SET primary_series = 0 WHERE book_id = ? AND series_id != ?`, bookID, seriesID); err != nil {
+		return fmt.Errorf("set primary series: demote siblings: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE series_books SET primary_series = 1 WHERE book_id = ? AND series_id = ?`, bookID, seriesID); err != nil {
+		return fmt.Errorf("set primary series: promote: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("set primary series: %w", err)
+	}
+	return nil
 }
 
 // GetBookBySeriesPosition finds the single "wanted" book at the given position
@@ -983,4 +1178,101 @@ func (r *SeriesRepo) GetBookBySeriesPosition(ctx context.Context, seriesTitle, p
 		return nil, nil
 	}
 	return found[0], nil
+}
+
+// SearchTitles returns up to limit series whose title contains every word of
+// query, best match first, for the header library search (#2551). userID 0 is
+// unscoped; otherwise only series with at least one book the caller may see
+// (owned by them or unowned, the include-NULL tier every list uses) qualify,
+// so a series made entirely of another user's books never surfaces its title.
+//
+// The series table has no search_key column (migration 083 folded books,
+// authors and aliases only), and the fold is Go code, so the match runs in Go
+// over the id/title pairs rather than in SQL. Series counts are small next to
+// books, the query is two columns, and that is cheaper than a migration plus
+// a backfill for one typeahead. Ranking follows the tiers in searchrank.go:
+// the whole field, a leading whole word, a whole word anywhere, a leading
+// fragment, a fragment anywhere, and finally rows matched only word by word.
+func (r *SeriesRepo) SearchTitles(ctx context.Context, query string, userID int64, limit int) ([]models.Series, error) {
+	folded := textutil.FoldForSearch(query)
+	if folded == "" || limit <= 0 {
+		return []models.Series{}, nil
+	}
+	tokens := searchTokens(folded)
+
+	q := "SELECT id, title FROM series"
+	var args []any
+	if userID != 0 {
+		q += " WHERE EXISTS (SELECT 1 FROM series_books sb JOIN books b ON b.id = sb.book_id" +
+			" WHERE sb.series_id = series.id AND (b.owner_user_id = ? OR b.owner_user_id IS NULL))"
+		args = append(args, userID)
+	}
+	rows, err := r.db.QueryContext(ctx, q+" ORDER BY title", args...)
+	if err != nil {
+		return nil, fmt.Errorf("search series: %w", err)
+	}
+	defer rows.Close()
+
+	type ranked struct {
+		s    models.Series
+		tier int
+	}
+	var hits []ranked
+	for rows.Next() {
+		var s models.Series
+		if err := rows.Scan(&s.ID, &s.Title); err != nil {
+			return nil, fmt.Errorf("scan series title: %w", err)
+		}
+		key := textutil.FoldForSearch(s.Title)
+		tier, ok := seriesTitleTier(key, folded, tokens)
+		if !ok {
+			continue
+		}
+		hits = append(hits, ranked{s: s, tier: tier})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Stable, so equal tiers keep the title order the query produced.
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].tier != hits[j].tier {
+			return hits[i].tier < hits[j].tier
+		}
+		return len(hits[i].s.Title) < len(hits[j].s.Title)
+	})
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
+	out := make([]models.Series, len(hits))
+	for i, h := range hits {
+		out[i] = h.s
+	}
+	return out, nil
+}
+
+// seriesTitleTier reports the searchrank.go tier of a folded title against a
+// folded query, and false when a token of the query is missing from it.
+func seriesTitleTier(key, folded string, tokens []string) (int, bool) {
+	for _, tok := range tokens {
+		if !strings.Contains(key, tok) {
+			return 0, false
+		}
+	}
+	padded := " " + key + " "
+	switch {
+	case key == folded:
+		return 0, true
+	case strings.HasPrefix(padded, " "+folded+" "):
+		return 1, true
+	case strings.Contains(padded, " "+folded+" "):
+		return 2, true
+	case strings.HasPrefix(key, folded):
+		return 3, true
+	case strings.Contains(padded, " "+folded):
+		return 4, true
+	case strings.Contains(key, folded):
+		return 5, true
+	default:
+		return searchRankTiers, true
+	}
 }

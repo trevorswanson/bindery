@@ -58,8 +58,51 @@ var errAlreadyGrabbed = errors.New("already grabbed")
 //
 // StateImportFailed deliberately does NOT qualify: the scanner is still working
 // through its retry budget on that row, and a re-grab would race it.
+//
+// The state alone never makes an imported row re-grabbable. The one imported
+// row that is, an import whose book has since been deleted, depends on more
+// than the state and is decided by orphanedImport (#2289).
 func regrabbableState(s models.DownloadState) bool {
 	return s == models.StateFailed || s == models.StateImportBlocked
+}
+
+// regrabbable is the gate grab applies to an existing download row for the
+// same GUID: the row may be reused when its state is dead (regrabbableState)
+// or when it is an orphaned import (orphanedImport).
+func regrabbable(d *models.Download) bool {
+	return regrabbableState(d.Status) || orphanedImport(d)
+}
+
+// orphanedImport reports whether d finished importing into a book that has
+// since been deleted (#2289).
+//
+// downloads.book_id is ON DELETE SET NULL (migration 007), so deleting a book
+// detaches its download rows and leaves them in place. An imported row then
+// outlives the book it imported into, still holding the GUID and still
+// reporting imported, and every later grab of that release answered "already
+// imported" for a book that no longer existed. Nothing automatic ever moves it
+// on: the pollers skip imported rows whether or not the torrent is still in
+// the client, which is why removing the torrent from qBittorrent did not
+// release it either.
+//
+// What the imported state normally guards is "you already have this book", and
+// with the book gone it guards nothing. Deciding at the check, rather than
+// rewriting the row when a book is deleted, covers every way a book goes away
+// (the book page, an author deletion cascading through the books FK, bulk
+// delete, import rollbacks) and the rows already orphaned on existing installs,
+// with no migration. The row is left exactly as it was until a grab actually
+// claims it through RetryFailed, and nothing is sent to the download client
+// until then.
+//
+// A NULL book_id alone is not enough. An in-flight row can legitimately have no
+// book, since the free-text search grabs without one and the importer matches
+// it later, and that is still live work.
+//
+// The predicate itself is models.Download.IsOrphanedImport, shared with the
+// scheduler's auto grab. Keep it in sync with the SQL guards in
+// db.DownloadRepo.RetryFailed and RetryOrphanedImport.
+func orphanedImport(d *models.Download) bool {
+	return d.IsOrphanedImport()
 }
 
 // alreadyGrabbedDetail explains why a re-grab was refused and what to do
@@ -135,9 +178,10 @@ func (h *QueueHandler) resolveSeedRatio(ctx context.Context, indexerID *int64) *
 //
 // The web UI sends the release's indexer id back on grab, which names the
 // credential directly. API clients post only {guid, nzbUrl} — nothing carries
-// the id — so with no id (or one that no longer resolves) the key is taken from
-// the configured indexer whose host matches the URL: only an indexer on that
-// host could have produced it, and SignDownloadURLFor's host guard keeps the
+// the id — so with no usable id (none sent, one that no longer resolves, or one
+// whose own host does not match the download URL, which is the #2505 case) the
+// key is taken from the configured indexer whose host matches the URL: only an
+// indexer on that host could have produced it, and SignDownloadURLFor's host guard keeps the
 // credential from travelling anywhere else. Several indexers on one host (the
 // usual Prowlarr layout) are usable while they agree on the key; when they
 // disagree there is nothing to choose between them and the URL is left alone.
@@ -157,9 +201,34 @@ func (h *QueueHandler) signNZBURL(ctx context.Context, rawURL string, indexerID 
 	if h.indexers == nil || rawURL == "" {
 		return rawURL, nil
 	}
+	// Checked before anything tries to sign, because signDownloadURL returns
+	// its input unchanged both for "already signed" and for "could not sign",
+	// and the two need different answers below.
+	if newznab.HasAPIKey(rawURL) {
+		return rawURL, nil
+	}
 	if indexerID != nil {
 		if idx, err := h.indexers.GetByID(ctx, *indexerID); err == nil && idx != nil {
-			return newznab.SignDownloadURLFor(rawURL, idx.URL, idx.APIKey), nil
+			if signed := newznab.SignDownloadURLFor(rawURL, idx.URL, idx.APIKey); signed != rawURL {
+				return signed, nil
+			}
+			// The named indexer could not sign it, so its host does not match
+			// the download URL or it has no key stored. Prowlarr builds
+			// download links from its own application URL, which need not
+			// carry the same host:port as the indexer URL Bindery recorded,
+			// and u.Host includes the port, so "prowlarr:9696" and "prowlarr"
+			// are a mismatch.
+			//
+			// Returning here shipped the URL unsigned, the indexer answered
+			// 401, and the grab was recorded as successful anyway: the queue
+			// item sat at downloading forever with an empty errorMessage and
+			// nothing was logged at any level (#2505). The web UI always sends
+			// an indexer id, so this was the path every browser grab took.
+			// Fall through to the host match, which can still find the right
+			// credential, and say so.
+			slog.Warn("the indexer named on the grab could not sign the download URL, trying a host match",
+				"indexer_id", *indexerID, "indexer_url", idx.URL,
+				"url", newznab.RedactDownloadURL(rawURL))
 		}
 	}
 	idxs, err := h.indexers.List(ctx)
@@ -876,7 +945,7 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 	if err != nil {
 		return nil, err
 	}
-	if existing != nil && !regrabbableState(existing.Status) {
+	if existing != nil && !regrabbable(existing) {
 		return nil, fmt.Errorf("%w: %s", errAlreadyGrabbed, alreadyGrabbedDetail(existing.Status))
 	}
 
@@ -915,8 +984,16 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 		editionID = existing.EditionID
 		indexerFlags = existing.IndexerFlags
 	}
-	// Tenancy (#1457): stamp from the request identity; API-key callers
-	// (uid 0) inherit the target book's owner when one is known.
+	// Tenancy (#1457): stamp from the request identity. API key and trusted
+	// local requests carry the first admin's id (auth.withOperatorUserID), so
+	// they own what they grab like any signed-in user. A request reaches here
+	// with no identity only when auth is disabled or no admin account exists;
+	// it inherits the target book's owner when one is known, and is otherwise
+	// stored unowned.
+	//
+	// A reused row gets exactly the owner a fresh Create would (#2289), since
+	// it is now this grab's download. That includes unowned: the previous
+	// owner is never carried over.
 	grabOwner := auth.UserIDFromContext(ctx)
 	if grabOwner == 0 && bookID != nil {
 		if b, err := h.books.GetByID(ctx, *bookID); err == nil && b != nil {

@@ -10,11 +10,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/vavallee/bindery/internal/calibre"
+	"github.com/vavallee/bindery/internal/covers"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/models"
 )
@@ -366,6 +368,45 @@ func TestCalibreMetadata_CoverPathOnlyForCalibredb(t *testing.T) {
 	}
 }
 
+// TestCalibreMetadata_StoredCoverResolvesFromStore: a bindery-cover:
+// reference (#2564) is handed to calibredb as the stored file, never sent
+// through MaterializeCover, whose SSRF policy would refuse the scheme.
+func TestCalibreMetadata_StoredCoverResolvesFromStore(t *testing.T) {
+	ctx := context.Background()
+	store := covers.NewStore(filepath.Join(t.TempDir(), "covers"))
+	src := filepath.Join(t.TempDir(), "cover.jpg")
+	if err := os.WriteFile(src, []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := store.Put(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _, _ := store.Resolve(ref)
+
+	book := &models.Book{ID: 42, Title: "Dune", ImageURL: ref, Genres: []string{}}
+	s := NewScanner(nil, nil, nil, nil, nil, t.TempDir(), "", "", "", "").
+		WithCalibreCoverCache(t.TempDir()).
+		WithCoverStore(store)
+
+	meta := s.calibreMetadata(ctx, book, nil, nil, "", "", calibre.ModeCalibredb)
+	if meta.CoverPath != want {
+		t.Fatalf("CoverPath = %q, want stored file %q", meta.CoverPath, want)
+	}
+
+	// The edition's reference wins over the book's, as for any other cover.
+	edition := &models.Edition{ImageURL: covers.Scheme + strings.Repeat("0", 64) + ".jpg"}
+	if meta := s.calibreMetadata(ctx, book, nil, edition, "", "", calibre.ModeCalibredb); meta.CoverPath != "" {
+		t.Fatalf("absent stored cover gave CoverPath %q, want empty", meta.CoverPath)
+	}
+
+	// No store wired: nothing to hand over, and no fetch attempted.
+	bare := NewScanner(nil, nil, nil, nil, nil, t.TempDir(), "", "", "", "").WithCalibreCoverCache(t.TempDir())
+	if meta := bare.calibreMetadata(ctx, book, nil, nil, "", "", calibre.ModeCalibredb); meta.CoverPath != "" {
+		t.Fatalf("no store gave CoverPath %q, want empty", meta.CoverPath)
+	}
+}
+
 func TestResolveCalibreEdition_PrefersDownloadThenSelected(t *testing.T) {
 	database, err := db.OpenMemory()
 	if err != nil {
@@ -465,6 +506,99 @@ func TestImportInternal_ThreeFileBundle_TracksAllInBookFiles(t *testing.T) {
 	}
 	if len(files) != 3 {
 		t.Errorf("want 3 book_files rows for epub+mobi+pdf bundle, got %d", len(files))
+	}
+}
+
+// TestImportInternal_OPFSidecarSeesBackfilledLanguage regression-tests the
+// ordering fix: the OPF sidecar is written after applyEmbeddedLanguage's
+// #1160 backfill, not before it, so a first-time import of a book with no
+// catalogue language produces a sidecar that already carries the language
+// read from the EPUB rather than a blank dc:language moments before the DB
+// catches up.
+func TestImportInternal_OPFSidecarSeesBackfilledLanguage(t *testing.T) {
+	dlDir := t.TempDir()
+
+	opf := `<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Cien Años de Soledad</dc:title>
+    <dc:creator opf:role="aut">Gabriel García Márquez</dc:creator>
+    <dc:language>es</dc:language>
+  </metadata>
+</package>`
+	epubSrc := writeTestEpub(t, "OEBPS/content.opf", opf)
+	epubBytes, err := os.ReadFile(epubSrc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dlDir, "book.epub"), epubBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	libDir := t.TempDir()
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	ctx := context.Background()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	dlRepo := db.NewDownloadRepo(database)
+	clientRepo := db.NewDownloadClientRepo(database)
+	settingsRepo := db.NewSettingsRepo(database)
+	if err := settingsRepo.Set(ctx, "import.write_opf_sidecar", "true"); err != nil {
+		t.Fatal(err)
+	}
+
+	author := &models.Author{ForeignID: "OLA-LANG", Name: "Author", SortName: "Author", Monitored: true, MetadataProvider: "openlibrary"}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	book := &models.Book{
+		ForeignID: "OLB-LANG", AuthorID: author.ID, Title: "Cien Años de Soledad",
+		SortTitle: "Cien Años de Soledad", Status: models.BookStatusWanted,
+		Monitored: true, AnyEditionOK: true, MetadataProvider: "openlibrary",
+		Language: "", // no catalogue language — triggers the #1160 backfill path
+	}
+	if err := bookRepo.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+
+	dl := &models.Download{
+		GUID: "lang-guid", Title: "Cien Años de Soledad", BookID: &book.ID,
+		Status: models.StateCompleted,
+	}
+	if err := dlRepo.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewScanner(dlRepo, clientRepo, bookRepo, authorRepo, db.NewHistoryRepo(database), libDir, "", "", "", "").WithSettings(settingsRepo)
+	s.tryImportInternal(ctx, dl, dlDir, "", "", "", nil, nil)
+
+	updated, err := bookRepo.GetByID(ctx, book.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if updated.Language != "spa" {
+		t.Fatalf("book language after import = %q, want backfilled %q", updated.Language, "spa")
+	}
+
+	bookFiles, err := bookRepo.ListFiles(ctx, book.ID)
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(bookFiles) != 1 {
+		t.Fatalf("want 1 book_files row, got %d", len(bookFiles))
+	}
+	sidecarPath := filepath.Join(filepath.Dir(bookFiles[0].Path), "metadata.opf")
+	sidecar, err := os.ReadFile(sidecarPath)
+	if err != nil {
+		t.Fatalf("reading metadata.opf: %v", err)
+	}
+	if !strings.Contains(string(sidecar), "<dc:language>es</dc:language>") {
+		t.Errorf("metadata.opf missing backfilled language (want normalized <dc:language>es</dc:language>), got:\n%s", sidecar)
 	}
 }
 

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -381,6 +382,65 @@ func (h *SeriesHandler) AddBook(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, updated)
 }
 
+// RemoveBook drops a single book's membership of a series, leaving every other
+// membership and the book itself alone (#2525). Before this existed the only
+// way to correct a book filed under the wrong series was Re-bind metadata,
+// which wipes every membership and rebuilds them from the provider, re-adding
+// exactly the one the user was trying to remove.
+func (h *SeriesHandler) RemoveBook(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	bookID, err := strconv.ParseInt(chi.URLParam(r, "bookId"), 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid book id"})
+		return
+	}
+	series, err := h.series.GetByID(r.Context(), id)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if series == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "series not found"})
+		return
+	}
+	if err := h.series.UnlinkBook(r.Context(), id, bookID); err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// SetPrimaryBook makes this series the one the renamer uses for the given
+// book, demoting the book's other memberships (#2525).
+func (h *SeriesHandler) SetPrimaryBook(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	bookID, err := strconv.ParseInt(chi.URLParam(r, "bookId"), 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid book id"})
+		return
+	}
+	if err := h.series.SetPrimarySeries(r.Context(), id, bookID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "book is not in this series"})
+			return
+		}
+		writeServerError(w, r, err)
+		return
+	}
+	updated, err := h.series.GetByID(r.Context(), id)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
 // Monitor toggles the monitored flag on a series.
 func (h *SeriesHandler) Monitor(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
@@ -621,6 +681,12 @@ func (h *SeriesHandler) queueSeriesBook(ctx context.Context, b models.Book) (boo
 	// scheduler's wanted sweep does (#2365), so a series fill on a book that is
 	// already downloading can still grab a second release.
 	if b.Status == models.BookStatusImported {
+		// Say so. The handler answers queued:0 and the UI renders "Nothing to
+		// fill", which is indistinguishable from a fill that resolved onto the
+		// wrong book (#2538). Naming the book that satisfied the request is
+		// what makes the two tellable apart from the logs.
+		slog.Debug("series fill: nothing queued, the matched book is already imported",
+			"bookID", b.ID, "title", b.Title, "foreignID", b.ForeignID)
 		return false, models.Book{}, nil
 	}
 	if err := h.books.MarkWantedMonitored(ctx, b.ID); err != nil {
@@ -1208,11 +1274,37 @@ func buildHardcoverDiff(ctx context.Context, books *db.BookRepo, userID int64, s
 	// LocalOnly when it has none. First local seen wins the tie, matching the
 	// order this loop has always used.
 	matchedCatalog := make(map[int]struct{})
-	for _, local := range series.Books {
+	// Identities bind first (#2553). Assigning in library order let an
+	// earlier local's fuzzy title match claim the catalogue slot that a later
+	// local owned by foreign ID: "He Who Fights with Monsters 4" took volume
+	// 9 at 0.87, and the real volume 9, carrying volume 9's exact foreign ID,
+	// was left Local only. An explicit identity is never outranked by a title
+	// heuristic, so it must not be outrun by one either.
+	identity := make(map[int]catalogMatch, len(series.Books))
+	for li, local := range series.Books {
+		if local.Book == nil || local.Book.ForeignID == "" {
+			continue
+		}
+		for ci, candidate := range catalog.Books {
+			if _, taken := matchedCatalog[ci]; taken {
+				continue
+			}
+			if local.Book.ForeignID == candidate.ForeignID || local.Book.ForeignID == candidate.Book.ForeignID {
+				identity[li] = catalogMatch{index: ci, score: 100, foreignID: true}
+				matchedCatalog[ci] = struct{}{}
+				break
+			}
+		}
+	}
+	for li, local := range series.Books {
 		if local.Book == nil {
 			continue
 		}
-		match := bestCatalogMatch(local, catalog.Books, matchedCatalog)
+		match, byIdentity := identity[li]
+		if !byIdentity {
+			match = bestCatalogMatch(local, catalog.Books, matchedCatalog)
+		}
+		logDiffDecision(series.ID, local, catalog.Books, match)
 		localItem := localDiffBook(local)
 		if match.index < 0 {
 			diff.LocalOnly = append(diff.LocalOnly, localItem)
@@ -1237,6 +1329,14 @@ func buildHardcoverDiff(ctx context.Context, books *db.BookRepo, userID int64, s
 		if _, ok := matchedCatalog[i]; ok {
 			continue
 		}
+		// The same unconditional bundle prune the add path applies (#2239).
+		// Without it the diff offered an Add button on a box set that
+		// fillHardcoverCatalogBook then silently refused, and counted it in
+		// "N missing" so a complete series never read as complete. Reported
+		// by magrhino in #2524 against a real Stormlight catalogue.
+		if title := firstNonEmpty(book.Book.Title, book.Title); metadata.IsUnambiguousBundleTitle(title) {
+			continue
+		}
 		item := catalogDiffBook(book, catalog.AuthorName)
 		enrichMissingDiffBook(ctx, books, userID, book, &item)
 		diff.Missing = append(diff.Missing, item)
@@ -1244,6 +1344,32 @@ func buildHardcoverDiff(ctx context.Context, books *db.BookRepo, userID int64, s
 	diff.PresentCount = len(diff.Present)
 	diff.MissingCount = len(diff.Missing)
 	return diff
+}
+
+// logDiffDecision records which catalogue entry a local series book bound
+// to, and how. The diff matcher had no logging at all, so a wrong binding
+// could only be diagnosed by rebuilding the library in a scratch container
+// (#2553, where magrhino had DEBUG on and found nothing to read).
+func logDiffDecision(seriesID int64, local models.SeriesBook, books []metadata.SeriesCatalogBook, match catalogMatch) {
+	if local.Book == nil {
+		return
+	}
+	if match.index < 0 {
+		slog.Debug("series diff: local book matched no catalogue entry",
+			"seriesID", seriesID, "localBookID", local.Book.ID, "localTitle", local.Book.Title,
+			"localPosition", local.PositionInSeries)
+		return
+	}
+	c := books[match.index]
+	matchedBy := "title"
+	if match.foreignID {
+		matchedBy = "identity"
+	}
+	slog.Debug("series diff: local book bound to catalogue entry",
+		"seriesID", seriesID, "localBookID", local.Book.ID, "localTitle", local.Book.Title,
+		"localForeignID", local.Book.ForeignID, "localPosition", local.PositionInSeries,
+		"catalogTitle", firstNonEmpty(c.Title, c.Book.Title), "catalogForeignID", firstNonEmpty(c.ForeignID, c.Book.ForeignID),
+		"catalogPosition", c.Position, "matchedBy", matchedBy, "score", match.score)
 }
 
 type catalogMatch struct {
@@ -1288,6 +1414,18 @@ func bestCatalogMatch(local models.SeriesBook, books []metadata.SeriesCatalogBoo
 			// Only on the title path. A foreign-ID match is an explicit
 			// identity and outranks any title heuristic.
 			if seriesmatch.DifferentVolumes(local.Book.Title, candidateTitle) {
+				continue
+			}
+			// A book this series already files at one position cannot be the
+			// catalogue's entry at another, however the titles score (#2553).
+			// "He Who Fights with Monsters 4" scored 0.87 against catalogue
+			// volume 9 and "He Who Fights with Monsters 12: A LitRPG
+			// Adventure" 0.90 against volume 1, and neither title carries a
+			// marker DifferentVolumes can compare. The stored position is the
+			// evidence that does separate them. Same rule the add path
+			// applies (#2538).
+			if local.PositionInSeries != "" && candidate.Position != "" &&
+				!seriesmatch.SamePosition(local.PositionInSeries, candidate.Position) {
 				continue
 			}
 			score = seriesmatch.TitleScore(local.Book.Title, candidateTitle)
@@ -1511,13 +1649,29 @@ func (h *SeriesHandler) ensureHardcoverCatalogBook(ctx context.Context, series *
 	if book.ForeignID == "" {
 		book.ForeignID = "hc:" + catalogBook.ProviderID
 	}
-	if existing, err := h.books.GetByForeignID(ctx, book.ForeignID); err != nil {
+	// GetByAnyForeignID, not GetByForeignID: a book the library already holds
+	// under a different provider's id carries that id in book_identifiers
+	// (#1705), and matching only the primary column made Fill create a second
+	// row for the same work and queue it for download. Raised in #2524.
+	if existing, err := h.books.GetByAnyForeignID(ctx, book.ForeignID); err != nil {
 		return nil, err
 	} else if existing != nil {
 		if existing.Excluded {
 			return nil, nil
 		}
-		_, err := h.series.LinkBookIfMissing(ctx, series.ID, existing.ID, catalogBook.Position, true)
+		// The book already exists, so it may already be filed under its real
+		// series; do not promote this one over it (#2525).
+		slog.Debug("series fill: catalog entry resolved to an existing book by identity",
+			"seriesID", series.ID,
+			"requestedTitle", firstNonEmpty(book.Title, catalogBook.Title),
+			"requestedForeignID", book.ForeignID,
+			"requestedPosition", catalogBook.Position,
+			"matchedBookID", existing.ID,
+			"matchedTitle", existing.Title,
+			"matchedForeignID", existing.ForeignID,
+			"matchedStatus", existing.Status,
+			"matchedBy", "identity")
+		_, err := h.series.LinkBookPreservingPrimary(ctx, series.ID, existing.ID, catalogBook.Position)
 		return existing, err
 	}
 
@@ -1568,10 +1722,23 @@ func (h *SeriesHandler) ensureHardcoverCatalogBook(ctx context.Context, series *
 	}
 	blockedByExcludedTitle := false
 	incomingTitle := firstNonEmpty(book.Title, catalogBook.Title)
+	// Where each existing book already sits in THIS series. A book filed at
+	// position 1 cannot also be the catalogue's volume 13, however its title
+	// scores: "The Primal Hunter" against "The Primal Hunter 13" scores 95,
+	// and the bare-number veto below cannot fire because only one side
+	// carries a number (#2538, reported by magrhino).
+	seriesPosition := make(map[int64]string, len(series.Books))
+	for _, member := range series.Books {
+		seriesPosition[member.BookID] = strings.TrimSpace(member.PositionInSeries)
+	}
+	wantPosition := strings.TrimSpace(catalogBook.Position)
 	var best *models.Book
 	bestScore := 0
 	for i := range existingByTitle {
 		existing := &existingByTitle[i]
+		if have := seriesPosition[existing.ID]; have != "" && wantPosition != "" && !seriesmatch.SamePosition(have, wantPosition) {
+			continue
+		}
 		// Volume numbers veto the similarity score (#1682). Fuzzy title
 		// matching cannot separate the volumes of a light novel or manga
 		// series — they differ by one number in an otherwise identical string,
@@ -1630,7 +1797,23 @@ func (h *SeriesHandler) ensureHardcoverCatalogBook(ctx context.Context, series *
 		}
 	}
 	if best != nil {
-		_, err := h.series.LinkBookIfMissing(ctx, series.ID, best.ID, catalogBook.Position, true)
+		// #2538: this return is why "Add" on a missing volume answered
+		// queued:0 with nothing in the logs to say why. A fuzzy title match
+		// picking the wrong volume looks identical from outside to a book
+		// that genuinely already exists, so the score and both identities
+		// have to be on the record.
+		slog.Debug("series fill: catalog entry resolved to an existing book by title",
+			"seriesID", series.ID,
+			"requestedTitle", incomingTitle,
+			"requestedForeignID", book.ForeignID,
+			"requestedPosition", catalogBook.Position,
+			"matchedBookID", best.ID,
+			"matchedTitle", best.Title,
+			"matchedForeignID", best.ForeignID,
+			"matchedStatus", best.Status,
+			"matchedBy", "title",
+			"score", bestScore)
+		_, err := h.series.LinkBookPreservingPrimary(ctx, series.ID, best.ID, catalogBook.Position)
 		return best, err
 	}
 	if blockedByExcludedTitle {

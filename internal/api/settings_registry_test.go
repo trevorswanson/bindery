@@ -61,6 +61,13 @@ func TestSettingDescriptors_WellFormed(t *testing.T) {
 					continue
 				}
 				if _, err := time.ParseDuration(v); err != nil {
+					// A default may be a sentinel instead of a duration, as
+					// "off" is for authors.discovery.interval, but only one
+					// the key's own validator accepts. Bounds have no such
+					// licence: a min or max must be a real duration.
+					if name == "default" && validateSettingValue(d.Key, v) == nil {
+						continue
+					}
 					t.Errorf("%s: duration %s %q does not parse: %v", d.Key, name, v, err)
 				}
 			}
@@ -357,6 +364,11 @@ func TestValidateSettingValue_KnownKeysUnchanged(t *testing.T) {
 		{"plugin url rejects a missing host", SettingCalibrePluginURL, "https://", true},
 		{"plugin url rejects cloud metadata", SettingCalibrePluginURL, "http://169.254.169.254/latest/meta-data", true},
 
+		{"opf sidecar accepts true", SettingImportWriteOPFSidecar, "true", false},
+		{"opf sidecar accepts false", SettingImportWriteOPFSidecar, "false", false},
+		{"opf sidecar accepts empty", SettingImportWriteOPFSidecar, "", false},
+		{"opf sidecar rejects other", SettingImportWriteOPFSidecar, "yes", true},
+
 		{"abs enabled accepts false", SettingABSEnabled, "false", false},
 		{"abs enabled accepts empty", SettingABSEnabled, "", false},
 		{"abs enabled rejects other", SettingABSEnabled, "on", true},
@@ -371,6 +383,15 @@ func TestValidateSettingValue_KnownKeysUnchanged(t *testing.T) {
 		{"hardcover sync interval accepts empty", SettingHardcoverSyncInterval, "", false},
 		{"hardcover sync interval rejects under an hour", SettingHardcoverSyncInterval, "5m", true},
 		{"hardcover sync interval rejects over a week", SettingHardcoverSyncInterval, "1000h", true},
+
+		{"discovery interval accepts off", SettingAuthorDiscoveryInterval, "off", false},
+		{"discovery interval accepts empty", SettingAuthorDiscoveryInterval, "", false},
+		{"discovery interval accepts daily", SettingAuthorDiscoveryInterval, "24h", false},
+		{"discovery interval accepts weekly", SettingAuthorDiscoveryInterval, "168h", false},
+		{"discovery interval accepts monthly", SettingAuthorDiscoveryInterval, "720h", false},
+		{"discovery interval rejects gibberish", SettingAuthorDiscoveryInterval, "weekly", true},
+		{"discovery interval rejects under a day", SettingAuthorDiscoveryInterval, "6h", true},
+		{"discovery interval rejects over a month", SettingAuthorDiscoveryInterval, "1000h", true},
 
 		// Keys with a descriptor but no per key rule: they were accepted
 		// before and still are, now on the strength of being registered
@@ -410,6 +431,7 @@ func TestValidateSettingValue_KnownKeysUnchanged(t *testing.T) {
 var webSettingKeys = []string{
 	"author.default_monitor_latest_count",
 	"author.default_monitor_mode",
+	"authors.discovery.interval",
 	"autoGrab.enabled",
 	"calibre.binary_path",
 	"calibre.library_import_enabled",
@@ -431,6 +453,7 @@ var webSettingKeys = []string{
 	"import.drop_layout",
 	"import.drop_link_mode",
 	"import.mode",
+	"import.write_opf_sidecar",
 	"library.defaultRootFolderId",
 	"log.retention_days",
 	"metadata.primary_provider",
@@ -540,6 +563,19 @@ func TestSettingsHandler_Descriptors(t *testing.T) {
 	}
 	if !interval.RestartRequired {
 		t.Errorf("%s is read once at scheduler start, so restartRequired must survive the wire", SettingSearchInterval)
+	}
+	// Discovery ships off: the descriptor is what a client renders as the
+	// selected state before anything is stored, and the bounds stay as they
+	// were so an operator who turns it on has the same choices.
+	discovery, ok := byKey[SettingAuthorDiscoveryInterval]
+	if !ok {
+		t.Fatalf("%s missing from the served registry", SettingAuthorDiscoveryInterval)
+	}
+	if discovery.Default != "off" || discovery.Min != "24h" || discovery.Max != "720h" {
+		t.Errorf("%s served as %+v, want default off within [24h, 720h]", SettingAuthorDiscoveryInterval, discovery)
+	}
+	if discovery.RestartRequired {
+		t.Errorf("%s is re-read every tick, so restartRequired must stay false", SettingAuthorDiscoveryInterval)
 	}
 	if token := byKey[SettingHardcoverAPIToken]; !token.Secret || !token.Writable {
 		t.Errorf("%s served as secret=%v writable=%v, want secret and still writable", SettingHardcoverAPIToken, token.Secret, token.Writable)

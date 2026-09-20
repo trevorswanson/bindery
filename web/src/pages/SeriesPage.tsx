@@ -3,6 +3,7 @@ import { Link, useLocation } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import { api, MediaType, Series, SeriesHardcoverDiff, SeriesHardcoverDiffBook, SeriesHardcoverLink, SeriesHardcoverSearchResult, SystemStatus } from '../api/client'
 import { hardcoverSeriesUrl } from '../util/metadataSource'
+import { foldedIncludes } from '../util/foldForSearch'
 import AddSeriesBookModal from '../components/AddSeriesBookModal'
 import HardcoverSeriesLinkModal from '../components/HardcoverSeriesLinkModal'
 import SeriesNameModal from '../components/SeriesNameModal'
@@ -15,6 +16,7 @@ export default function SeriesPage() {
   const { confirm, confirmDialog } = useConfirmDialog()
   const location = useLocation()
   const [seriesList, setSeriesList] = useState<Series[]>([])
+  const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [expanded, setExpanded] = useState<number | null>(null)
   const [filling, setFilling] = useState<number | null>(null)
@@ -246,6 +248,8 @@ export default function SeriesPage() {
     }
   }
 
+  const filteredSeries = seriesList.filter(series => foldedIncludes(series.title, search))
+
   return (
     <div>
       {confirmDialog}
@@ -262,6 +266,17 @@ export default function SeriesPage() {
         </div>
       </div>
 
+      <div className="flex flex-col sm:flex-row gap-3 mb-4">
+        <input
+          type="search"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          aria-label={t('series.searchPlaceholder')}
+          placeholder={t('series.searchPlaceholder')}
+          className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600 placeholder-slate-400 dark:placeholder-zinc-600"
+        />
+      </div>
+
       {loading ? (
         <div className="text-slate-600 dark:text-zinc-500">Loading...</div>
       ) : seriesList.length === 0 ? (
@@ -269,15 +284,21 @@ export default function SeriesPage() {
           <p className="text-lg mb-2">No series found</p>
           <p className="text-sm">Series are populated automatically from your monitored authors' books</p>
         </div>
+      ) : filteredSeries.length === 0 ? (
+        <div className="text-center py-16 text-slate-600 dark:text-zinc-500" role="status">
+          <p>{t('series.noMatch', { query: search })}</p>
+        </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 items-start">
           {/* items-start (#1682): CSS Grid defaults to align-items:stretch, so
               expanding one series card stretched every other card in the same
               row to match, making it hard to tell which one was actually open. */}
-          {seriesList.map(series => {
+          {filteredSeries.map(series => {
             const books = series.books ?? []
             const bookCount = books.length
-            const gapCount = books.filter(b => b.book && b.book.status !== 'imported').length
+            // Excluded books are not a gap: counting them showed a "missing" pill
+            // that Fill could not act on (#2324).
+            const gapCount = books.filter(b => b.book && b.book.status !== 'imported' && !b.book.excluded).length
             const diff = diffs[series.id]
             const hardcoverMissingEstimate = enhancedHardcoverApi ? Math.max(0, (series.hardcoverLink?.hardcoverBookCount ?? 0) - bookCount) : 0
             const hardcoverMissingCount = enhancedHardcoverApi ? (diff?.missingCount ?? hardcoverMissingEstimate) : 0
@@ -319,12 +340,19 @@ export default function SeriesPage() {
 
                 {/* Actions row */}
                 <div className="px-4 pb-3 flex items-center gap-3 flex-wrap" onClick={e => e.stopPropagation()}>
+                  {/* This flag is a shortlist marker, not a schedule. Nothing
+                      reads series.monitored except this page: no job checks a
+                      monitored series for new books, and Fill gaps ignores it.
+                      Labelling it "Monitor series" promised recurring attention
+                      the code never gave, which is what #2523 was filed about.
+                      The control stays, the wording no longer overstates it. */}
                   <Switch
                     checked={series.monitored}
                     onChange={() => toggleMonitor(series)}
-                    label={series.monitored ? 'Stop monitoring' : 'Monitor series'}
+                    label={series.monitored ? 'Remove from shortlist' : 'Add to shortlist'}
+                    title="Marks the series so you can find it again. Bindery does not yet check a shortlisted series for new books on its own; use Fill gaps."
                   >
-                    {series.monitored ? 'Monitored' : 'Not monitored'}
+                    {series.monitored ? 'Shortlisted' : 'Not shortlisted'}
                   </Switch>
                   {enhancedHardcoverApi && (
                     <button
@@ -421,17 +449,24 @@ export default function SeriesPage() {
                             </p>
                           )}
                         </div>
-                        {entry.book?.status && (
-                          <span className={`ml-auto text-xs px-2 py-0.5 rounded flex-shrink-0 ${
-                            entry.book.status === 'imported'
-                              ? 'bg-emerald-500/20 text-emerald-400'
-                              : entry.book.status === 'wanted'
-                              ? 'bg-amber-500/20 text-amber-400'
-                              : 'bg-slate-300 dark:bg-zinc-700 text-slate-600 dark:text-zinc-400'
-                          }`}>
-                            {entry.book.status}
-                          </span>
-                        )}
+                        <span className="ml-auto flex items-center gap-1 flex-shrink-0">
+                          {entry.book?.status && (
+                            <span className={`text-xs px-2 py-0.5 rounded ${
+                              entry.book.status === 'imported'
+                                ? 'bg-emerald-500/20 text-emerald-400'
+                                : entry.book.status === 'wanted'
+                                ? 'bg-amber-500/20 text-amber-400'
+                                : 'bg-slate-300 dark:bg-zinc-700 text-slate-600 dark:text-zinc-400'
+                            }`}>
+                              {entry.book.status}
+                            </span>
+                          )}
+                          {entry.book?.excluded && (
+                            <span className="text-xs px-2 py-0.5 rounded bg-amber-500/20 text-amber-700 dark:text-amber-400">
+                              Excluded
+                            </span>
+                          )}
+                        </span>
                       </Link>
                     ))}
                   </div>

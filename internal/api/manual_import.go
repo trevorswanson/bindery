@@ -78,6 +78,23 @@ func (h *ManualImportHandler) WithRoots(r *LibraryRoots) *ManualImportHandler {
 	return h
 }
 
+// outsideRootsMessage is the 403 body for a path that does not resolve inside a
+// configured library root. The flat sentence it replaces told the user what was
+// wrong and nothing about what would be right, so a folder scan was a dead end:
+// naming the roots shows what a valid path looks like.
+//
+// Every manual-import route is behind RequireAdmin, and the only thing added is
+// the operator's own root folder configuration, which the same admin can read
+// on the Root Folders tab. Nothing else about the filesystem is disclosed.
+func (h *ManualImportHandler) outsideRootsMessage(ctx context.Context) string {
+	const base = "path is outside the configured library roots"
+	roots := h.roots.Configured(ctx)
+	if len(roots) == 0 {
+		return base + "; no library root is configured yet, so add one in Settings, Root Folders"
+	}
+	return base + ": " + strings.Join(roots, ", ")
+}
+
 // Lookup handles GET /api/v1/queue/manual-import/lookup?path=...
 // It parses the filename, searches the local catalogue, and returns a match
 // result along with the auto-detected format. No state is modified.
@@ -93,7 +110,7 @@ func (h *ManualImportHandler) Lookup(w http.ResponseWriter, r *http.Request) {
 	}
 	resolved, ok := h.roots.ResolveContained(r.Context(), path)
 	if !ok {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "path is outside the configured library roots"})
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": h.outsideRootsMessage(r.Context())})
 		return
 	}
 	// Operate on the symlink-resolved path so the containment check and the
@@ -137,7 +154,7 @@ func (h *ManualImportHandler) prepareImport(ctx context.Context, rawPath string,
 	// points outside it can't redirect the read/move to an arbitrary file.
 	resolved, ok := h.roots.ResolveContained(ctx, path)
 	if !ok {
-		return nil, "", http.StatusForbidden, "path is outside the configured library roots"
+		return nil, "", http.StatusForbidden, h.outsideRootsMessage(ctx)
 	}
 	path = resolved
 	if bookID <= 0 {
@@ -305,7 +322,7 @@ func (h *ManualImportHandler) ReassignPreview(w http.ResponseWriter, r *http.Req
 	// sits under a configured library root before reporting anything about it.
 	resolved, ok := h.roots.ResolveContained(r.Context(), path)
 	if !ok {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "path is outside the configured library roots"})
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": h.outsideRootsMessage(r.Context())})
 		return
 	}
 	path = resolved
@@ -532,7 +549,7 @@ func (h *ManualImportHandler) resolveImportFolder(ctx context.Context, rawPath s
 	}
 	resolved, ok := h.roots.ResolveContained(ctx, path)
 	if !ok {
-		return "", http.StatusForbidden, "path is outside the configured library roots"
+		return "", http.StatusForbidden, h.outsideRootsMessage(ctx)
 	}
 	info, err := os.Stat(resolved) //nolint:gosec // #nosec G304 -- resolved by ResolveContained after symlink-aware root containment; route requires admin
 	if err != nil {

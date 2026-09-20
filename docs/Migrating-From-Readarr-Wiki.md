@@ -13,6 +13,8 @@ Each imported author's catalogue is populated from metadata. Nothing is auto-gra
 
 The import dedupes by metadata id, so re-running it is safe: authors that already exist are skipped.
 
+Each author is matched against your primary metadata provider and its fallbacks, and linked to the provider whose record matched. If your primary metadata provider does not answer during the import, an author it did not match is listed as failed rather than linked to another provider, because the link decides for good which provider the author's catalogue syncs from. The reason says the primary did not answer. Nothing is wrong with the name, so run the import again once the provider responds. Once the primary has failed to answer three lookups in a row, the import stops asking it and lists the remaining authors as failed with the same reason straight away, so an outage costs a few timeouts rather than one per author. A name that no provider matched while they were all answering is listed with the providers that were asked. A pasted or uploaded author list (**Settings → Import**) works the same way.
+
 An indexer or download client whose address Bindery will not call (link-local and cloud-metadata addresses) is reported as failed rather than imported, with the same message you would get typing it into the Add form.
 
 ## Two Readarr instances (separate ebook / audiobook)
@@ -25,7 +27,7 @@ Bindery is a single instance. One author record covers ebook, audiobook, or both
 
 ## Bringing in books already on disk
 
-For files already on disk, use **Library Scan**. It takes the author and title from your folder layout: a file under `{Author}/{Book}/` — Readarr's and Calibre's default structure — is matched on the folder names, so the filename convention (`Author - Title` vs `Title - Author`) does not matter. Loose files with no author/book folders fall back to filename parsing, which can still be ambiguous, so keep an organised folder structure for the most reliable scan.
+For files already on disk, use **Library Scan**. It takes the author from your folder layout: a file under `{Author}/{Book}/` — Readarr's and Calibre's default structure — is matched on the author folder, so the filename convention (`Author - Title` vs `Title - Author`) does not matter for the author. An ebook's title is read from the file's own name first and from the book folder only when the filename matches nothing, so a `Series/01 - Title.epub` layout matches the book the file names. An audiobook's title comes from its folder, where the files are its tracks. Loose files with no author/book folders fall back to filename parsing, which can still be ambiguous, so keep an organised folder structure for the most reliable scan. **Bulk folder import** reads the same author folders when you point it at the folder that holds them.
 
 One difference to know about before you start correcting matches: Readarr's fix-match only changes which record a file is linked to, while Bindery's **Fix match** re-runs the import, so it moves the file into the target book's folder and renames it from your naming template. The confirmation step names the destination path before anything happens, so you can back out if you would rather keep your existing layout. Reassigning without relocating is not available yet (#2055).
 
@@ -67,6 +69,8 @@ The import is a two-step, dry-run-first flow — nothing is written until you co
 
 ### 5. Failed rows
 
-Rows that could not be matched are listed in the preview under **unresolved**, with a reason (no ISBN match, title+author search found nothing, etc.). Use **Download failed rows** to get a Goodreads-shaped CSV of just those rows, with a `Reason` column. Fix an ISBN or title in that file and re-upload it to retry only the misses.
+Rows that could not be matched are listed in the preview under **unresolved**, with a reason naming the providers that were asked, for example `no match on openlibrary, hardcover for ISBN or title+author`. Use **Download failed rows** to get a Goodreads-shaped CSV of just those rows, with a `Reason` column. Fix an ISBN or title in that file and re-upload it to retry only the misses.
+
+A reason that starts `primary metadata provider ... did not answer` is different: the row is fine, so do not edit it. Your primary metadata provider was not answering during the preview, so the row either found nothing or was matched only by another provider, and importing that match would link its author to the other provider for good. Upload the failed rows again, unchanged, once the provider responds. After three lookups in a row get no answer from the primary, the preview stops asking and gives every remaining row this reason without a lookup, so it finishes quickly instead of waiting out the provider's timeout row by row.
 
 Resolution quality depends on ISBN coverage: rows with a valid ISBN match most reliably. Older or self-published titles often have no ISBN in the export and fall back to title+author search, which can miss — that is expected.

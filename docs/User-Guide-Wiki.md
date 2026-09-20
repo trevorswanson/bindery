@@ -41,14 +41,35 @@ an arbitrary release is unreliable. The escape hatches:
 
 - **Search Indexers** (the magnifier icon in the header) — free-text search
   across all your indexers; any result can be grabbed.
-- **Manual Import** (`/import`) — point it at a folder of files you already
-  have and match them to books. Files already tracked in the library are skipped
-  by default; toggle **Show already imported** to surface them again, e.g. to
-  spot a corrupted file or relink one. A file with no catalogue match gets a
-  metadata search on its row, which creates the book (and its author, if new)
-  and links the file to it, so an unmatched file is no longer a dead end.
+- **Import** (`/import`): **In your library** lists the books a library scan
+  could not match, for you to adopt in place ([Adopting files already in your
+  library](#adopting-files-already-in-your-library)). **From a folder** points
+  at a folder of files you already have and matches them to books; files already
+  tracked in the library are skipped by default, and toggling **Show already
+  imported** surfaces them again, e.g. to spot a corrupted file or relink one.
+  Either way a file with no catalogue match gets a metadata search, which
+  creates the book (and its author, if new) and links the file to it, so an
+  unmatched file is no longer a dead end.
 
 Both still end by attaching a file to a catalogue record.
+
+The **Search library** box in the header is the other kind of search: it looks
+only at what is already in Bindery. As you type it lists matching authors
+(including pen names), books (by title or author) and series, and selecting a
+row opens it (a series row opens the Series page with that series expanded,
+without scrolling to it). The last row is always *Add "…" to Bindery*, which
+opens the **Add to library** dialog with the same text already searched against
+your metadata providers, so a miss in the library turns into an add without
+retyping. Pressing Enter with nothing highlighted opens that dialog too, even
+when the list has library hits; use the arrow keys to pick a hit instead. It
+does not query indexers; that stays with the magnifier.
+
+**Where the pages live.** The top bar carries five entries. **Library** holds
+Authors, Books and Series; **Activity** holds Wanted, Queue and History (plus
+Requests for an admin); **Import**, **Calendar** and **Discover** are pages of
+their own. Opening a group lands on its first page and a row of tabs above the
+content switches between the rest, so every page keeps the address it always
+had. On a phone the menu lists the same pages, indented under their group.
 
 ## Five rules that answer most questions
 
@@ -58,9 +79,10 @@ Almost every "why is Bindery doing that?" question comes down to one of these.
 
 **Scan Library** (Settings → General → Library, and automatically every 6
 hours) matches files already on disk to books **already in your catalogue**.
-It never creates authors or books from files. If you point a fresh install at
-a folder of 3,000 epubs and hit Scan, you get 3,000 "unmatched" files and an
-empty library — nothing populated the catalogue first.
+It never creates authors or books from files on its own. If you point a fresh
+install at a folder of 3,000 epubs and hit Scan, you get a long list of
+unmatched books on **Import → In your library** and an empty library, because
+nothing populated the catalogue first. That list is where you can adopt them.
 
 The sequence that works is always: **populate the catalogue, then scan**. See
 [Bringing in an existing library](#bringing-in-an-existing-library) below.
@@ -78,7 +100,9 @@ Separately, every book is **monitored** or not. Monitored means "Bindery
 actively pursues this." The **Wanted page** — and the automatic search sweep —
 only covers books that are *all three of*: status `wanted`, monitored, and not
 excluded. A book that is `wanted` but unmonitored shows as "Not monitored" and
-is left alone.
+is left alone. Flip a single book from the switch next to the status badge on
+its own page, or many at once from the Books list (select, then **Monitor** /
+**Unmonitor**).
 
 Two related labels:
 
@@ -102,8 +126,9 @@ Consequences:
   save path Bindery hands qBittorrent.
 - There is no per-protocol (torrent vs usenet) folder setting because each
   client already owns its completed path.
-- Files you acquired outside Bindery are picked up only via **Manual Import**,
-  **Bulk folder import**, or a **Library Scan** (rule 1 applies).
+- Files you acquired outside Bindery are picked up only via **Import → From a
+  folder**, or a **Library Scan** and **Import → In your library** for files
+  already in the library folder (rule 1 applies).
 
 ### 4. Naming templates are for output, not input
 
@@ -111,9 +136,27 @@ The templates in Settings → General → File Naming control how Bindery names
 and organises files **it imports itself**. The Library Scan does **not** use
 them — it reads existing files with a fixed parser that prefers an
 `{Author}/{Book Title}/` folder structure and reads a bare `X - Y` filename as
-`Title - Author` (the *opposite* of Readarr's default order). If the scan
-misreads your `Author - Title.epub` files, that is why: rearrange into
-author folders, or use Manual Import, which lets you pick the right book.
+`Title - Author` (the *opposite* of Readarr's default order). Author folders
+settle the order. The Library Scan takes the author from the author folder,
+except for an audiobook whose tags name an author: there the tag wins. An
+ebook's **title** comes from the file's own name, with the book folder as the
+fallback, so a series or box set folder does not retitle the books inside it;
+a leading position number is stripped from a folder title, so `01 - The Eye of
+the World (1990)` matches as well. An audiobook keeps the folder as the book,
+because its files are tracks rather than books. A file
+in a folder named after the first part of its name can also be read the other
+way round, as author then title, and that reading is kept only if it matches a
+book by an author in your library. Bulk folder import tries it for the folder
+you point it at, and Manual Import of a single file tries it inside your
+library folders, both only when the usual reading matches nothing. The Library
+Scan tries it first, in author folders with no book folder below them, so a
+Tom Clancy file named author first goes to its own book and not to one with
+Tom Clancy in its title. It skips it for an audiobook whose tags name a title,
+or an author other than the folder's. Bulk folder import also takes the author
+from the folder when the filename has none, or when the filename's author
+matches none of the books with that title and the folder name does. Loose files with no author folder still use the
+filename alone; if those are misread, move them into author folders, or use
+Manual Import, which lets you pick the right book.
 
 ### 5. Hardlinks need one mount
 
@@ -137,12 +180,32 @@ monitored.
 
 | Entry point | What it creates |
 |---|---|
-| **Authors → Add Author** | The author **plus their full catalogue** (up to ~100 titles), monitored per the monitor mode you pick |
-| **Authors → Add Book** (title/ISBN/ASIN) | One book, and only that book, silently creating its author if needed |
+| **Add to library → an author row** (the **Add Author** button on Authors) | The author **plus their full catalogue** (up to ~100 titles), monitored per the monitor mode you pick |
+| **Add to library → a book row** (the **Add Book** button on Books or Authors) | One book, and only that book, silently creating its author if needed. Select a search result to review its cover and identifiers before confirming; ISBN lookups show the searched ISBN separately from identifiers reported by the metadata source |
 | **Discover → Add to Wanted** | One recommended book |
 | **Series → Fill gaps** | The missing books of a linked series, wanted + monitored |
 | **Import lists** (Settings → Import, Hardcover reading lists) | Every list item, re-synced on the Hardcover list sync interval (Settings → General, 24h by default). Whether the items are also marked wanted is the per-list **Download books from this list** checkbox: on (the default) creates them monitored and queues downloads; off catalogues them unmonitored, so you can browse a Want to Read shelf in Bindery and fetch books one at a time. Authors created by a list never pull their back-catalogue in — only the listed books are added. **Sync now** starts the sync in the background and the row reports its progress, so a large shelf isn't cut short by a request timeout |
 | **Library imports** (Calibre, Readarr, ABS, Goodreads CSV, author list) | Your existing catalogue — see the next section |
+
+**Add Author** and **Add Book** open the same dialog. Type an author name, a
+title, an ISBN or an ASIN and press Enter; the results list authors first, each
+followed by the books the provider attributes to them, with any remaining books
+under a *Books* divider. Which button you pressed only changes the placeholder.
+What you pick decides what happens next: an author row leads to the monitoring
+step (metadata profile, root folder, media type, monitor mode, auto-grab), a
+book row to the single-book step (cover, identifiers, format, search on add).
+Rows that already match something in your library say **In your library** with
+an **Open** link instead of Select, and adding one anyway is refused with a
+link to the existing record. An ISBN search, and adding a book row whose
+result carries no author id (DNB results, for example), look the ISBN up
+across your metadata providers. If the primary provider does not answer during
+that lookup, the search or the add is refused with a message to try again once
+it responds, rather than offering another provider's record and linking the
+book and its author to it for good. A primary that answers without the ISBN
+still lets another provider's record through.
+Searches run against the metadata providers only
+when you press Enter or Search, never as you type; the header library search is
+the one that reacts to keystrokes, because it only reads your own catalogue.
 
 Two settings decide whether an author add stays a trickle or becomes a flood:
 
@@ -177,10 +240,21 @@ Settings → General turns grabbing off entirely if you prefer to grab by hand
 from the Wanted page. It covers every path that can start a download: the
 scheduled sweep, the searches an author add fires, a series fill, adding a
 single book, adding from recommendations, a bulk **Search** action, a book
-flipping to wanted, and the re-search after a stalled download. Books are
+flipping to wanted, and the re-search after a stalled download. A bulk
+**Search** refuses while the switch is off and says which setting to change,
+keeping your selection; a single book's **Search Indexers** still runs, which
+is how you search and grab by hand with grabbing off. Books are
 still created and still marked wanted, so the Wanted page is complete when
 you come back to it. Searches also fire when an author is added
 ("Search for books on add") and when a book flips to wanted.
+
+**Two language titles.** A translated book whose title is stored as
+"translated / original", such as "El imperio final / The Final Empire", is
+searched under the translated part only, because no release is named with
+both. This applies when the title is exactly two parts joined by a spaced
+slash and the book, or your metadata profile, names a language other than
+English. An English bundle such as "Second Nature / One Summer" is searched
+whole.
 
 **Daily query limits.** A sweep searches every wanted book against every
 enabled indexer back to back, so on a large library it can be thousands of
@@ -203,6 +277,17 @@ search details panel, and the **Test** button is exempt so it still works when
 you are trying to diagnose a quiet indexer. Raising the search interval is not
 an alternative: it changes how often the burst happens, not how big one burst
 is.
+
+**Rate limits.** When an indexer refuses a search because a request limit
+was reached, whether as a Newznab "request limit reached" error or as an HTTP
+429 from the host in front of it (Cloudflare's "error code: 1015"), Bindery
+stops searching that indexer for the time the indexer asked for, or for an hour
+when it gave no time. An indexer that limits again after that is left alone
+for longer each time: three hours, then six, twelve and a day, and every search
+it answers brings it back down a step. The Indexers tab shows a held indexer
+with the time searches resume; editing the indexer clears the hold, and so does
+a restart. A daily query limit stops the burst before the indexer has to refuse
+it; the hold is what happens when it refuses anyway.
 
 **Decision.** Each release is checked against your quality profile (allowed
 formats), delay profile, blocklist, size limits, and language filter.
@@ -245,6 +330,12 @@ After import, Bindery fans out to whatever integrations you enabled: Calibre,
 a CWA ingest folder, Grimmory's BookDrop, an Audiobookshelf library scan,
 webhooks.
 
+If the library app downstream reads sidecar metadata, turn on **Write a
+metadata.opf sidecar** in Settings → General (off by default). Bindery then
+writes a Calibre style `metadata.opf` next to each imported ebook and
+audiobook with its own title, author, series and identifiers, and refreshes it
+on Reorganize. The book file itself is never modified.
+
 **Queue and History.** The Queue page shows live downloads and, importantly,
 the recovery actions: **Retry import** (after fixing a path remap), **Match to
 book** (attach a failed import to the right book and import it from disk), and
@@ -268,7 +359,7 @@ matches where your metadata lives, then scan:
 | An Audiobookshelf server | Settings → Audiobookshelf → configure + **Import** ([guide](ABS-Import-Wiki.md)) |
 | A Goodreads account | Settings → Import → **Goodreads CSV** (export, filter by shelf, preview, commit) |
 | Just a list of authors | Settings → Import → paste or upload the author list |
-| Only folders of files | Use **Manual Import** (`/import`) or Settings → Import → **Bulk folder import**, which match files and create what's missing |
+| Only folders of files | Scan the library, then adopt on **Import → In your library**; or use **Import → From a folder** for files outside the library |
 
 Then run **Settings → General → Library → Scan Library** to attach your files
 to the records. Things worth knowing before you judge the results:
@@ -281,6 +372,31 @@ to the records. Things worth knowing before you judge the results:
   those books arrive with their files already attached and do not need a scan
   to find them (#1635). In 1.32.1 and earlier it recorded nothing, which left
   a Calibre-managed book looking imported while Bindery tracked no file for it.
+- The Calibre library import is also the exception on covers. Each book's
+  `cover.jpg` from the library folder is copied into Bindery's data directory
+  (`covers/` under `BINDERY_DATA_DIR`) and shown for the book and every one of
+  its editions, so a Calibre library has covers straight after import, with
+  or without a metadata provider match. A cover a provider has already supplied
+  is kept; the Calibre cover only fills the gap, and **Refresh metadata** can
+  still replace it. Earlier versions recorded the library path instead, which
+  the browser could not load, so Calibre-imported books had no cover at all
+  (#2564). On the first start after upgrading, Bindery copies those covers in
+  and repairs the existing rows in the background; the library must be
+  mounted at the same path for that pass, and any it cannot read are picked
+  up by the next start or the next library import.
+- The Calibre library import reads `metadata.db` read-only and honours
+  Calibre's write-ahead log, so an author you merged or a book you deleted in
+  Calibre, Calibre-Web-Automated or `calibredb` is gone from the next import
+  even before Calibre has checkpointed it back into `metadata.db` (#2631).
+  There are two exceptions. A library directory mounted read-only into the
+  container with no `metadata.db-shm` file beside the database (Calibre not
+  running), and a library on a network filesystem such as NFS or SMB, where
+  SQLite cannot share the write-ahead-log index. In both cases Bindery
+  falls back to reading the last checkpoint and logs a warning saying
+  Calibre edits will not show until Calibre checkpoints. For the first,
+  mount the library writable or keep Calibre running; for a network mount
+  there is no workaround on the Bindery side, and Calibre itself does not
+  recommend keeping a library on one.
 - The scan only matches files whose **author already exists** in Bindery, by
   normalised name — `B. Sanderson/` on disk won't match a "Brandon Sanderson"
   author row.
@@ -293,11 +409,10 @@ to the records. Things worth knowing before you judge the results:
 - ABS imports that "lose" titles usually didn't: ambiguous matches are parked
   in the **review queue** (Settings → Audiobookshelf) for you to resolve, and
   the import summary counts them.
-- Unmatched files are listed after the scan, each with the reason it missed:
-  the parsed author isn't in your library (fix the file's tags or folder name),
-  the author matched but has no book waiting for a file (populate that author's
-  catalogue), no title matched, or no title could be read from the file at all
-  (rename it). Use **Manual Import** to resolve the rest by hand.
+- Books the scan could not match wait on **Import → In your library**, one row
+  per book with a sentence saying why and what to do: add the author, confirm
+  a suggested book, or choose one. See [Adopting files already in your
+  library](#adopting-files-already-in-your-library).
 - **Fix match moves and renames the file.** When a book page shows the wrong
   file, the **Fix match** button reassigns it to the book you pick. That runs
   the full import, so the file is moved into the target book's folder and
@@ -323,6 +438,85 @@ to the records. Things worth knowing before you judge the results:
   already own it: a cue sheet or notes file next to an audiobook is never taken
   as evidence you own the book, and a real ebook wins over a supplement-class
   file when both match (#2240).
+
+## Adopting files already in your library
+
+A library scan attaches every file it can match with confidence and leaves
+the rest for you. Those books wait on **Import → In your library**, the page
+`/import` opens on. Each row is one **book**, not one file: a 193 track
+audiobook folder is one row, a folder whose audio subfolders are all discs
+(`CD1`, `Disc 2`, `Disk 3`) is one row named after it, and `Dune.epub` beside
+`Dune.mobi` is one row. An `Artwork` folder without audio, or a hidden or
+system folder such as `@eaDir`, does not stop a disc set from grouping.
+Folders named `1`, `2`, `Book 1` or `Part 1` stay separate rows; when they are
+really one book, adopt each of them into it.
+
+**Adopting registers the files where they are.** Nothing is moved, renamed or
+queued, and no indexer search starts. It is the scan's own match with you
+supplying the answer, so **Undo** can take it back exactly.
+
+How to work through the list:
+
+- **Strong match** means the title is very close and the author is the same.
+  **Confirm** adopts it in one click.
+- **Possible match** means the title is only similar, or the author differs.
+  Click the suggested title to check it in the editor, where it is already
+  selected, and adopt it from there.
+- **Choose book** opens the row in place: the suggestions with their scores,
+  a search of your library (prefilled from the file), and a collapsed
+  **Search metadata**. Metadata providers are only asked when you press Search
+  there, so opening rows never spends provider quota. **Add and adopt** adds
+  the book from metadata and adopts the files in one step.
+- **Books whose author is not in your library** and that share a folder are
+  one row: that is one decision. **Add author**, then **Scan now**, and the
+  scan attaches what it can by itself. Open the row to see its books, which
+  you can still choose or ignore one by one. Its **More** menu has **Ignore
+  folder** to set all of them aside.
+- **More** on any row holds the rest: Choose book, Show files, Ignore.
+  **Ignore** hides a row that is not a book you want tracked. Later scans keep
+  it hidden. The **Ignored** list brings any of them back.
+- **The folder list** on the left filters the table to one author folder. An
+  amber dot marks a folder whose author is not in your library.
+- Each row says in one line what the scan found. Hovering it shows the full
+  explanation and the scanner's reason code, for bug reports; the editor
+  shows the explanation too.
+- Keyboard: arrow keys move between rows, **Enter** opens one, **Esc** closes
+  it, **i** ignores, **u** undoes, **/** jumps to the search.
+
+What adopting does to your library:
+
+- Choosing a book **already in your library** attaches the files to it and
+  changes nothing else: its owner and its monitored flag stay as they were.
+- A book added from metadata is added **unmonitored**, in the format you
+  adopted (ebook or audiobook), so Bindery never goes looking for the other
+  format behind your back. It and a new author are owned by the admin who
+  adopted them. The author's other books are not added.
+- **Undo** removes exactly the file entries the adoption made, and only while
+  each still belongs to the book it was adopted into; a file that has since
+  moved to another book stays with that book. A book or author the adoption
+  created is removed too, unless something else now depends on it (another
+  file, another book by that author, excluded or not, another adopted row),
+  or the book has been used since: monitored, edited, linked to a series, or
+  searched for or downloaded. Then the book stays and Undo says so.
+- If Bindery stops in the middle of an adoption, the next start reverses what
+  that adoption had done and the book is back in **Needs a decision**.
+- Only an admin can see or act on this list, because it shows server paths.
+
+Things worth knowing:
+
+- Only regular files inside your library folders are listed. A symlink is not
+  adopted, including one inside the library that points elsewhere.
+- A scan that finds no files at all (an unmounted volume, say) changes
+  nothing on this list, so your ignores and adoptions survive it.
+- An adopted row stays, with Undo, for as long as its book exists. An ignored
+  row is forgotten 30 days after a scan last saw its files, counted only by
+  scans that found files in that row's library folder, or once that folder is
+  no longer one of your library folders at all.
+- One scan lists up to 20,000 books from up to 50,000 unmatched files. A
+  larger library says so; adopt or ignore some and scan again.
+- **From a folder** (`/import?view=folder`) is the other way in: point it at a
+  folder anywhere Bindery can read, such as your downloads, and it imports
+  what it matches into the library, moving or copying the files.
 
 ## Metadata: where book data comes from
 
@@ -353,10 +547,12 @@ Which of those a given book actually came from is on the book page, under
 **Metadata source**. It names the provider, shows the identifier the book is
 bound to with a copy button, and lists any other provider ids the same book is
 known by. That is the thing to check before deciding a book needs re-binding,
-and the id is what to quote in a bug report. Providers whose public page can be
-built from the stored id (OpenLibrary, Google Books) also get a link out;
-Hardcover, DNB, Calibre and Audiobookshelf ids show on their own, because their
-stored ids do not map to a stable public page.
+and the id is what to quote in a bug report. Hover or activate **Links** while
+confirming a book in the Add to library dialog or in the book header to open
+trustworthy upstream pages for OpenLibrary, Google Books, Hardcover, and DNB
+records.
+Calibre and Audiobookshelf ids remain visible only under **Metadata source**
+because they do not map to stable public pages.
 
 When metadata is wrong, you have three levels of fix:
 
@@ -384,6 +580,99 @@ add them*, is refreshed in place and never grows. (Exception: an author with
 no books at all is populated, which is how bulk **Refresh metadata** repairs
 an import that landed an author but no catalogue.) When a refresh declines to
 add works, the author page says how many and why.
+
+**Refresh metadata** on a single author asks the metadata providers for
+current data: the bio, the photo, the book list and, when the default media
+type is audiobook or both, the Audible catalogue. The page waits for the
+refresh to finish and then shows the result, so a bio, photo or new book added
+upstream shows up on the first click. The page waits up to a minute; a refresh
+that takes longer carries on in the background, and reloading the page later
+shows it. Clicking Refresh again while a refresh for that author is still
+running waits for that one instead of starting another. If the refresh
+already running was a scheduled, bulk or Refresh all one, which read the
+cached copy, the page waits for it to finish and then runs its own refresh.
+
+When a provider fails outright, Bindery keeps the copy it fetched in the last
+24 hours rather than replacing it. How well a refresh can spot a catalogue
+that came back short depends on the provider:
+
+- **OpenLibrary** reports when a request failed along the way. Bindery then
+  keeps the earlier copy and adds any new books the partial answer did
+  include.
+- **Other providers** (DNB, for example) cannot say their answer is short. An
+  empty book list is treated as a failure while Bindery holds an earlier
+  copy, so it never wipes the catalogue, but a list that is merely shorter
+  than before is taken as the current catalogue.
+- If the **Hardcover** supplement fails, the refresh uses the earlier copy of
+  the catalogue as it is, because Hardcover is what identifies the box sets
+  and omnibus editions to leave out.
+
+**Refresh all metadata**, the bulk Refresh action and the scheduled refresh
+reuse what Bindery fetched in the last 24 hours instead, which keeps a whole
+library refresh from hammering the providers; a change upstream reaches them
+within a day.
+
+### New releases arrive on their own
+
+Following an author means their next book shows up without a click. Bindery
+can check each monitored author's catalogue on a schedule and add the books it
+does not have yet. It **ships off**: nothing is checked until you pick an
+interval, and **Weekly** is the one to pick if you are not sure. This is the
+same sync as **Refresh metadata**, so the same rules apply: the author must be monitored and set to
+take new items, the metadata profile's language and junk filters still run,
+and each new book is monitored or not according to the author's monitor mode.
+
+- **Turning it on and how often:** Settings → General → **New release
+  discovery**. It starts on Off; choose Daily, Weekly or Monthly to turn it
+  on, and Off again to stop it. The change applies within the hour, no
+  restart.
+- **How it spreads out:** every hour Bindery checks a small share of your
+  authors (at most 25), so a week's worth of checks is spread over the week
+  instead of arriving in one burst. Authors never checked go first. One
+  author gets at most 10 minutes; one that takes longer is counted as checked
+  and waits for its next turn.
+- **Your refreshes come first:** while **Refresh all** or a bulk refresh of
+  selected authors is running, discovery stops until the next hour. A
+  **Refresh metadata** click on an author discovery is checking right then
+  says so; try again a minute later. A bulk refresh that reaches that author
+  waits while the check writes its new books, so nothing is added or
+  announced twice. That wait lasts at most as long as one author's check, 10
+  minutes at worst. Adding a single book never waits for it.
+- **Changes since the hour started:** an author you unmonitor, delete or set
+  to *Don't add them* while a pass is running is skipped.
+- **Grabbing:** discovery only adds books. A new monitored book is picked up
+  by the next wanted search, and only when **auto grab** is on.
+- **Opting an author out:** set their **Monitor new items** to *Don't add
+  them*. Unmonitored authors and Calibre library authors are not checked
+  either.
+- **When a provider struggles:** when OpenLibrary or Hardcover refuses with a
+  rate limit, the pass stops and the remaining authors wait for the next
+  hour. When three authors in a row fail because the provider is down (server
+  errors, network failures, timeouts), the pass stops too, and those three
+  are tried again in about six hours rather than a week later. An error about
+  one author, such as an author the provider no longer knows, counts that
+  author as checked, so broken authors cannot hold up everyone else.
+- **Covers:** discovery looks up covers only for the books it adds. A book you
+  already have that has no cover gets one from **Refresh metadata**, not from
+  discovery, which saves a provider call for every such book.
+- **Getting told:** a webhook with **New book** turned on receives one
+  `bookAnnounced` message per author run that added books to an author you
+  already had, listing up to ten titles. It is **off for every webhook until
+  you turn it on**, existing ones included. The first fill of a newly added
+  author, refilling an author whose books you had all deleted, and adding a
+  single book never send it.
+
+**A risk worth knowing.** OpenLibrary can be edited by anyone. A false "new
+book" added to an author you follow becomes a Wanted, monitored book, and with
+auto grab on the next wanted search will try to download it. This could
+already happen when you clicked Refresh; discovery makes it happen without
+you. The profile filters, the small hourly batch and the `bookAnnounced`
+message are the mitigations, and *Don't add them* on an author, or leaving
+discovery Off, removes it entirely.
+
+Discovery follows authors only. Watching a **series** for its next entry is
+planned separately
+([#2523](https://github.com/vavallee/bindery/issues/2523)).
 
 Changing a provider or tightening a metadata profile does not silently delete
 old catalogue rows during refresh. To apply the new catalogue rules to an
@@ -422,13 +711,19 @@ Knowing the edges saves time:
 
 **I added one author and now have 100+ wanted books.**
 Monitor mode *All books* on a prolific author. Bulk-select on the author page
-and Unmonitor or Exclude; set the default monitor mode to *Future books only*
-in Settings → Metadata Profiles → Library Defaults before adding more.
+and Unmonitor or Exclude. Before adding more, pick a different mode on the Add
+Author dialog (it shows how many books will arrive and what will be searched
+for), or change the default in Settings → Metadata Profiles → Library
+Defaults. *None* lists the catalogue and searches for nothing. *Future books
+only* searches only for unreleased titles, and with scheduled discovery turned
+on new releases join the list on their own
+([New releases arrive on their own](#new-releases-arrive-on-their-own)).
 
 **Scan Library sees my files but imports nothing.**
-Rule 1 — the catalogue is empty or the authors don't exist yet. Populate
+Rule 1: the catalogue is empty or the authors don't exist yet. Populate
 first ([Bringing in an existing library](#bringing-in-an-existing-library)),
-then scan.
+then scan, or adopt the books from **Import → In your library**
+([Adopting files](#adopting-files-already-in-your-library)).
 
 **I moved my files and a book still shows the old path.**
 Fixed (#2186). A book now shows whichever of its tracked files still exists,
@@ -492,7 +787,9 @@ Rule 5 — separate mounts. One shared parent mount, then `auto` or `hardlink`
 mode.
 
 **Where do I drop files for Bindery to pick up?**
-Nowhere (rule 3). Use Manual Import (`/import`) for files it didn't download.
+Nowhere (rule 3). Use **Import** (`/import`) for files it didn't download:
+**From a folder** for files elsewhere, **In your library** for files a library
+scan found but could not match.
 
 ---
 

@@ -196,15 +196,18 @@ Use **Test** to confirm the connection.
 
 ## 5. Add an author and grab a book
 
-Go to **Authors → Add Author**. Search by name (results come from OpenLibrary /
-Hardcover / DNB), pick the author, choose a **Monitor mode** (default monitors
-all books), and add them. Adding an author **populates their catalogue** —
-Bindery fetches the full book list regardless of auto-grab.
+Go to **Library → Authors** and press **Add Author**. Type a name and press Enter (results come from
+OpenLibrary / Hardcover / DNB); the list shows the author followed by their
+books. Select the author row, choose a **Monitor mode** (default monitors all
+books), and add them. Adding an author **populates their catalogue** —
+Bindery fetches the full book list regardless of auto-grab. Selecting a book
+row instead adds just that one book.
 
 Monitored books that are still missing become **wanted**. With "Search for
 books on add" enabled (the default), Bindery immediately queries your indexers
-and hands matching releases to the download client. To do it by hand, open the
-**Wanted** page, hit **Search** on a book, and **Grab** a result. The
+and hands matching releases to the download client. To do it by hand, open
+**Activity** in the top bar for the **Wanted** page, hit **Search** on a book,
+and **Grab** a result. The
 completed download is imported into `/books` with metadata.
 
 ---

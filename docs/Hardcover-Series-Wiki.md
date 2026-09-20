@@ -30,7 +30,9 @@ If either requirement is missing, Bindery hides the enhanced controls and the en
 
 ## Series Workflow
 
-1. Open **Series**.
+Use **Search series...** at the top of the Series page to filter your local series by title instead of using browser Find in a large collection. Matching ignores case and accents; clear the field to show all series again. This local search is available without enhanced Hardcover data.
+
+1. Open **Library → Series**.
 2. Create a series manually, or open an existing series populated from your library metadata.
 3. Use **Add Book** to attach existing Bindery books and set their series positions.
 4. Use **Search** to find a matching Hardcover series.
@@ -47,9 +49,10 @@ Most series rows are not created on the Series page at all. They arrive when Bin
 
 When Hardcover enriches an author whose works come from OpenLibrary, both providers can claim a series for the same book. Hardcover wins. Its series carry a stable catalog id and a position, while OpenLibrary parses a free text string, and keeping both would create two local series for one real one and put the book in each. Providers other than Hardcover only fill in a series when the work has none yet.
 
-Two limits are worth knowing:
+Refreshing an author links the series of the books you already have, not only the ones the refresh creates. That is how an imported library gains its series: point the author at the metadata record you want and refresh, and each book the provider puts in a series is filed under it. A link that is already stored is left exactly as it is, position included, so a position you corrected by hand survives every later refresh. Nothing is unlinked, and a book already in a series keeps that series even when the provider now names the same one under a different catalog id. Matching those two up ignores case, spacing, apostrophes and a parenthetical suffix, but not an inverted article, so a stored "Expanse, The" and an incoming "The Expanse" still end up as two series.
 
-- Only books Bindery creates get linked. Books already in your library are not backfilled when a later refresh finds series data for them, so an author added before this behaviour existed keeps an empty series list until those books are recreated.
+Two more limits are worth knowing:
+
 - A series that came from Hardcover metadata is linked to the Hardcover catalog as it is created, because the provider supplied the catalog id exactly. Series from other providers are local series like any other, and linking them is the manual step described below.
 - Series created before this behaviour existed keep no link. Use **Search** on the series to link them, which also unlocks the catalog diff and missing-book fill for them.
 
@@ -61,6 +64,12 @@ When you click **Search** on an unlinked series, Bindery first attempts an autom
 - author agreement with books already in the local series
 
 If that evidence is missing, Bindery shows candidates for manual selection instead of linking automatically.
+
+## How the Catalog Diff Binds Local Books
+
+The diff pairs each local book in the series with at most one catalog entry, in two passes. A local book whose provider ID matches a catalog entry binds to it first, whatever the library order. Only then are the remaining local books matched by title, and a title match is never allowed across positions: a book the series files at position 4 cannot bind to catalog volume 9 however similar the titles are. Two local rows at the same position (a duplicate import) compete for that one catalog entry and the loser is listed as Local only.
+
+Every binding decision is logged at DEBUG as `series diff: local book bound to catalogue entry` with the local and catalog IDs, positions and whether it was matched by identity or title, so a wrong pairing can be read straight out of the log.
 
 ## Missing-Book Fill
 

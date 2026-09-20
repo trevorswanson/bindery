@@ -3,8 +3,7 @@ import { Link, useNavigate } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { api, Author, AuthorBulkMonitorMode, MediaType, MonitorNewItems, AuthorRefreshStatus } from '../api/client'
-import AddAuthorModal from '../components/AddAuthorModal'
-import AddBookModal from '../components/AddBookModal'
+import AddToLibraryModal from '../components/AddToLibraryModal'
 import MergeAuthorsModal from '../components/MergeAuthorsModal'
 import SeriesNameModal from '../components/SeriesNameModal'
 import BulkActionBar from '../components/BulkActionBar'
@@ -13,6 +12,8 @@ import MoreMenu from '../components/MoreMenu'
 import Pagination from '../components/Pagination'
 import { useServerPagination } from '../components/usePagination'
 import ViewToggle from '../components/ViewToggle'
+import BulkNotice from '../components/BulkNotice'
+import { isAutoGrabRefusal } from '../util/autoGrabRefusal'
 import { useView } from '../components/useView'
 import SetupChecklist from '../components/SetupChecklist'
 import { btn, btnSize } from '../components/buttons'
@@ -39,8 +40,9 @@ export default function AuthorsPage() {
   // author, not just the current page.
   const [mergeAuthors, setMergeAuthors] = useState<Author[]>([])
   const [loading, setLoading] = useState(true)
-  const [showAdd, setShowAdd] = useState(false)
-  const [showAddBook, setShowAddBook] = useState(false)
+  // Both Add buttons open the same search-first dialog (#1227); the mode
+  // only seeds the placeholder.
+  const [addMode, setAddMode] = useState<'author' | 'book' | null>(null)
   const [showAddSeries, setShowAddSeries] = useState(false)
   const [showMerge, setShowMerge] = useState(false)
   const [showMonitorModeBulk, setShowMonitorModeBulk] = useState(false)
@@ -64,6 +66,9 @@ export default function AuthorsPage() {
   const [view, setView] = useView('authors', 'grid')
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [bulkBusy, setBulkBusy] = useState(false)
+  // A message from the last bulk action that is not an exception, e.g. the
+  // server refusing a search because automatic grabbing is off (#2669).
+  const [bulkNotice, setBulkNotice] = useState<string | null>(null)
   const selectAllRef = useRef<HTMLInputElement>(null)
   // "Refresh all metadata" background job (#863). refreshStatus mirrors the
   // persisted server-side progress; refreshing is the in-flight flag that drives
@@ -225,8 +230,15 @@ export default function AuthorsPage() {
       confirmLabel: t('common.delete'),
     })) return
     setBulkBusy(true)
+    setBulkNotice(null)
     try {
-      await api.bulkActionAuthors([...selectedIds], action)
+      const res = await api.bulkActionAuthors([...selectedIds], action)
+      // Same refusal as every other bulk Search surface (#2669): the selection
+      // survives and the list is not reloaded, because nothing happened.
+      if (isAutoGrabRefusal(res)) {
+        setBulkNotice(t('search.autoGrabDisabled'))
+        return
+      }
       clearSelection()
       load()
     } catch (err) {
@@ -341,12 +353,23 @@ export default function AuthorsPage() {
   // outright and costing OpenLibrary users a real sort key.
   const anyRating = authors.some(a => a.averageRating > 0)
 
+  // This page's loaded ids, in order — handed to AuthorDetailPage as router
+  // state (#2548) for Previous/Next; see AuthorNavState there.
+  const authorIds = authors.map(a => a.id)
+  const authorNavState = (index: number) => ({ ids: authorIds, index })
+
   return (
     <div className={selectedIds.size > 0 ? 'pb-16' : ''}>
       {confirmDialog}
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-2xl font-bold">{t('authors.title')}</h2>
-        <div className="flex items-center gap-2 flex-wrap justify-end">
+      <BulkNotice message={bulkNotice} onDismiss={() => setBulkNotice(null)} />
+      {/* Page header. The outer row wraps and the toolbar is pinned to the
+          container width below `sm`, so a phone puts the buttons on their own
+          lines under the title instead of letting the group claim more room
+          than the viewport has. Books, Series and History already lay their
+          headers out this way. */}
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <h2 className="text-2xl font-bold min-w-0">{t('authors.title')}</h2>
+        <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto justify-start sm:justify-end">
           <ViewToggle view={view} onChange={setView} />
           <button
             onClick={handleRefreshAll}
@@ -365,10 +388,10 @@ export default function AuthorsPage() {
             {t('authors.merge')}
           </button>
           <button
-            onClick={() => setShowAddBook(true)}
+            onClick={() => setAddMode('book')}
             className="px-4 py-2 bg-slate-200 dark:bg-zinc-800 hover:bg-slate-300 dark:hover:bg-zinc-700 rounded-md text-sm font-medium transition-colors"
           >
-            Add Book
+            {t('addToLibrary.addBook')}
           </button>
           <button
             onClick={() => setShowAddSeries(true)}
@@ -376,9 +399,14 @@ export default function AuthorsPage() {
           >
             Add Series
           </button>
+          {/* Below `sm` the five buttons wrap and the primary action used to
+              land on the second row, under Refresh all metadata, Merge and Add
+              Book. `order-first` pulls it to the front of the wrapped group on a
+              phone only; the DOM order is untouched, so the desktop row keeps
+              its usual secondary-then-primary reading order. */}
           <button
-            onClick={() => setShowAdd(true)}
-            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-md text-sm font-medium transition-colors"
+            onClick={() => setAddMode('author')}
+            className="order-first sm:order-none px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-md text-sm font-medium transition-colors"
           >
             {t('authors.addAuthor')}
           </button>
@@ -502,7 +530,7 @@ export default function AuthorsPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-zinc-800">
-                {authors.map(author => (
+                {authors.map((author, i) => (
                   <tr
                     key={author.id}
                     className={`hover:bg-slate-200/50 dark:hover:bg-zinc-800/50 ${selectedIds.has(author.id) ? 'bg-emerald-500/10 dark:bg-emerald-500/10' : 'bg-slate-100/50 dark:bg-zinc-900/50'}`}
@@ -517,7 +545,7 @@ export default function AuthorsPage() {
                       />
                     </td>
                     <td className="px-3 py-2">
-                      <Link to={`/author/${author.id}`} className="flex items-center gap-2">
+                      <Link to={`/author/${author.id}`} state={authorNavState(i)} className="flex items-center gap-2">
                         {author.imageUrl ? (
                           <img src={author.imageUrl} alt="" className="w-7 h-7 rounded-full object-cover flex-shrink-0" />
                         ) : (
@@ -560,7 +588,7 @@ export default function AuthorsPage() {
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-          {authors.map(author => (
+          {authors.map((author, i) => (
             <div
               key={author.id}
               className={`border rounded-lg bg-slate-100 dark:bg-zinc-900 overflow-hidden hover:border-emerald-500 transition-colors ${selectedIds.has(author.id) ? 'border-emerald-500' : 'border-slate-200 dark:border-zinc-800'}`}
@@ -573,7 +601,7 @@ export default function AuthorsPage() {
                   className={`absolute top-2 left-2 z-10 rounded-full border-slate-400 dark:border-zinc-600 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0 ${selectedIds.has(author.id) ? '' : 'bg-white/80 dark:bg-zinc-900/80'}`}
                   title={`Select ${author.authorName}`}
                 />
-                <Link to={`/author/${author.id}`} className="flex gap-3 p-4 hover:bg-slate-200/40 dark:hover:bg-zinc-800/40 transition-colors">
+                <Link to={`/author/${author.id}`} state={authorNavState(i)} className="flex gap-3 p-4 hover:bg-slate-200/40 dark:hover:bg-zinc-800/40 transition-colors">
                   {author.imageUrl ? (
                     <img src={author.imageUrl} alt={author.authorName} className="w-16 h-16 rounded-full object-cover flex-shrink-0" />
                   ) : (
@@ -655,7 +683,7 @@ export default function AuthorsPage() {
                   className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500 disabled:opacity-50"
                 >
                   <option value="all">{t('monitorMode.all', 'All books')}</option>
-                  <option value="future">{t('monitorMode.future', 'Future books only')}</option>
+                  <option value="future">{t('monitorMode.future', 'Future books only (grows on refresh)')}</option>
                   <option value="latest">{t('monitorMode.latest', 'Latest only')}</option>
                   <option value="none">{t('monitorMode.none', 'None')}</option>
                 </select>
@@ -738,8 +766,13 @@ export default function AuthorsPage() {
         </div>
       )}
 
-      {showAdd && <AddAuthorModal onClose={() => setShowAdd(false)} onAdded={load} />}
-      {showAddBook && <AddBookModal onClose={() => setShowAddBook(false)} onAdded={() => setShowAddBook(false)} />}
+      {addMode && (
+        <AddToLibraryModal
+          mode={addMode}
+          onClose={() => setAddMode(null)}
+          onAdded={() => load()}
+        />
+      )}
       {showAddSeries && (
         <SeriesNameModal
           title="Add Series"

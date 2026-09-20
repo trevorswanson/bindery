@@ -893,7 +893,7 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		}
 	}
 	crit := indexer.MatchCriteria{
-		Title:            book.Title,
+		Title:            indexer.SearchTitle(book, allowedLangs),
 		Author:           authorName,
 		MediaType:        mediaType,
 		ASIN:             book.ASIN,
@@ -1061,7 +1061,13 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		outcome = "duplicate check failed"
 		return
 	}
-	if existing != nil {
+	// Only an import whose book has since been deleted is reused (#2289):
+	// without this, a book deleted and added back never grabs its old release
+	// automatically when that release ranks first. A failed or blocked row is
+	// different. It is a release that already went wrong once, and while a
+	// user clicking Grab may try it again, the scheduler would pick it on
+	// every sweep and loop on it, so it stays skipped here.
+	if existing != nil && !existing.IsOrphanedImport() {
 		outcome = "already grabbed"
 		return
 	}
@@ -1080,7 +1086,25 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		Quality:          indexer.ParseRelease(best.Title).Format,
 	}
 
-	if err := s.downloads.Create(ctx, dl); err != nil {
+	if existing != nil {
+		// RetryOrphanedImport resets every per grab column, owner and
+		// import_path included, and claims the row only while it is still an
+		// orphaned import. A manual grab that claimed it first turns this into
+		// a skip, including one that has since failed: the failed or
+		// importBlocked row it leaves is not reclaimed here, as RetryFailed
+		// would do.
+		dl.ID = existing.ID
+		ok, err := s.downloads.RetryOrphanedImport(ctx, dl)
+		if err != nil {
+			slog.Error("SearchAndGrabBook: failed to reuse download record", "download_id", existing.ID, "error", err)
+			outcome = "download record failed"
+			return
+		}
+		if !ok {
+			outcome = "already grabbed"
+			return
+		}
+	} else if err := s.downloads.Create(ctx, dl); err != nil {
 		slog.Error("SearchAndGrabBook: failed to create download record", "error", err)
 		outcome = "download record failed"
 		return

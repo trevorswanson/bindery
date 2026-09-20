@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/vavallee/bindery/internal/calibre"
+	"github.com/vavallee/bindery/internal/covers"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/decision"
 	"github.com/vavallee/bindery/internal/importer/formatsniff"
@@ -84,7 +85,11 @@ type Scanner struct {
 	grimmory             grimmoryPusher
 	calibreMode          func() calibre.Mode
 	calibreCoverCacheDir string
-	settings             *db.SettingsRepo
+	// coverStore resolves bindery-cover: references (a Calibre library's
+	// own cover, #2564) to the file on disk so a push to calibredb can hand
+	// it over without an HTTP fetch that the SSRF policy would refuse.
+	coverStore *covers.Store
+	settings   *db.SettingsRepo
 	// qualityProfiles and blocklist back the post-download format check
 	// (#1782). Both nil disables it entirely, which is what every caller that
 	// has not been wired up gets.
@@ -96,6 +101,9 @@ type Scanner struct {
 	absLib               absNotifier
 	absLibraryIDsFn      func() []string
 	notif                eventNotifier
+	// unmatchedUnits stores the books a library scan could not match, for
+	// library adoption. Nil stores nothing (see WithUnmatchedUnits).
+	unmatchedUnits UnmatchedUnitStore
 
 	// jobs, when set, tracks the detached scan goroutine launched by StartScan
 	// so process shutdown can cancel and drain it before the database closes
@@ -301,6 +309,14 @@ func (s *Scanner) WithGrimmory(p grimmoryPusher) *Scanner {
 // images that need to be materialized before calibredb can consume them.
 func (s *Scanner) WithCalibreCoverCache(dir string) *Scanner {
 	s.calibreCoverCacheDir = dir
+	return s
+}
+
+// WithCoverStore attaches the store that backs bindery-cover: references
+// (#2564), so a book whose cover came from a Calibre library import can be
+// pushed back to calibredb with that cover.
+func (s *Scanner) WithCoverStore(store *covers.Store) *Scanner {
+	s.coverStore = store
 	return s
 }
 
@@ -566,6 +582,16 @@ func (s *Scanner) forgetImportSkipsExcept(stillFailing map[int64]bool) {
 			delete(s.importSkips, id)
 		}
 	}
+}
+
+// importContentMissingReason is the message recorded the first time the
+// download client reports a complete download whose content path is not on
+// this host. Unlike importSourceGoneReason it is written while the files may
+// still appear, so it names both causes the operator can act on rather than
+// telling them to stop waiting.
+func importContentMissingReason(savePath string) string {
+	return fmt.Sprintf("the download client reports this download as complete, but no content path for it is on this host (client save path %s). The files may have been moved or deleted after the download finished, or the client's paths may not map into Bindery (set PathRemap on the download client). Use Retry import on the Queue page once that is fixed, or grab the release again from search.",
+		savePath)
 }
 
 // importSourceGoneReason is the message a download is blocked with once its
@@ -964,10 +990,14 @@ func (s *Scanner) blockStaleImportFailures(
 	s.forgetImportSkipsExcept(stillFailing)
 	for i := range allDownloads {
 		dl := allDownloads[i]
-		if dl.Status != models.StateImportFailed {
+		if !belongsToClient(dl) {
 			continue
 		}
-		if !belongsToClient(dl) {
+		if dl.Status == models.StateDownloading {
+			s.failDownloadThatNeverArrived(ctx, &dl, seenSourceIDs, sourceListIsComplete)
+			continue
+		}
+		if dl.Status != models.StateImportFailed {
 			continue
 		}
 		var reason string
@@ -982,6 +1012,72 @@ func (s *Scanner) blockStaleImportFailures(
 		slog.Warn("blocking unrecoverable import failure", "title", dl.Title, "download_id", dl.ID, "reason", reason)
 		s.failImport(ctx, &dl, models.StateImportBlocked, reason)
 	}
+}
+
+// neverArrivedGrace is how long a grabbed download may be absent from its
+// client before failDownloadThatNeverArrived gives up on it.
+//
+// It is generous on purpose. The window has to cover a client that accepts an
+// add and takes its time publishing the torrent (qBittorrent does this while it
+// resolves a magnet's metadata), plus the poll interval, plus a restart. Ten
+// minutes is far longer than any of those and still far shorter than "forever",
+// which is what the wait used to be.
+const neverArrivedGrace = 10 * time.Minute
+
+// failDownloadThatNeverArrived fails a download that Bindery reported as
+// grabbed but that never turned up in the download client (#2505).
+//
+// The grab path can report success without the client ever receiving anything:
+// the reporter's case was an unsigned indexer URL answered with 401, but a
+// client that drops the add, or a magnet whose metadata never resolves, land
+// here the same way. Every poll then found the torrent missing, logged
+// "download not found in torrent list" at Debug, and did nothing, because the
+// only thing that acts on a vanished source is the StateImportFailed arm above.
+// The queue item sat at downloading with an empty errorMessage indefinitely,
+// which on screen is indistinguishable from a torrent waiting on peers.
+//
+// Three guards, and all three matter:
+//
+//   - sourceListIsComplete, so absence is definitive. Under a degraded or
+//     category-filtered listing a healthy torrent can be missing from the view
+//     (#1461), and failing on that would be the same mistake in a new place.
+//   - not seen this cycle, the same signal the arm above uses.
+//   - grabbed longer ago than neverArrivedGrace, so a client that is merely
+//     slow to publish the torrent is left alone.
+//
+// The download is failed rather than blocked: nothing was placed on disk and
+// nothing needs unpicking, so this is recoverable by grabbing again. It
+// deliberately does not blocklist the release, because the usual cause is on
+// Bindery's side of the wire and blocklisting a good release for that would
+// cost the user the best copy.
+func (s *Scanner) failDownloadThatNeverArrived(
+	ctx context.Context,
+	dl *models.Download,
+	seenSourceIDs map[int64]bool,
+	sourceListIsComplete bool,
+) {
+	if !sourceListIsComplete || seenSourceIDs[dl.ID] {
+		return
+	}
+	// No recorded source id means absence from the client's list proves
+	// nothing: every poller skips such a row before it reaches seenSourceIDs,
+	// so it is unseen because it was never looked up, not because it is
+	// missing. qBittorrent backfills the hash from a listing match; Deluge and
+	// rTorrent simply continue. Failing on that would kill a healthy download.
+	if dl.TorrentID == nil && dl.SABnzbdNzoID == nil {
+		return
+	}
+	since := dl.AddedAt
+	if dl.GrabbedAt != nil {
+		since = *dl.GrabbedAt
+	}
+	if since.IsZero() || time.Since(since) < neverArrivedGrace {
+		return
+	}
+	const reason = "never reached the download client — the client has no record of it, so nothing was downloaded. Check the indexer and the client are both reachable, then grab it again"
+	slog.Warn("failing a download the client never received",
+		"title", dl.Title, "download_id", dl.ID, "grabbed_at", since)
+	s.markDownloadFailed(ctx, dl, reason)
 }
 
 // alreadyImportedFormat reports whether book already has a tracked, on-disk
@@ -1622,8 +1718,18 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 				// attempt instead — but only when the sources still exist.
 				// After a move they do not, and those files are the only
 				// copy, so they stay put and the error tells the user where.
-				if dirErr != nil && len(placed) > 0 {
-					if mode == "move" {
+				//
+				// The rollback runs even when nothing was placed (#2504).
+				// Failing on the FIRST file leaves placed empty, and gating on
+				// it skipped the cleanup for exactly the case where there is
+				// nothing to weigh against removing the folder: the MkdirAll
+				// above had already created it, so the empty directory
+				// survived, and the next attempt's UniqueDir read it as a
+				// collision and built "Title (2)" beside it. In move mode with
+				// files already placed the folder still stays, since removing
+				// it would take the only copy of them with it.
+				if dirErr != nil {
+					if mode == "move" && len(placed) > 0 {
 						slog.Warn("audiobook move failed partway; placed files left in place because their sources are already gone",
 							"dst", destDir, "placed", len(placed))
 					} else {
@@ -1735,7 +1841,8 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 				if err := os.MkdirAll(destDir, 0o750); err != nil {
 					dirErr = fmt.Errorf("create audiobook dest dir: %w", err)
 				} else {
-					dstFile := filepath.Join(destDir, filepath.Base(audiobookSource))
+					name := filepath.Base(audiobookSource)
+					dstFile := filepath.Join(destDir, name)
 					switch mode {
 					case "hardlink":
 						dirErr = HardlinkFile(audiobookSource, dstFile)
@@ -1743,6 +1850,23 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 						dirErr = CopyFileCtx(importCtx, audiobookSource, dstFile)
 					default:
 						dirErr = MoveFileCtx(importCtx, audiobookSource, dstFile)
+					}
+					// A lone .m4b had no cleanup at all, so any failure here
+					// left the directory MkdirAll had just made, and the next
+					// attempt's UniqueDir built "Title (2)" beside the empty
+					// original (#2504). Move mode passes no name: the file
+					// either arrived or it did not, and a partial destination
+					// whose source is already gone is not ours to delete.
+					// rollbackPlacedFiles removes the folder through its
+					// parent, which only succeeds while it is empty, so a
+					// shared folder holding this book's ebook is safe either
+					// way.
+					if dirErr != nil {
+						if mode == "move" {
+							rollbackPlacedFiles(destDir, nil)
+						} else {
+							rollbackPlacedFiles(destDir, []string{name})
+						}
 					}
 				}
 			}
@@ -1814,6 +1938,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 
 		s.pushToCalibre(ctx, book, author, edition, seriesTitle, seriesNum, destDir)
 		s.pushToABS(ctx)
+		s.writeOPFSidecar(ctx, destDir, []string{audiobookRoot}, book, author, edition, seriesTitle, seriesNum)
 
 		historyMeta := map[string]string{"path": destDir, "format": models.MediaTypeAudiobook}
 		if len(mergeSkippedFiles) > 0 {
@@ -1847,6 +1972,15 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 	// edit outranks it, and that locks the field — in which case the EPUB is
 	// not opened at all.
 	var detectedLang string
+	// sidecarDir records the folder a successfully imported ebook file landed
+	// in, so the OPF sidecar can be written once after the loop rather than
+	// once per file — and, critically, after applyEmbeddedLanguage below has
+	// had a chance to backfill book.Language, so a first-time import of a
+	// book with no catalogue language doesn't write a sidecar missing
+	// dc:language moments before the DB gains one. All files of one book
+	// share a destination directory (only the extension varies), so any
+	// imported file's directory is the right one.
+	var sidecarDir string
 	readLanguage := book != nil && !book.IsFieldLocked(models.BookFieldLanguage)
 	// Resolve the ebook destination root and (auto) placement mode once: the
 	// root is stable for this author across the loop, and choosing hardlink-vs-
@@ -1956,6 +2090,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		}
 		imported++
 		importedSrcFiles = append(importedSrcFiles, srcFile)
+		sidecarDir = filepath.Dir(destPath)
 		// NOTE: StateImported is intentionally NOT set here (issue #705 finding 1).
 		// Writing the terminal "imported" state after the first successful file
 		// would mark an incomplete multi-file download as fully imported; a later
@@ -1976,6 +2111,16 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 	// rewrite the catalogue from a file that is not in the library.
 	if readLanguage && imported > 0 && detectedLang != "" {
 		s.applyEmbeddedLanguage(ctx, book, detectedLang, dl.Title)
+	}
+
+	// Written once here, after applyEmbeddedLanguage above, rather than once
+	// per file inside the loop: a sidecar written mid-loop could carry a
+	// blank dc:language that the backfill above fills in moments later, and
+	// a multi-file download (epub + mobi + pdf sharing one folder) would
+	// otherwise regenerate the identical sidecar once per format.
+	if imported > 0 && sidecarDir != "" {
+		seriesTitle, seriesNum := s.primarySeriesFor(ctx, book)
+		s.writeOPFSidecar(ctx, sidecarDir, []string{ebookRoot}, book, author, edition, seriesTitle, seriesNum)
 	}
 
 	// If every file failed to copy/move, the destination is likely not writable —
@@ -2573,13 +2718,19 @@ type scanBook struct {
 // ("Discworld #8 - Guards! Guards!" → "Guards! Guards!", issue #1234): without
 // this the whole folder name, series tag and all, leaks through as the title
 // and only series openers (where book title == series title) reconcile.
+// A bare position prefix goes the same way ("01 - The Eye of the World
+// (1990)" → "The Eye of the World", #2171): the {series}/{seriesIndex} -
+// {title} layout writes the number without the "#" that parseSeriesFolder
+// looks for, and the number then blocked every title match.
 func cleanLayoutTitle(dir string) string {
 	if _, _, title, ok := parseSeriesFolder(dir); ok {
 		dir = title
 	}
 	s := cleanRe.ReplaceAllString(dir, "")
 	s = multiSp.ReplaceAllString(s, " ")
-	return strings.TrimSpace(s)
+	s = strings.TrimSpace(s)
+	stripped, _ := stripLeadingPosition(dashNormalizer.Replace(s))
+	return stripped
 }
 
 // authorTitleFromLayout derives author and title from a library file's folder
@@ -2607,6 +2758,31 @@ func authorTitleFromLayout(path string, roots ...string) (author, title string, 
 		}
 	}
 	return "", "", false
+}
+
+// flipByLayout returns the other reading of a two sided filename whose title
+// side names the author folder it sits in. ParseFilename reads a bare "X - Y"
+// as "Title - Author", so a Readarr named "Christopher Pike - Evil Thirst.epub"
+// in Christopher Pike/ parses with author and title swapped (#754, #2331). The
+// flipped reading takes the other side as the title and the folder as the
+// author.
+//
+// ok only says a flip is possible, never that it is right. A book folder
+// always names the title side of a correct "Title - Author" name
+// (It/It - Stephen King.epub), so the folder alone cannot tell the two apart.
+// Every caller therefore matches the parse as it is first, and takes this
+// reading only when that finds nothing in the catalogue and this one finds a
+// book. The name comparison is confidentAuthorMatch because the flip is an
+// automatic decision, and an ambiguous author match never auto matches.
+func flipByLayout(parsed ParsedFile, layoutAuthor string) (ParsedFile, bool) {
+	if layoutAuthor == "" || parsed.Title == "" || parsed.Author == "" {
+		return parsed, false
+	}
+	if !confidentAuthorMatch(parsed.Title, layoutAuthor) || confidentAuthorMatch(parsed.Author, layoutAuthor) {
+		return parsed, false
+	}
+	parsed.Title, parsed.Author = parsed.Author, layoutAuthor
+	return parsed, true
 }
 
 // ErrScanAlreadyRunning is returned by StartScan when a library scan (manual
@@ -2685,9 +2861,13 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 		return
 	}
 
+	scanStartedAt := time.Now()
+
 	// walkDir appends all book files found under root to foundFiles, tracking
 	// which root each file belongs to so the author-inference fallback can
-	// strip the correct prefix.
+	// strip the correct prefix. The size and mode the walk already has are
+	// kept for the unmatched units (P2).
+	walked := make(map[string]walkedFile)
 	walkDir := func(root string) []string {
 		var files []string
 		if err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -2696,6 +2876,7 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 			}
 			if IsBookFile(path) {
 				files = append(files, path)
+				walked[path] = walkedFile{size: info.Size(), mode: info.Mode()}
 			}
 			return nil
 		}); err != nil {
@@ -2705,16 +2886,26 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 	}
 
 	foundFiles := walkDir(s.libraryDir)
+	// rootsWithFiles tells the unmatched unit purge which roots this scan
+	// actually saw files under, so an unmounted root keeps its ignores.
+	var rootsWithFiles []string
+	if len(foundFiles) > 0 {
+		rootsWithFiles = append(rootsWithFiles, s.libraryDir)
+	}
 
 	// Also scan the audiobook directory when it is configured separately.
 	if s.audiobookDir != "" && s.audiobookDir != s.libraryDir {
-		foundFiles = append(foundFiles, walkDir(s.audiobookDir)...)
+		audioFiles := walkDir(s.audiobookDir)
+		if len(audioFiles) > 0 {
+			rootsWithFiles = append(rootsWithFiles, s.audiobookDir)
+		}
+		foundFiles = append(foundFiles, audioFiles...)
 	}
 
 	slog.Info("library scan found files", "paths", []string{s.libraryDir, s.audiobookDir}, "count", len(foundFiles))
 
 	if len(foundFiles) == 0 {
-		s.writeScanResult(ctx, len(foundFiles), 0, 0, 0, 0, nil)
+		s.writeScanResult(ctx, len(foundFiles), 0, 0, 0, 0, s.unmatchedUnitCounts(ctx, false))
 		return
 	}
 
@@ -2963,7 +3154,7 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 		return set, parsedAuthor
 	}
 
-	var unmatchedFiles []unmatchedFile
+	var unmatchedFiles unmatchedCollector
 	var reconciled, unmatched, alreadyTracked, tagReadFailed int
 
 	// tryReconcileTitle attempts to reconcile path to the given wanted book via
@@ -3028,6 +3219,40 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 		return true
 	}
 
+	// reconcileByTitle runs the fuzzy title tier for one reading of a file,
+	// returning true once a book is claimed.
+	reconcileByTitle := func(path, cleanPath, detectedFmt, title, author, layoutAuthor string) bool {
+		// normalizeTitle strips leading articles and inverts comma-suffix
+		// sort form ("Title, A" → "title") so librarian-sorted folders
+		// reconcile correctly (#513). Hoisted: computed once per file.
+		normParsed := normalizeTitle(title)
+		// authorMatch is part of the title-tier predicate. Resolving the
+		// matching authors first lets the candidate list be built from just
+		// their books (booksByAuthor), iterated in library order. A nil set
+		// means the parsed author is empty or initials only, so authorMatch
+		// accepts any author and every wanted book is a candidate.
+		authorSet, _ := resolveAuthors(author, layoutAuthor)
+		if authorSet == nil {
+			for i := range wantedBooks {
+				if tryReconcileTitle(&wantedBooks[i], path, cleanPath, normParsed, detectedFmt) {
+					return true
+				}
+			}
+			return false
+		}
+		titleCand = titleCand[:0]
+		for id := range authorSet {
+			titleCand = append(titleCand, booksByAuthor[id]...)
+		}
+		slices.Sort(titleCand) // restore library order across authors
+		for _, idx := range titleCand {
+			if tryReconcileTitle(&wantedBooks[idx], path, cleanPath, normParsed, detectedFmt) {
+				return true
+			}
+		}
+		return false
+	}
+
 	for _, path := range foundFiles {
 		// Files already registered, and sibling tracks inside a tracked
 		// audiobook folder, are counted instead of silently skipped so
@@ -3068,19 +3293,33 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 
 		// Parse the filename for title/author hints, then let the folder
 		// hierarchy correct them. A file under <root>/<Author>/<Book>/<file>
-		// names author and title unambiguously and dash-safe, unlike splitting
-		// an "Author - Title" / "Title - Author" filename — the scan must not
-		// assume a single filename order (#754).
-		parsed := ParseFilename(path)
+		// names the AUTHOR unambiguously and dash-safe, unlike splitting an
+		// "Author - Title" / "Title - Author" filename — the scan must not
+		// assume a single filename order (#754). The book folder is a weaker
+		// signal than the author folder and no longer overrides the filename
+		// for an ebook: see scanTitle (#2171).
+		parsed := parseScanFile(path, detectedFmt)
 		var layoutTitle, layoutAuthor string
+		// flipped is the filename read the other way round, for an
+		// "Author - Title" name that sits in its author's folder. The title
+		// tier tries it first, and only for an author the catalogue knows
+		// (flipByLayout, #2331). It used to be offered only where there was no
+		// book folder, because the book folder's own name was then taken as
+		// the title regardless. Now that the filename leads (#2171), a
+		// "Cal Newport - Deep Work.epub" under Cal Newport/Deep Work/ needs
+		// the same flip as the one directly under Cal Newport/, and it lands
+		// on the same title the folder names.
+		var flipped ParsedFile
+		var canFlip bool
 		if a, t, ok := authorTitleFromLayout(path, s.libraryDir, s.audiobookDir); ok {
+			flipped, canFlip = flipByLayout(parsed, a)
 			if a != "" {
 				parsed.Author = a
 				layoutAuthor = a
 			}
 			if t != "" {
-				parsed.Title = t
 				layoutTitle = t
+				parsed.Title = scanTitle(parsed.Title, t, detectedFmt)
 			}
 		}
 
@@ -3094,6 +3333,15 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 					"path", path, "error", err)
 				tagReadFailed++
 			} else {
+				// Tags describe the file itself. A tag title leaves no
+				// filename reading to flip, and neither does a tag author that
+				// is not the folder's. A tag author that is the folder's (an
+				// m4b with only its artist set, an mp3 with album and album
+				// artist) says nothing about which side of the filename is the
+				// title, so the flip stays open, as it is in bulk import.
+				if tags.Title != "" || (tags.Author != "" && !confidentAuthorMatch(tags.Author, layoutAuthor)) {
+					canFlip = false
+				}
 				// Multi-part audiobooks tag each track with its chapter name
 				// ("04 - Sinister Grey Mists..."). When the folder hierarchy
 				// already gave a real book title, don't let a per-chapter tag
@@ -3148,36 +3396,35 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 				break
 			}
 		}
+		// The #2331 flip comes before the parse as it is. Read as it is, an
+		// "Author - Title" filename in its author folder has the author's own
+		// name for a title, and the fuzzy title tier pairs that with any of the
+		// author's books named after them ("Tom Clancy Enemy Contact"). The
+		// flip is taken only for a folder author the catalogue knows, so a
+		// flat book folder (It/It - Stephen King.epub) still reconciles as it
+		// is.
+		if !matched && canFlip && len(matchingAuthors(flipped.Author)) > 0 {
+			if matched = reconcileByTitle(path, cleanPath, detectedFmt, flipped.Title, flipped.Author, layoutAuthor); matched {
+				slog.Debug("library scan: reconciled a backwards filename in its author folder",
+					"path", path, "title", flipped.Title, "author", flipped.Author)
+			}
+		}
 		if !matched && parsed.Title != "" {
-			// normalizeTitle strips leading articles and inverts comma-suffix
-			// sort form ("Title, A" → "title") so librarian-sorted folders
-			// reconcile correctly (#513). Hoisted: computed once per file.
-			normParsed := normalizeTitle(parsed.Title)
-			// authorMatch is part of the title-tier predicate. Resolving the
-			// matching authors first lets the candidate list be built from just
-			// their books (booksByAuthor), iterated in library order. A nil set
-			// means the parsed author is empty/initials-only — authorMatch then
-			// accepts any author, so every wanted book is a candidate.
-			authorSet, _ := resolveAuthors(parsed.Author, layoutAuthor)
-			if authorSet == nil {
-				for i := range wantedBooks {
-					if tryReconcileTitle(&wantedBooks[i], path, cleanPath, normParsed, detectedFmt) {
-						matched = true
-						break
-					}
-				}
-			} else {
-				titleCand = titleCand[:0]
-				for id := range authorSet {
-					titleCand = append(titleCand, booksByAuthor[id]...)
-				}
-				slices.Sort(titleCand) // restore library order across authors
-				for _, idx := range titleCand {
-					if tryReconcileTitle(&wantedBooks[idx], path, cleanPath, normParsed, detectedFmt) {
-						matched = true
-						break
-					}
-				}
+			matched = reconcileByTitle(path, cleanPath, detectedFmt, parsed.Title, parsed.Author, layoutAuthor)
+		}
+		// The book folder's title, one tier down (#2171). The filename now
+		// leads, so this is what keeps everything the folder used to match
+		// matching: a file whose own name resolves to no book at all is still
+		// offered to the book its folder names. It is also how a notes .txt or
+		// chapter .pdf beside an epub is recognised as that epub's companion
+		// rather than an orphan — its own name says "notes", only the folder
+		// says which book it belongs to (#2188).
+		if !matched && layoutTitle != "" && layoutTitle != parsed.Title {
+			if matched = reconcileByTitle(path, cleanPath, detectedFmt, layoutTitle, parsed.Author, layoutAuthor); matched {
+				// The log used to print only the winner, which is why the
+				// reported libraries looked healthy (#2171). Name both.
+				slog.Debug("library scan: reconciled on the book folder's title, not the file's",
+					"path", path, "folderTitle", layoutTitle, "fileTitle", parsed.Title)
 			}
 		}
 
@@ -3255,15 +3502,10 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 			slog.Debug("library scan: unmatched file", "path", path, "parsedTitle", parsed.Title,
 				"parsedAuthor", parsed.Author, "matchAuthor", matchAuthor, "reason", reason)
 			unmatched++
-			// Collect up to 1000 unmatched entries for UI display
-			if len(unmatchedFiles) < 1000 {
-				unmatchedFiles = append(unmatchedFiles, unmatchedFile{
-					Path:         path,
-					ParsedTitle:  parsed.Title,
-					ParsedAuthor: parsed.Author,
-					Reason:       reason,
-				})
-			}
+			unmatchedFiles.add(unmatchedScanFile{
+				path: path, format: detectedFmt, size: walked[path].size, mode: walked[path].mode,
+				title: parsed.Title, author: parsed.Author, layoutAuthor: layoutAuthor, reason: reason,
+			})
 		}
 	}
 
@@ -3283,7 +3525,15 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 	slog.Info("library scan complete", "paths", scanRoots, "bookFiles", len(foundFiles),
 		"reconciled", reconciled, "unmatched", unmatched, "tagReadFailed", tagReadFailed)
 
-	s.writeScanResult(ctx, len(foundFiles), reconciled, unmatched, alreadyTracked, tagReadFailed, unmatchedFiles)
+	// Suggestions come from the catalogue already in memory, ranked once per
+	// unit rather than per file.
+	units := s.recordUnmatchedUnits(ctx, &unmatchedFiles, scanRoots, rootsWithFiles, scanStartedAt,
+		func(title, author, layoutAuthor string) []db.UnmatchedCandidate {
+			authorSet, _ := resolveAuthors(author, layoutAuthor)
+			return rankCandidates(normalizeTitle(title), wantedBooks, booksByAuthor, authorSet)
+		})
+
+	s.writeScanResult(ctx, len(foundFiles), reconciled, unmatched, alreadyTracked, tagReadFailed, units)
 }
 
 // refreshStaleRenderedPaths re-derives the file path shown for books that
@@ -3365,7 +3615,10 @@ func (s *Scanner) refreshStaleRenderedPaths(ctx context.Context) {
 // this only suppresses the tag title when the folder hierarchy already resolved
 // a title to fall back to (see the caller), so the worst case is using the
 // folder's title for such a book rather than the tag's.
-var chapterTitleRe = regexp.MustCompile(`(?i)^(\d{1,3}\s*[-._]\s*\D|(chapter|track|part|disc|cd)\b\s*\.?\s*\d)`)
+// The last branch is a bare track counter with nothing else, "001-190" or
+// "07 of 12": some rips tag every track's title that way, and letting it win
+// over a folder-derived book title left every file unmatched (#2547).
+var chapterTitleRe = regexp.MustCompile(`(?i)^(\d{1,3}\s*[-._]\s*\D|(chapter|track|part|disc|cd)\b\s*\.?\s*\d|\d{1,4}\s*(?:-|/|of)\s*\d{1,4}$)`)
 
 // looksLikeChapterTitle reports whether an embedded-tag title looks like a
 // per-track chapter name rather than a book title (#1239).
@@ -3432,22 +3685,12 @@ const (
 	unmatchedReasonNoTitleParsed = "no_title_parsed"
 )
 
-// unmatchedFile represents a file that could not be reconciled during library scan.
-type unmatchedFile struct {
-	Path         string `json:"path"`
-	ParsedTitle  string `json:"parsed_title"`
-	ParsedAuthor string `json:"parsed_author"`
-	// Reason is one of the unmatchedReason* constants. Omitted when empty so
-	// results written before this field existed keep parsing unchanged.
-	Reason string `json:"reason,omitempty"`
-}
-
 // writeScanError persists a failed-scan result so the UI reflects the failure
 // instead of a stale prior scan (#965). It reuses the same "library.lastScan"
 // shape as a normal scan — zero counts plus a non-empty scan_error message the
 // frontend renders the same way as the other scan-outcome warnings.
 func (s *Scanner) writeScanError(ctx context.Context, message string) {
-	s.writeScanResultWithError(ctx, 0, 0, 0, 0, 0, nil, message)
+	s.writeScanResultWithError(ctx, 0, 0, 0, 0, 0, s.unmatchedUnitCounts(ctx, false), message)
 }
 
 // writeScanResult persists the scan summary to the settings table under
@@ -3456,30 +3699,16 @@ func (s *Scanner) writeScanError(ctx context.Context, message string) {
 // api.SettingLibraryLastScan on the read side, where the settings endpoints
 // reserve it for admins because the blob carries absolute paths (#2361). Keep
 // the two spellings in sync.
-func (s *Scanner) writeScanResult(ctx context.Context, filesFound, reconciled, unmatched, alreadyTracked, tagReadFailed int, unmatchedFiles []unmatchedFile) {
-	s.writeScanResultWithError(ctx, filesFound, reconciled, unmatched, alreadyTracked, tagReadFailed, unmatchedFiles, "")
+func (s *Scanner) writeScanResult(ctx context.Context, filesFound, reconciled, unmatched, alreadyTracked, tagReadFailed int, units unitCounts) {
+	s.writeScanResultWithError(ctx, filesFound, reconciled, unmatched, alreadyTracked, tagReadFailed, units, "")
 }
 
 // writeScanResultWithError is the shared writer for both successful scans and
 // early-return failures. scanError is empty for a normal scan and a
 // user-facing message when the scan could not complete (#965).
-func (s *Scanner) writeScanResultWithError(ctx context.Context, filesFound, reconciled, unmatched, alreadyTracked, tagReadFailed int, unmatchedFiles []unmatchedFile, scanError string) {
+func (s *Scanner) writeScanResultWithError(ctx context.Context, filesFound, reconciled, unmatched, alreadyTracked, tagReadFailed int, units unitCounts, scanError string) {
 	if s.settings == nil {
 		return
-	}
-
-	// Marshal unmatched files to JSON
-	var unmatchedJSON string
-	if len(unmatchedFiles) > 0 {
-		bytes, err := json.Marshal(unmatchedFiles)
-		if err != nil {
-			slog.Warn("library scan: failed to marshal unmatched files", "error", err)
-			unmatchedJSON = "[]"
-		} else {
-			unmatchedJSON = string(bytes)
-		}
-	} else {
-		unmatchedJSON = "[]"
 	}
 
 	// Surface the resolved roots that were actually walked so the UI can tell
@@ -3511,11 +3740,15 @@ func (s *Scanner) writeScanResultWithError(ctx context.Context, filesFound, reco
 		}
 	}
 
+	// The unmatched files now live in unmatched_units, one row per book, and
+	// the blob carries only their counts. unmatched_files stays as an empty
+	// list so a web bundle cached from before library adoption still parses
+	// the result. Added 2026-09 for v1.37; remove it in the release after.
 	payload := fmt.Sprintf(
-		`{"ran_at":%q,"files_found":%d,"reconciled":%d,"unmatched":%d,"already_tracked":%d,"tag_read_failed":%d,"unmatched_files":%s,"library_dir":%q,"audiobook_dir":%q,"scanned_paths":%s,"no_files_found":%t,"scan_error":%s}`,
+		`{"ran_at":%q,"files_found":%d,"reconciled":%d,"unmatched":%d,"already_tracked":%d,"tag_read_failed":%d,"unmatched_files":[],"unmatched_units":%d,"ignored_units":%d,"units_truncated":%t,"library_dir":%q,"audiobook_dir":%q,"scanned_paths":%s,"no_files_found":%t,"scan_error":%s}`,
 		time.Now().UTC().Format(time.RFC3339),
 		filesFound, reconciled, unmatched, alreadyTracked, tagReadFailed,
-		unmatchedJSON,
+		units.pending, units.ignored, units.truncated,
 		s.libraryDir, s.audiobookDir, pathsJSON, noFilesFound, scanErrorJSON,
 	)
 	if err := s.settings.Set(ctx, "library.lastScan", payload); err != nil {

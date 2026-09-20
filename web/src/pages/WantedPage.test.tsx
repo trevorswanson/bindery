@@ -1,6 +1,7 @@
+import { useEffect } from 'react'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { MemoryRouter } from 'react-router'
+import { MemoryRouter, useLocation } from 'react-router'
 import WantedPage from './WantedPage'
 import { api } from '../api/client'
 import type { Author, Book, Download, SearchResult } from '../api/client'
@@ -63,6 +64,7 @@ vi.mock('react-i18next', () => ({
         'wanted.colActions': 'Actions',
         'wanted.noCover': 'No cover',
         'wanted.authorUnknown': 'Author unknown',
+        'search.autoGrabDisabled': 'No search was run. Automatic grabbing is off.',
       }
       return labels[key] ?? key
     },
@@ -151,9 +153,20 @@ function makeDownload(overrides: Partial<Download> = {}): Download {
   }
 }
 
-function renderWantedPage() {
+type Located = { pathname: string; state: unknown }
+
+function LocationProbe({ onLocation }: { onLocation: (location: Located) => void }) {
+  const location = useLocation()
+  useEffect(() => {
+    onLocation({ pathname: location.pathname, state: location.state })
+  }, [location, onLocation])
+  return null
+}
+
+function renderWantedPage(onLocation?: (location: Located) => void) {
   return render(
     <MemoryRouter>
+      {onLocation && <LocationProbe onLocation={onLocation} />}
       <WantedPage />
     </MemoryRouter>,
   )
@@ -187,9 +200,9 @@ describe('WantedPage', () => {
 
     expect(await screen.findByText('No wanted books. Add an author to start tracking.')).toBeInTheDocument()
     const manualImport = screen.getByRole('link', { name: 'Import them' })
-    expect(manualImport).toHaveAttribute('href', '/settings?tab=import')
+    expect(manualImport).toHaveAttribute('href', '/import?view=folder')
     const scanLibrary = screen.getByRole('link', { name: 'Scan Library' })
-    expect(scanLibrary).toHaveAttribute('href', '/settings?tab=general')
+    expect(scanLibrary).toHaveAttribute('href', '/import')
   })
 
   it('renders a row with the book title and its author', async () => {
@@ -439,6 +452,40 @@ describe('WantedPage', () => {
     expect(screen.queryByRole('link', { name: 'Dune' })).not.toBeInTheDocument()
     expect(screen.queryByRole('link', { name: 'Hyperion' })).not.toBeInTheDocument()
   })
+
+  // #2669: with automatic grabbing off the server refuses the search instead
+  // of queueing it. Before the fix every entry came back ok:true, the page
+  // cleared the selection and reloaded, and the user saw a button flash and
+  // no other sign that nothing had happened.
+  it('tells the user nothing was searched when automatic grabbing is off, and keeps the selection', async () => {
+    vi.mocked(api.listWanted).mockResolvedValue([
+      makeBook({ id: 1, title: 'Dune' }),
+      makeBook({ id: 2, title: 'Hyperion' }),
+    ])
+    vi.mocked(api.bulkActionWanted).mockResolvedValue({
+      results: {
+        1: { ok: false, code: 'auto_grab_disabled', error: 'automatic grabbing is disabled' },
+        2: { ok: false, code: 'auto_grab_disabled', error: 'automatic grabbing is disabled' },
+      },
+    })
+
+    renderWantedPage()
+
+    await screen.findByRole('link', { name: 'Dune' })
+    fireEvent.click(screen.getByTitle('Select Dune'))
+    fireEvent.click(screen.getByTitle('Select Hyperion'))
+
+    const bulkBar = screen.getByText('2 selected').closest('div')
+    if (!bulkBar) throw new Error('Bulk action bar was not rendered')
+    fireEvent.click(within(bulkBar).getByRole('button', { name: 'Search' }))
+
+    expect(await screen.findByText('No search was run. Automatic grabbing is off.')).toBeInTheDocument()
+    // The selection survives, so flipping the setting and pressing Search
+    // again does not mean re-picking every book.
+    expect(screen.getByText('2 selected')).toBeInTheDocument()
+    // And the list is not reloaded, because nothing changed.
+    expect(api.listWanted).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('WantedPage — live polling (#1161)', () => {
@@ -459,5 +506,45 @@ describe('WantedPage — live polling (#1161)', () => {
     expect(vi.mocked(api.listWanted).mock.calls.length).toBeGreaterThan(1)
     expect(screen.queryByText('Grabbed Away')).not.toBeInTheDocument()
     expect(screen.getByText('Stays Wanted')).toBeInTheDocument()
+  })
+})
+
+describe('WantedPage — book link nav state (#2548, book side)', () => {
+  it('carries {ids, index} scoped to pageItems (this page’s slice), not the unpaginated filtered list', async () => {
+    vi.mocked(api.listWanted).mockResolvedValue([
+      makeBook({ id: 1, title: 'Elantris' }),
+      makeBook({ id: 2, title: 'Mistborn' }),
+    ])
+    let located: Located | undefined
+    renderWantedPage(loc => { located = loc })
+
+    await screen.findByText('Mistborn')
+    fireEvent.click(screen.getByText('Mistborn'))
+
+    await waitFor(() => expect(located?.pathname).toBe('/book/2'))
+    expect(located?.state).toEqual({ ids: [1, 2], index: 1, hopDepth: 1 })
+  })
+
+  it('narrows the carried ids to the search-filtered set, not every wanted book', async () => {
+    vi.mocked(api.listWanted).mockResolvedValue([
+      makeBook({ id: 1, title: 'Elantris' }),
+      makeBook({ id: 2, title: 'Mistborn' }),
+      makeBook({ id: 3, title: 'Warbreaker' }),
+    ])
+    let located: Located | undefined
+    renderWantedPage(loc => { located = loc })
+
+    await screen.findByText('Mistborn')
+    fireEvent.change(screen.getByPlaceholderText('Search by title or author...'), {
+      target: { value: 'Mist' },
+    })
+    // Narrows the visible list to just Mistborn — Elantris and Warbreaker
+    // must also be dropped from the carried ids, not just hidden.
+    await waitFor(() => expect(screen.queryByText('Elantris')).not.toBeInTheDocument())
+
+    fireEvent.click(screen.getByText('Mistborn'))
+
+    await waitFor(() => expect(located?.pathname).toBe('/book/2'))
+    expect(located?.state).toEqual({ ids: [2], index: 0, hopDepth: 1 })
   })
 })

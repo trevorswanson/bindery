@@ -1,15 +1,21 @@
 import { BrowserRouter, Routes, Route, NavLink, Link, Navigate, useLocation, useParams } from 'react-router'
-import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react'
+import { Fragment, lazy, Suspense, useEffect, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from './api/client'
 import { AuthProvider, useAuth } from './auth/AuthContext'
 import AuthGuard from './auth/AuthGuard'
 import PublicOnlyRoute from './auth/PublicOnlyRoute'
+import AccountMenu from './components/AccountMenu'
 import ErrorBoundary from './components/ErrorBoundary'
+import LibrarySearch from './components/LibrarySearch'
 import Logo from './components/Logo'
+import NavTabs from './components/NavTabs'
+import { activeGroup, isEntryActive, matchesPath, navGroupsFor, type NavItem } from './components/navGroups'
 import SetupBanner from './components/SetupBanner'
 import VersionBadge from './components/VersionBadge'
 import WhatsNewToast from './components/WhatsNewToast'
+import { useUnmatchedCount } from './components/useUnmatchedCount'
+import { REQUESTS_CHANGED_EVENT } from './pages/requests/requestLabels'
 import { useTheme } from './theme'
 
 // Route-scoped error boundary: a render crash in one page shows an inline error
@@ -33,7 +39,7 @@ const BooksPage = lazy(() => import('./pages/BooksPage'))
 const BookDetailPage = lazy(() => import('./pages/BookDetailPage'))
 const WantedPage = lazy(() => import('./pages/WantedPage'))
 const QueuePage = lazy(() => import('./pages/QueuePage'))
-const ManualImportPage = lazy(() => import('./pages/ManualImportPage'))
+const ImportPage = lazy(() => import('./pages/import/ImportPage'))
 const SettingsPage = lazy(() => import('./pages/SettingsPage'))
 const UsersPage = lazy(() => import('./pages/UsersPage'))
 const HistoryPage = lazy(() => import('./pages/HistoryPage'))
@@ -41,18 +47,32 @@ const SeriesPage = lazy(() => import('./pages/SeriesPage'))
 const CalendarPage = lazy(() => import('./pages/CalendarPage'))
 const DiscoverPage = lazy(() => import('./pages/DiscoverPage'))
 const SearchPage = lazy(() => import('./pages/SearchPage'))
+const RequesterLibraryPage = lazy(() => import('./pages/requests/RequesterLibraryPage'))
+const RequestSearchPage = lazy(() => import('./pages/requests/RequestSearchPage'))
+const MyRequestsPage = lazy(() => import('./pages/requests/MyRequestsPage'))
+const RequestsPage = lazy(() => import('./pages/requests/RequestsPage'))
 
-const NAV_KEYS = [
-  { to: '/', key: 'authors', end: true },
-  { to: '/books', key: 'books' },
-  { to: '/wanted', key: 'wanted' },
-  { to: '/queue', key: 'queue' },
-  { to: '/import', key: 'import' },
-  { to: '/history', key: 'history' },
-  { to: '/series', key: 'series' },
-  { to: '/calendar', key: 'calendar' },
-  { to: '/discover', key: 'discover' },
-]
+// The admin nav badge: pending requests, read once on load and again after
+// each approve or decline. No polling.
+function usePendingRequestCount(enabled: boolean): number {
+  const [count, setCount] = useState(0)
+  useEffect(() => {
+    if (!enabled) return
+    let cancelled = false
+    const load = () => {
+      api.pendingRequestCount()
+        .then(r => { if (!cancelled) setCount(r.count) })
+        .catch(() => { /* the badge is a hint; leave it as it was */ })
+    }
+    load()
+    window.addEventListener(REQUESTS_CHANGED_EVENT, load)
+    return () => {
+      cancelled = true
+      window.removeEventListener(REQUESTS_CHANGED_EVENT, load)
+    }
+  }, [enabled])
+  return enabled ? count : 0
+}
 
 function PageLoadingFallback() {
   const { t } = useTranslation()
@@ -105,17 +125,50 @@ function Shell() {
   const [version, setVersion] = useState('')
   const [latestVersion, setLatestVersion] = useState<string | undefined>(undefined)
   const [menuOpen, setMenuOpen] = useState(false)
-  const { status, logout, isAdmin } = useAuth()
+  const { status, logout, isAdmin, isRequester } = useAuth()
+  const signedIn = !!status?.authenticated && status.mode !== 'disabled'
+  // Books the library scan could not match, on the Import nav entry (admins
+  // only; the count comes from an admin only route).
+  const unmatched = useUnmatchedCount(isAdmin)
+  const navEntries = navGroupsFor(isAdmin, isRequester)
+  const pendingRequests = usePendingRequestCount(isAdmin)
+  const { pathname } = useLocation()
+  // The group whose tab strip belongs above the current page, if any.
+  const tabGroup = activeGroup(pathname, navEntries)
 
   useEffect(() => {
+    // /system/status is closed to requesters, and only admins see the version.
+    if (isRequester) return
     api.status().then(s => {
       setVersion(s.version)
       setLatestVersion(s.latestVersion)
     }).catch(() => {})
-  }, [])
+  }, [isRequester])
+
+  // Both count badges survive the regrouping: Import is still a top level link
+  // and keeps its own, and the admin pending count rides the Activity entry as
+  // well as the Requests tab inside it.
+  const navLabel = (item: NavItem) => (
+    <>
+      {t(`nav.${item.key}`)}
+      {item.key === 'import' && unmatched > 0 && (
+        <span
+          className="ml-1.5 inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-amber-100 px-1.5 text-[11px] font-semibold text-amber-800 dark:bg-amber-950 dark:text-amber-300"
+          aria-label={t('nav.importUnmatched', { count: unmatched, defaultValue: '{{count}} books need a decision' })}
+        >
+          {unmatched > 999 ? '999+' : unmatched}
+        </span>
+      )}
+      {(item.key === 'requests' || item.key === 'activity') && pendingRequests > 0 && (
+        <span className="ml-1.5 px-1.5 py-0.5 rounded-full bg-amber-500 text-white text-[10px] font-semibold" aria-label={t('nav.requestsPending', { count: pendingRequests })}>
+          {pendingRequests}
+        </span>
+      )}
+    </>
+  )
 
   const linkClass = ({ isActive }: { isActive: boolean }) =>
-    `px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+    `px-2.5 py-2 rounded-md text-sm font-medium whitespace-nowrap transition-colors ${
       isActive ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'
     }`
 
@@ -128,22 +181,27 @@ function Shell() {
     <div className="min-h-screen bg-slate-50 dark:bg-zinc-950 text-slate-900 dark:text-zinc-100">
       <header className="border-b border-slate-200 dark:border-zinc-800 sticky top-0 z-40 bg-slate-50 dark:bg-zinc-950">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-16">
+          <div className="flex items-center justify-between gap-4 h-16">
             <Link to="/" className="flex items-center gap-2 flex-shrink-0 group" onClick={() => setMenuOpen(false)}>
               <Logo className="w-14 h-14 rounded-full transition-transform group-hover:scale-105" />
               <h1 className="text-lg font-bold tracking-tight">Bindery</h1>
             </Link>
 
-            <nav className="hidden lg:flex gap-1">
-              {NAV_KEYS.map(item => (
-                <NavLink key={item.to} to={item.to} end={item.end} className={linkClass}>
-                  {t(`nav.${item.key}`)}
-                </NavLink>
+            {/* A group link goes to its first member and stays lit on every
+                member, so the bar shows where you are without listing ten
+                pages. Plain Link plus a computed class: NavLink only knows
+                about its own path. */}
+            <nav className="hidden xl:flex gap-1">
+              {navEntries.map(item => (
+                <Link key={item.to} to={item.to} className={linkClass({ isActive: isEntryActive(pathname, item) })}>
+                  {navLabel(item)}
+                </Link>
               ))}
             </nav>
 
-            <div className="flex items-center gap-3 flex-shrink-0">
-              <NavLink
+            <div className="flex items-center gap-2 flex-shrink-0">
+              {!isRequester && <LibrarySearch className="hidden lg:block w-40" />}
+              {!isRequester && <NavLink
                 to="/search"
                 className={({ isActive }) =>
                   `hidden lg:block p-2 rounded-md transition-colors ${
@@ -155,7 +213,7 @@ function Shell() {
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
                 </svg>
-              </NavLink>
+              </NavLink>}
               {isAdmin && (
                 <NavLink
                   to="/users"
@@ -171,7 +229,7 @@ function Shell() {
                   </svg>
                 </NavLink>
               )}
-              <NavLink
+              {!isRequester && <NavLink
                 to="/settings"
                 className={({ isActive }) =>
                   `hidden lg:block p-2 rounded-md transition-colors ${
@@ -184,29 +242,19 @@ function Shell() {
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.248a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z" />
                   <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
                 </svg>
-              </NavLink>
-              {isAdmin && version && (
-                <VersionBadge version={version} latestVersion={latestVersion} className="hidden lg:block" />
-              )}
-              {status?.authenticated && status.mode !== 'disabled' && (
-                <>
-                  {status.username && (
-                    <span className="hidden sm:inline text-xs text-fg-muted whitespace-nowrap" title={`${t('login.signedInAs')} ${status.username}`}>
-                      {status.username}
-                    </span>
-                  )}
-                  <button
-                    onClick={logout}
-                    className="hidden lg:block text-xs text-fg-muted hover:text-slate-900 dark:hover:text-white transition-colors"
-                    title={status.username ? `${t('login.signedInAs')} ${status.username}` : t('login.signOut')}
-                  >
-                    {t('login.signOut')}
-                  </button>
-                </>
+              </NavLink>}
+              {(signedIn || (isAdmin && version)) && (
+                <AccountMenu
+                  className="hidden lg:block"
+                  username={signedIn ? status?.username : undefined}
+                  version={isAdmin && version ? version : undefined}
+                  latestVersion={latestVersion}
+                  onSignOut={signedIn ? logout : undefined}
+                />
               )}
               <button
                 onClick={() => setMenuOpen(open => !open)}
-                className="lg:hidden p-2 rounded-md text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-zinc-800 transition-colors"
+                className="xl:hidden p-2 rounded-md text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-zinc-800 transition-colors"
                 aria-label="Toggle menu"
               >
                 {menuOpen ? (
@@ -224,48 +272,68 @@ function Shell() {
         </div>
 
         {menuOpen && (
-          <div className="lg:hidden border-t border-slate-200 dark:border-zinc-800">
+          <div className="xl:hidden border-t border-slate-200 dark:border-zinc-800">
+            {/* From lg up the search, the icons and the account menu stay in
+                the header row, so the menu only carries the nav links. */}
+            {!isRequester && <div className="lg:hidden px-4 py-3 border-b border-slate-200/50 dark:border-zinc-800/50">
+              <LibrarySearch className="w-full" onNavigate={() => setMenuOpen(false)} />
+            </div>}
+            {/* The menu keeps every page reachable: a group heads its own
+                block and its members are listed indented beneath it. */}
             <nav>
-              {NAV_KEYS.map(item => (
-                <NavLink
-                  key={item.to}
-                  to={item.to}
-                  end={item.end}
-                  className={mobileLinkClass}
-                  onClick={() => setMenuOpen(false)}
-                >
-                  {t(`nav.${item.key}`)}
-                </NavLink>
+              {navEntries.map(item => (
+                <Fragment key={item.to}>
+                  <Link
+                    to={item.to}
+                    className={mobileLinkClass({ isActive: isEntryActive(pathname, item) })}
+                    onClick={() => setMenuOpen(false)}
+                  >
+                    {navLabel(item)}
+                  </Link>
+                  {item.children?.map(child => (
+                    <Link
+                      key={child.to}
+                      to={child.to}
+                      className={`pl-8 ${mobileLinkClass({ isActive: matchesPath(pathname, child) })}`}
+                      onClick={() => setMenuOpen(false)}
+                    >
+                      {navLabel(child)}
+                    </Link>
+                  ))}
+                </Fragment>
               ))}
-              <NavLink
+              {!isRequester && <NavLink
                 to="/search"
-                className={mobileLinkClass}
+                className={args => `lg:hidden ${mobileLinkClass(args)}`}
                 onClick={() => setMenuOpen(false)}
               >
                 {t('nav.search')}
-              </NavLink>
+              </NavLink>}
               {isAdmin && (
                 <NavLink
                   to="/users"
-                  className={mobileLinkClass}
+                  className={args => `lg:hidden ${mobileLinkClass(args)}`}
                   onClick={() => setMenuOpen(false)}
                 >
                   {t('nav.users')}
                 </NavLink>
               )}
-              <NavLink
+              {!isRequester && <NavLink
                 to="/settings"
-                className={mobileLinkClass}
+                className={args => `lg:hidden ${mobileLinkClass(args)}`}
                 onClick={() => setMenuOpen(false)}
               >
                 {t('nav.settings')}
-              </NavLink>
+              </NavLink>}
             </nav>
-            <div className="flex items-center justify-between px-4 py-2 border-t border-slate-200 dark:border-zinc-800">
+            <div className="lg:hidden flex items-center justify-between gap-3 px-4 py-2 border-t border-slate-200 dark:border-zinc-800">
+              {signedIn && status?.username && (
+                <span className="text-xs text-fg-muted truncate">{t('login.signedInAs')} {status.username}</span>
+              )}
               {isAdmin && version && (
                 <VersionBadge version={version} latestVersion={latestVersion} />
               )}
-              {status?.authenticated && status.mode !== 'disabled' && (
+              {signedIn && (
                 <button
                   onClick={logout}
                   className="text-xs text-fg-muted hover:text-slate-900 dark:hover:text-white transition-colors"
@@ -282,8 +350,17 @@ function Shell() {
       <WhatsNewToast version={version} />
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        {tabGroup && <NavTabs group={tabGroup} renderLabel={navLabel} />}
         <Suspense fallback={<PageLoadingFallback />}>
           <RoutedErrorBoundary>
+          {isRequester ? (
+          <Routes>
+            <Route path="/" element={<RequesterLibraryPage />} />
+            <Route path="/request" element={<RequestSearchPage />} />
+            <Route path="/my-requests" element={<MyRequestsPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+          ) : (
           <Routes>
             <Route path="/" element={<AuthorsPage />} />
             {/* Authors has always been served from "/" because it was the first
@@ -299,7 +376,7 @@ function Shell() {
             <Route path="/book/:id" element={<BookDetailPage />} />
             <Route path="/wanted" element={<WantedPage />} />
             <Route path="/queue" element={<QueuePage />} />
-            <Route path="/import" element={<ManualImportPage />} />
+            <Route path="/import" element={<ImportPage />} />
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/series" element={<SeriesPage />} />
             <Route path="/calendar" element={<CalendarPage />} />
@@ -309,8 +386,10 @@ function Shell() {
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/settings/:tab" element={<SettingsTabRedirect />} />
             {isAdmin && <Route path="/users" element={<UsersPage />} />}
+            {isAdmin && <Route path="/requests" element={<RequestsPage />} />}
             <Route path="*" element={<NotFoundPage />} />
           </Routes>
+          )}
           </RoutedErrorBoundary>
         </Suspense>
       </main>
