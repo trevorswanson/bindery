@@ -3,33 +3,32 @@
 package api
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
 
-// TestConfirmedCrossDevice_SamePathNeverConfirmedCross verifies the
-// conservative default: two paths on the same device (the common case in
-// tests, and for the tracked-file stat sweep's own root) are never falsely
-// reported as confirmed cross-device (#2480).
-func TestConfirmedCrossDevice_SamePathNeverConfirmedCross(t *testing.T) {
+// TestDeviceIDOf_MatchesDeviceID verifies deviceIDOf, given an os.FileInfo the
+// caller already has, agrees with deviceID stat'ing the same path fresh — the
+// manual-import scan's tracked-file rebuild (#2480 review) relies on reading
+// the device id off a FileInfo it already stat'd instead of stat'ing again.
+func TestDeviceIDOf_MatchesDeviceID(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	a := filepath.Join(root, "a.epub")
-	b := filepath.Join(root, "b.epub")
 	writeTestFile(t, a)
-	writeTestFile(t, b)
 
-	if confirmedCrossDevice(a, b) {
-		t.Error("two paths under the same tempdir should share a device")
+	fi, err := os.Stat(a)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
 	}
-	if confirmedCrossDevice("", b) {
-		t.Error("empty path should not be confirmed cross-device")
+	fromInfo, okInfo := deviceIDOf(fi)
+	fromPath, okPath := deviceID(a)
+	if !okInfo || !okPath {
+		t.Fatalf("expected both to resolve, got okInfo=%v okPath=%v", okInfo, okPath)
 	}
-	if confirmedCrossDevice(a, filepath.Join(root, "missing.epub")) {
-		t.Error("a path whose nearest existing ancestor is still on the same device should not be confirmed cross-device")
-	}
-	if confirmedCrossDevice(filepath.Join(root, "missing-a.epub"), b) {
-		t.Error("stat error on a should report false, not a false positive")
+	if fromInfo != fromPath {
+		t.Errorf("deviceIDOf(stat) = %d, deviceID(path) = %d, want equal", fromInfo, fromPath)
 	}
 }
 

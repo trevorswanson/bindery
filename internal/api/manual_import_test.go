@@ -1584,16 +1584,74 @@ func TestManualImportScan_IncludeImportedSurfacesTrackedUnits(t *testing.T) {
 	}
 }
 
+// TestManualImportScan_RevealsFileAfterBookDeletedByCascade is the maintainer
+// review repro for #2480: a tracked-file cache keyed on an in-process counter
+// that only BookFileRepo's own methods bumped went stale the moment a
+// book_files row disappeared some other way. Deleting a book removes its
+// book_files rows via the books(id) ON DELETE CASCADE FK (BookRepo.Delete),
+// never touching BookFileRepo directly, so the file scan hid forever even
+// though nothing tracks it anymore. The fix reads a fingerprint off the table
+// itself instead of trusting a counter to have seen every mutation.
+func TestManualImportScan_RevealsFileAfterBookDeletedByCascade(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	ctx := context.Background()
+	authors := db.NewAuthorRepo(database)
+	books := db.NewBookRepo(database)
+	downloads := db.NewDownloadRepo(database)
+	trackedBook := seedBook(t, authors, books, ctx)
+	root := t.TempDir()
+	tracked := filepath.Join(root, "tracked.epub")
+	writeTestFile(t, tracked)
+	if err := books.AddBookFile(ctx, trackedBook.ID, models.MediaTypeEbook, tracked); err != nil {
+		t.Fatalf("attach tracked file: %v", err)
+	}
+
+	stub := &stubManualImportScanner{lookupResult: importer.LookupResult{Match: "none"}}
+	h := NewManualImportHandler(stub, downloads, books).WithRoots(NewLibraryRoots(nil, root))
+
+	rec := httptest.NewRecorder()
+	h.Scan(rec, scanRequest(root))
+	var resp ScanResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Items) != 0 {
+		t.Fatalf("before delete: items = %+v, want the tracked file hidden", resp.Items)
+	}
+
+	// Delete the book, keeping the file on disk. book_files loses its row
+	// through the FK cascade, not through any BookFileRepo call.
+	if err := books.Delete(ctx, trackedBook.ID); err != nil {
+		t.Fatalf("delete book: %v", err)
+	}
+
+	rec2 := httptest.NewRecorder()
+	h.Scan(rec2, scanRequest(root))
+	var resp2 ScanResponse
+	if err := json.Unmarshal(rec2.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp2.Items) != 1 || resp2.Items[0].Path != tracked {
+		t.Fatalf("after delete: items = %+v, want the orphaned file surfaced", resp2.Items)
+	}
+}
+
 // TestManualImportHandler_TrackedFileIndex_CachesUntilBookFilesChange
 // verifies the tracked-file index is rebuilt only when book_files actually
-// changes (#2480): closing the database between two calls that see no
-// intervening write must not error, proving the second call served the
-// cached index rather than re-querying a now-closed DB.
+// changes (#2480): mutating the map trackedFileIndex returns and calling it
+// again with no intervening write must still see that mutation, proving the
+// second call served the cached map rather than rebuilding a fresh one.
 func TestManualImportHandler_TrackedFileIndex_CachesUntilBookFilesChange(t *testing.T) {
 	database, err := db.OpenMemory()
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { database.Close() })
 	ctx := context.Background()
 	authors := db.NewAuthorRepo(database)
 	books := db.NewBookRepo(database)
@@ -1630,17 +1688,16 @@ func TestManualImportHandler_TrackedFileIndex_CachesUntilBookFilesChange(t *test
 		t.Fatalf("expected the newly tracked file to appear after a book_files write, got %v", set2)
 	}
 
-	// No further writes: closing the DB must not surface an error on the next
-	// call, since nothing changed and the cache should be reused as-is.
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
+	// No further writes: mark the returned map so a rebuild would lose the
+	// mark, then call again. Getting the mark back proves the exact same map
+	// was reused rather than rebuilt from a fresh query.
+	set2[filepath.Clean("/sentinel")] = struct{}{}
 	set3, _, err := h.trackedFileIndex(ctx, root)
 	if err != nil {
-		t.Fatalf("third trackedFileIndex should have served the cache without querying the closed DB: %v", err)
+		t.Fatalf("third trackedFileIndex: %v", err)
 	}
-	if len(set3) != len(set2) {
-		t.Errorf("cached set changed unexpectedly: %v vs %v", set2, set3)
+	if _, ok := set3[filepath.Clean("/sentinel")]; !ok {
+		t.Error("expected the cached map to be reused (same map) when book_files did not change")
 	}
 }
 

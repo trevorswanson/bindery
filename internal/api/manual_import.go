@@ -679,7 +679,13 @@ func (h *ManualImportHandler) Scan(w http.ResponseWriter, r *http.Request) {
 
 		for i, res := range results {
 			c := cands[i]
-			alreadyImported := isAlreadyTracked(c.path, c.isDir, tracked, trackedFiles)
+			// roundSkip (above) already dropped every isAlreadyTracked unit
+			// from cands when includeImported is off, so re-running it here
+			// would just recompute false for every survivor — only worth the
+			// call when includeImported means roundSkip did NOT do that
+			// filtering (#2480 review: this ran for every unit, in both
+			// modes, doubling the warm-cache stat count for no reason).
+			alreadyImported := includeImported && isAlreadyTracked(c.path, c.isDir, tracked, trackedFiles)
 			if !alreadyImported && res.Match == "confident" && res.Book != nil &&
 				bookHasImportedFormat(res.Book, res.DetectedFormat, filesByBook[res.Book.ID]) {
 				alreadyImported = true

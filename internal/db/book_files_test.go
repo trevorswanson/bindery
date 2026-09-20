@@ -279,74 +279,75 @@ func TestBookFileRepo_ListByBooks(t *testing.T) {
 	}
 }
 
-// TestBookFileRepo_Version verifies the version counter bumps on every
-// mutating method and is stable across pure reads (#2480: lets a cache
-// derived from book_files know cheaply, without a query, when it must
-// rebuild). Exercises BookFileRepo's own methods directly rather than going
-// through BookRepo, which owns a separate BookFileRepo instance (and so a
-// separate counter) internally.
-func TestBookFileRepo_Version(t *testing.T) {
+// TestBookFileRepo_Fingerprint verifies the (count, maxID) snapshot changes on
+// every mutating method, is stable across pure reads, and — the point of
+// reading it from the table rather than an in-process counter (#2480 review)
+// — also changes when a row disappears through a path that never goes through
+// BookFileRepo at all, such as the books(id) ON DELETE CASCADE FK a book
+// delete triggers.
+func TestBookFileRepo_Fingerprint(t *testing.T) {
 	database, _, book := openTestDB(t)
 	ctx := context.Background()
 	files := NewBookFileRepo(database)
+	books := NewBookRepo(database)
 
-	v0 := files.Version()
+	count0, maxID0, err := files.Fingerprint(ctx)
+	if err != nil {
+		t.Fatalf("Fingerprint: %v", err)
+	}
 
 	if err := files.Add(ctx, book.ID, models.MediaTypeEbook, "/lib/v.epub"); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	v1 := files.Version()
-	if v1 == v0 {
-		t.Errorf("Version did not change after Add: %d", v1)
+	count1, maxID1, err := files.Fingerprint(ctx)
+	if err != nil {
+		t.Fatalf("Fingerprint: %v", err)
+	}
+	if count1 == count0 && maxID1 == maxID0 {
+		t.Errorf("Fingerprint did not change after Add: (%d, %d)", count1, maxID1)
 	}
 
 	if _, err := files.ListByBook(ctx, book.ID); err != nil {
 		t.Fatalf("ListByBook: %v", err)
 	}
-	if files.Version() != v1 {
-		t.Errorf("Version changed on a pure read: %d -> %d", v1, files.Version())
+	if count2, maxID2, err := files.Fingerprint(ctx); err != nil {
+		t.Fatalf("Fingerprint: %v", err)
+	} else if count2 != count1 || maxID2 != maxID1 {
+		t.Errorf("Fingerprint changed on a pure read: (%d, %d) -> (%d, %d)", count1, maxID1, count2, maxID2)
 	}
 
 	if _, err := files.DeleteByPath(ctx, "/lib/v.epub"); err != nil {
 		t.Fatalf("DeleteByPath: %v", err)
 	}
-	v2 := files.Version()
-	if v2 == v1 {
-		t.Errorf("Version did not change after DeleteByPath: %d", v2)
+	count3, maxID3, err := files.Fingerprint(ctx)
+	if err != nil {
+		t.Fatalf("Fingerprint: %v", err)
+	}
+	if count3 == count1 && maxID3 == maxID1 {
+		t.Errorf("Fingerprint did not change after DeleteByPath: (%d, %d)", count3, maxID3)
 	}
 
-	_ = files.Add(ctx, book.ID, models.MediaTypeEbook, "/lib/v2.epub")
-	if err := files.DeleteByBook(ctx, book.ID); err != nil {
-		t.Fatalf("DeleteByBook: %v", err)
+	// A book delete removes book_files rows via ON DELETE CASCADE — not
+	// through any BookFileRepo method — which is exactly the path an
+	// in-process mutation counter cannot see (#2480 review repro: seed a
+	// tracked file, delete the book keeping the file, and the cache stayed
+	// stale). Reading the fingerprint from the table itself must still catch it.
+	if err := files.Add(ctx, book.ID, models.MediaTypeEbook, "/lib/v2.epub"); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
-	if files.Version() == v2 {
-		t.Errorf("Version did not change after DeleteByBook")
+	count4, maxID4, err := files.Fingerprint(ctx)
+	if err != nil {
+		t.Fatalf("Fingerprint: %v", err)
 	}
-}
-
-// TestBookRepo_BookFilesVersion verifies BookRepo.BookFilesVersion reflects
-// mutations made through BookRepo's own AddBookFile/RemoveBookFile methods
-// (#2480), which is the path ManualImportHandler's cache actually observes.
-func TestBookRepo_BookFilesVersion(t *testing.T) {
-	database, _, book := openTestDB(t)
-	ctx := context.Background()
-	repo := NewBookRepo(database)
-
-	v0 := repo.BookFilesVersion()
-
-	if err := repo.AddBookFile(ctx, book.ID, models.MediaTypeEbook, "/lib/bv.epub"); err != nil {
-		t.Fatalf("AddBookFile: %v", err)
+	if err := books.Delete(ctx, book.ID); err != nil {
+		t.Fatalf("Delete book: %v", err)
 	}
-	v1 := repo.BookFilesVersion()
-	if v1 == v0 {
-		t.Errorf("BookFilesVersion did not change after AddBookFile: %d", v1)
+	count5, maxID5, err := files.Fingerprint(ctx)
+	if err != nil {
+		t.Fatalf("Fingerprint: %v", err)
 	}
-
-	if _, err := repo.RemoveBookFile(ctx, "/lib/bv.epub"); err != nil {
-		t.Fatalf("RemoveBookFile: %v", err)
-	}
-	if repo.BookFilesVersion() == v1 {
-		t.Errorf("BookFilesVersion did not change after RemoveBookFile")
+	if count5 == count4 && maxID5 == maxID4 {
+		t.Errorf("Fingerprint did not change after the owning book was deleted (FK cascade): (%d, %d)", count5, maxID5)
 	}
 }
 

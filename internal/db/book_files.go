@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/vavallee/bindery/internal/models"
@@ -14,11 +13,6 @@ import (
 // BookFileRepo manages the book_files table.
 type BookFileRepo struct {
 	db *sql.DB
-	// version bumps on every mutation (Add, UpdatePath, DeleteByPath,
-	// DeleteByBook), so callers that cache a derived view of book_files (the
-	// manual-import scan's tracked-file index, #2480) can tell cheaply,
-	// without a query, whether that view is stale.
-	version atomic.Int64
 }
 
 // NewBookFileRepo creates a new BookFileRepo backed by the given database.
@@ -26,11 +20,28 @@ func NewBookFileRepo(db *sql.DB) *BookFileRepo {
 	return &BookFileRepo{db: db}
 }
 
-// Version returns a counter that increments on every book_files mutation made
-// through this repo (the only writer — see the mutating methods below). A
-// cache keyed on this value only needs to rebuild when it changes.
-func (r *BookFileRepo) Version() int64 {
-	return r.version.Load()
+// Fingerprint reads a cheap snapshot of book_files — its row count and its
+// highest id — for a cache keyed on the table's actual contents rather than a
+// counter this repo maintains itself (the manual-import scan's tracked-file
+// index, #2480).
+//
+// An earlier version of that cache was keyed on an atomic counter bumped by
+// this repo's own mutating methods, which went stale: book_files rows also
+// disappear through the books(id) ON DELETE CASCADE FK when a book or author
+// is deleted (BookRepo.Delete, AuthorRepo.Delete), and through
+// BookRepo.UntrackFilePath's rollback DELETE — neither goes through this repo,
+// so neither could bump its counter. Reading count+maxID directly from the
+// table instead catches every mutation regardless of which code path made it:
+// a row removed without a matching insert changes the count, and any insert
+// hands out a strictly larger AUTOINCREMENT id, so the pair only repeats when
+// nothing actually changed. The query is a single indexed aggregate, cheap
+// enough to run on every scan request.
+func (r *BookFileRepo) Fingerprint(ctx context.Context) (count int64, maxID int64, err error) {
+	err = r.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(id), 0) FROM book_files`).Scan(&count, &maxID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("book_files fingerprint: %w", err)
+	}
+	return count, maxID, nil
 }
 
 // Add inserts a book_files row. Duplicate paths are silently ignored (INSERT OR IGNORE).
@@ -42,7 +53,6 @@ func (r *BookFileRepo) Add(ctx context.Context, bookID int64, format, path strin
 	if err != nil {
 		return fmt.Errorf("book_files add: %w", err)
 	}
-	r.version.Add(1)
 	return nil
 }
 
@@ -87,7 +97,6 @@ func (r *BookFileRepo) UpdatePath(ctx context.Context, id int64, newPath string)
 	if n == 0 {
 		return fmt.Errorf("book_files update path: no row with id %d", id)
 	}
-	r.version.Add(1)
 	return nil
 }
 
@@ -169,7 +178,6 @@ func (r *BookFileRepo) DeleteByBook(ctx context.Context, bookID int64) error {
 	if err != nil {
 		return fmt.Errorf("book_files delete by book: %w", err)
 	}
-	r.version.Add(1)
 	return nil
 }
 
@@ -188,7 +196,6 @@ func (r *BookFileRepo) DeleteByPath(ctx context.Context, path string) (int64, er
 	if _, err := r.db.ExecContext(ctx, `DELETE FROM book_files WHERE path = ?`, path); err != nil {
 		return 0, fmt.Errorf("book_files delete by path: %w", err)
 	}
-	r.version.Add(1)
 	return bookID, nil
 }
 
