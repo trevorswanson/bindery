@@ -1726,6 +1726,133 @@ func TestManualImportScan_SeesReorganizeMoveBetweenScans(t *testing.T) {
 	}
 }
 
+// TestManualImportScan_ReusedInodeIsNotTreatedAsTracked covers a hazard the
+// tracked-file cache (#2480) introduced. The cache keeps the os.FileInfo of
+// every tracked file so hardlinks can be spotted with os.SameFile, which
+// compares device and inode only. If a tracked file is deleted outside
+// Bindery (its book_files row stays, so the cache is not rebuilt) the
+// filesystem is free to hand that inode to the next file created, and ext4
+// does so immediately. The typical trigger is deleting a corrupt library copy
+// and downloading a fresh one: the fresh file then matched the stale FileInfo
+// and was hidden as already imported. A real hardlink shares the inode's size
+// and mtime as well, so requiring those to match too keeps hardlink detection
+// while rejecting a recycled inode.
+func TestManualImportScan_ReusedInodeIsNotTreatedAsTracked(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	ctx := context.Background()
+	authors := db.NewAuthorRepo(database)
+	books := db.NewBookRepo(database)
+	downloads := db.NewDownloadRepo(database)
+	trackedBook := seedBook(t, authors, books, ctx)
+	root := t.TempDir()
+	libDir := filepath.Join(root, "library")
+	dlDir := filepath.Join(root, "downloads")
+	if err := os.MkdirAll(libDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dlDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tracked := filepath.Join(libDir, "corrupt.epub")
+	writeTestFile(t, tracked)
+	if err := books.AddBookFile(ctx, trackedBook.ID, models.MediaTypeEbook, tracked); err != nil {
+		t.Fatalf("attach tracked file: %v", err)
+	}
+	trackedInfo, err := os.Stat(tracked)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stub := &stubManualImportScanner{lookupResult: importer.LookupResult{Match: "none"}}
+	h := NewManualImportHandler(stub, downloads, books).WithRoots(NewLibraryRoots(nil, root))
+
+	scan := func() []string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.Scan(rec, scanRequest(dlDir))
+		var resp ScanResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+		}
+		paths := make([]string, 0, len(resp.Items))
+		for _, it := range resp.Items {
+			paths = append(paths, it.Path)
+		}
+		return paths
+	}
+	if got := scan(); len(got) != 0 {
+		t.Fatalf("empty downloads folder: items = %v", got)
+	}
+
+	// The user deletes the corrupt library copy by hand and a fresh download
+	// arrives. book_files is untouched, so the cache is not rebuilt.
+	if err := os.Remove(tracked); err != nil {
+		t.Fatal(err)
+	}
+	fresh := filepath.Join(dlDir, "fresh.epub")
+	time.Sleep(10 * time.Millisecond) // a distinct mtime, as any real download has
+	if err := os.WriteFile(fresh, []byte("a good copy of the book"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if freshInfo, err := os.Stat(fresh); err == nil && os.SameFile(freshInfo, trackedInfo) {
+		t.Logf("inode %v was recycled for the fresh download", freshInfo.Sys())
+	} else {
+		t.Logf("filesystem did not recycle the inode; this run does not exercise the hazard")
+	}
+
+	if got := scan(); len(got) != 1 || got[0] != fresh {
+		t.Fatalf("items = %v, want the fresh download %q surfaced", got, fresh)
+	}
+}
+
+// TestManualImportScan_TrackedPathMissingAtRebuildStillHidden pins the exact
+// path half of isAlreadyTracked. A tracked file whose stat failed when the
+// index was built (an NFS mount that was briefly away, say) has no FileInfo
+// for hardlink matching, so once it is back on disk only the path set keeps
+// it from being offered for import again.
+func TestManualImportScan_TrackedPathMissingAtRebuildStillHidden(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	ctx := context.Background()
+	authors := db.NewAuthorRepo(database)
+	books := db.NewBookRepo(database)
+	downloads := db.NewDownloadRepo(database)
+	trackedBook := seedBook(t, authors, books, ctx)
+	root := t.TempDir()
+	tracked := filepath.Join(root, "away.epub")
+	if err := books.AddBookFile(ctx, trackedBook.ID, models.MediaTypeEbook, tracked); err != nil {
+		t.Fatalf("attach tracked file: %v", err)
+	}
+	stub := &stubManualImportScanner{lookupResult: importer.LookupResult{Match: "none"}}
+	h := NewManualImportHandler(stub, downloads, books).WithRoots(NewLibraryRoots(nil, root))
+
+	rec := httptest.NewRecorder()
+	h.Scan(rec, scanRequest(root)) // builds the index while the file is absent
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first scan: %d %s", rec.Code, rec.Body.String())
+	}
+
+	writeTestFile(t, tracked) // the mount comes back
+	rec2 := httptest.NewRecorder()
+	h.Scan(rec2, scanRequest(root))
+	var resp ScanResponse
+	if err := json.Unmarshal(rec2.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Items) != 0 {
+		t.Fatalf("items = %+v, want the tracked file hidden by its exact path", resp.Items)
+	}
+}
+
 // TestManualImportHandler_TrackedFileIndex_CachesUntilBookFilesChange
 // verifies the tracked-file index is rebuilt only when book_files actually
 // changes (#2480): mutating the map trackedFileIndex returns and calling it

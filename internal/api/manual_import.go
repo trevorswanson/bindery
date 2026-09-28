@@ -438,13 +438,24 @@ func (h *ManualImportHandler) removeStaleSource(ctx context.Context, src string,
 // file already registered in book_files. Imports may hard-link the source into
 // its canonical library destination, so comparing path strings alone is not
 // sufficient to keep a repeated scan from presenting the same file again.
+//
+// tracked comes from a cache (trackedFileIndex) that is only rebuilt when
+// book_files changes, and os.SameFile compares device and inode alone. When a
+// tracked file is deleted outside Bindery its row stays, the cache keeps its
+// old FileInfo, and ext4 hands the freed inode straight to the next new file,
+// so a fresh download could be hidden as already imported. A genuine hardlink
+// shares the inode's size and mtime too, so those must also agree. A tracked
+// file modified in place since the cache was built then shows as importable,
+// which is the safe way to be wrong.
 func fileMatchesTracked(path string, tracked []os.FileInfo) bool {
 	info, err := os.Stat(path)
 	if err != nil {
 		return false
 	}
 	for _, trackedInfo := range tracked {
-		if os.SameFile(info, trackedInfo) {
+		if os.SameFile(info, trackedInfo) &&
+			info.Size() == trackedInfo.Size() &&
+			info.ModTime().Equal(trackedInfo.ModTime()) {
 			return true
 		}
 	}
