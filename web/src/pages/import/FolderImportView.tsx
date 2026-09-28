@@ -126,7 +126,7 @@ export default function FolderImportView() {
     <div>
       <div className="flex items-center gap-3 mb-4">
         <p className="text-sm text-slate-600 dark:text-zinc-400">
-          {t('manualImport.description', 'Scan a folder of files already on disk, match each book to your library, and import them. A file with no match can be added from a metadata search.')}
+          {t('manualImport.description', 'Scan a folder of files anywhere on disk, match each book to one already in your catalogue, and import it into your library. Matching is against your catalogue, so add the author first if they are not in Bindery yet. A file with no match can be added from a metadata search.')}
         </p>
         <label className="ml-auto flex items-center gap-1.5 text-xs text-slate-600 dark:text-zinc-400 cursor-pointer select-none">
           <input

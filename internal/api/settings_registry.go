@@ -272,7 +272,7 @@ var settingDescriptors = []SettingDescriptor{
 	},
 	{
 		Key: SettingCWAIngestPath, Type: SettingTypeString, Default: "",
-		Description: "Calibre Web Automated ingest directory that every successful import is mirrored into. Empty disables the mirror.",
+		Description: "Calibre Web Automated ingest directory that every successful ebook import is copied into. Audiobooks are not mirrored. Empty disables the mirror.",
 		State:       SettingStateActive,
 	},
 
@@ -306,6 +306,12 @@ var settingDescriptors = []SettingDescriptor{
 	{
 		Key: SettingCalibrePluginAPIKey, Type: SettingTypeString, Default: "",
 		Description: "API key the Calibre plugin expects. Stored but never read back over the settings API.",
+		State:       SettingStateActive,
+	},
+	{
+		Key: SettingCalibrePluginTransport, Type: SettingTypeEnum, Default: "push",
+		Values:      []string{"push", "pull"},
+		Description: "In plugin mode, which side connects: push has Bindery send books to the plugin, pull has the plugin fetch them from Bindery's /bridge/v1 routes using the plugin API key.",
 		State:       SettingStateActive,
 	},
 	{

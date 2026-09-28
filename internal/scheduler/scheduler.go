@@ -34,6 +34,13 @@ type CalibreSyncer interface {
 	RunSync(ctx context.Context)
 }
 
+// CalibreDeliverer runs one pass of the Calibre delivery queue (#2832).
+// Implemented by *calibre.Deliverer. A pass returns at once when another is
+// already running, so the tick and an import's kick never overlap.
+type CalibreDeliverer interface {
+	RunDeliveries(ctx context.Context)
+}
+
 // bookSearcher is the narrow interface the scheduler uses for indexer
 // searches. *indexer.Searcher satisfies it; the interface keeps the scheduler
 // testable without real network calls.
@@ -351,6 +358,20 @@ func (s *Scheduler) WithCalibreSyncer(syncer CalibreSyncer) {
 	s.calibreSyncer = syncer
 }
 
+// WithCalibreDeliverer registers the Calibre delivery job, every minute
+// under the name calibre-deliver. A pass with Calibre off, an empty queue or
+// an unreachable Calibre does nothing, so the short interval costs one local
+// query when idle. It is what delivers a book imported while Calibre was
+// closed once Calibre is back. A nil deliverer registers nothing.
+func (s *Scheduler) WithCalibreDeliverer(d CalibreDeliverer) {
+	if d == nil {
+		return
+	}
+	s.cron.AddFunc("@every 1m", runJob("calibre-deliver", func() {
+		d.RunDeliveries(s.ctx())
+	}))
+}
+
 // WithRecommender registers a recommendation engine that runs every 24 hours.
 // Must be called before Start.
 func (s *Scheduler) WithRecommender(engine RecommendationEngine) {
@@ -630,6 +651,13 @@ func (s *Scheduler) searchAndGrabFormats(ctx context.Context, book models.Book, 
 			"book_id", book.ID, "title", book.Title)
 		return
 	}
+	// An unmonitored author's books are never grabbed automatically (#2742).
+	// Enforced here for the same reason the switch above is: this is the one
+	// place a grab is dispatched from, so a new automatic caller inherits the
+	// rule rather than having to know it exists.
+	if s.skipUnmonitoredAuthor(ctx, book, sweep) {
+		return
+	}
 	for _, mediaType := range formats {
 		s.searchAndGrabFormat(ctx, book, mediaType, sweep)
 	}
@@ -655,6 +683,17 @@ type sweepContext struct {
 	blocklistLoaded bool
 	delayProfiles   []models.DelayProfile
 	preferredLang   string
+	// unmonitoredAuthors is the set of author ids whose monitored flag is off
+	// (#2742). Loaded with the rest so the author monitoring rule costs one
+	// query per sweep rather than one per wanted book, which is the whole
+	// point of this type.
+	//
+	// unmonitoredAuthorsLoaded separates "every author is monitored" from
+	// "the authors table could not be read", the same distinction
+	// blocklistLoaded makes: only the first may suppress a grab, because a
+	// failed read must not silently stop the sweep grabbing anything.
+	unmonitoredAuthors       map[int64]bool
+	unmonitoredAuthorsLoaded bool
 }
 
 // newSweepContext loads the sweep-invariant tables once. It returns nil when
@@ -686,8 +725,77 @@ func (s *Scheduler) newSweepContext(ctx context.Context) *sweepContext {
 			sweep.delayProfiles = profiles
 		}
 	}
+	if s.authors != nil {
+		if ids, err := s.authors.UnmonitoredAuthorIDs(ctx); err != nil {
+			slog.Warn("wanted sweep: failed to load unmonitored authors, falling back to a per-book load", "error", err)
+		} else {
+			sweep.unmonitoredAuthors = ids
+			sweep.unmonitoredAuthorsLoaded = true
+		}
+	}
 	sweep.preferredLang = s.loadPreferredLanguage(ctx)
 	return sweep
+}
+
+// skipUnmonitoredAuthor reports whether this search must not run because the
+// book's author is not monitored, and logs the reason when it does.
+//
+// Two rules meet here, and both are load bearing:
+//
+//   - Only an automatic search is suppressed. SearchOrigin.Automatic draws
+//     that line, and a search the user asked for by name still runs, so
+//     unmonitoring an author never breaks "search this book now".
+//   - The author flag wins outright, whatever the book's own monitored flag
+//     says. That is the #2742 report: a bulk unmonitor on the Authors page
+//     wrote the author flag and never cascaded to the books, so every book
+//     under those 200 authors was still monitored and the sweep kept grabbing.
+//     Reading the author directly means a stale or partly cascaded state
+//     cannot grab either.
+//
+// It fails open, like autoGrabEnabled: no authors repo, an unreadable row, or
+// a book whose author has gone all keep searching. Closing on a failed read
+// would turn one bad query into a library that silently stops grabbing, which
+// is a worse failure than the one this fixes.
+func (s *Scheduler) skipUnmonitoredAuthor(ctx context.Context, book models.Book, sweep *sweepContext) bool {
+	if !indexer.SearchOriginFrom(ctx).Automatic() {
+		return false
+	}
+	name, unmonitored := s.authorMonitorState(ctx, book, sweep)
+	if !unmonitored {
+		return false
+	}
+	slog.Info("skipping automatic search: the author is not monitored",
+		"book_id", book.ID, "title", book.Title, "author", name,
+		"origin", string(indexer.SearchOriginFrom(ctx)), "issue", 2742)
+	return true
+}
+
+// authorMonitorState answers "is this book's author unmonitored", plus the
+// author name for the log line. The sweep snapshot answers it without a query
+// when there is one; a one-off search loads the single author it needs.
+func (s *Scheduler) authorMonitorState(ctx context.Context, book models.Book, sweep *sweepContext) (string, bool) {
+	name := ""
+	if book.Author != nil {
+		name = book.Author.Name
+	}
+	if sweep != nil && sweep.unmonitoredAuthorsLoaded {
+		return name, sweep.unmonitoredAuthors[book.AuthorID]
+	}
+	if s.authors == nil {
+		return name, false
+	}
+	author, err := s.authors.GetByID(ctx, book.AuthorID)
+	if err != nil {
+		slog.Warn("failed to load the author for a search, allowing it", "book_id", book.ID, "author_id", book.AuthorID, "error", err)
+		return name, false
+	}
+	if author == nil {
+		return name, false
+	}
+	if name == "" {
+		name = author.Name
+	}
+	return name, !author.Monitored
 }
 
 // sweepIndexers returns the indexer list for one search: the sweep snapshot
@@ -899,6 +1007,10 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		ASIN:             book.ASIN,
 		AuthorAliases:    authorAliases,
 		AllowedLanguages: allowedLangs,
+		// Ranked by the profile's order (#2733). The grab below takes the
+		// first approved release in ranked order, so this is what decides
+		// which format the sweep picks.
+		Profile: qualityProfile,
 	}
 	if book.ReleaseDate != nil {
 		crit.Year = book.ReleaseDate.Year()
@@ -962,7 +1074,7 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	// a release rejected here keeps failing re-evaluation instead of being
 	// grabbed on a later sweep.
 	if qualityProfile != nil {
-		specs = append(specs, decision.QualityAllowed{Profile: qualityProfile})
+		specs = append(specs, decision.QualityAllowed{Profile: qualityProfile, MediaType: mediaType})
 	}
 	var delayProfile *models.DelayProfile
 	if profiles := s.sweepDelayProfiles(ctx, sweep); len(profiles) > 0 {
@@ -1061,14 +1173,22 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		outcome = "duplicate check failed"
 		return
 	}
-	// Only an import whose book has since been deleted is reused (#2289):
-	// without this, a book deleted and added back never grabs its old release
-	// automatically when that release ranks first. A failed or blocked row is
-	// different. It is a release that already went wrong once, and while a
-	// user clicking Grab may try it again, the scheduler would pick it on
-	// every sweep and loop on it, so it stays skipped here.
-	if existing != nil && !existing.IsOrphanedImport() {
-		outcome = "already grabbed"
+	// Live work blocks the grab; a failed attempt does not (#2710). A failed
+	// row is reused once deadRegrabCooldown has passed since it died, and an
+	// import whose book has since been deleted is reused whatever its age
+	// (#2289). An importBlocked row is left to the manual grab and the
+	// queue's Retry import. blockingRegrabReason decides, and names the reason
+	// so the skip is not silent: the "auto-grabbing book" line above has
+	// already been written by now.
+	if reason := blockingRegrabReason(existing, time.Now().UTC()); reason != "" {
+		outcome = reason + " (" + string(existing.Status) + ")"
+		slog.Info("skipping a release the queue still holds",
+			"book", book.Title,
+			"release", best.Title,
+			"guid", best.GUID,
+			"existing_status", string(existing.Status),
+			"existing_download_id", existing.ID,
+			"reason", reason)
 		return
 	}
 
@@ -1087,21 +1207,23 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	}
 
 	if existing != nil {
-		// RetryOrphanedImport resets every per grab column, owner and
-		// import_path included, and claims the row only while it is still an
-		// orphaned import. A manual grab that claimed it first turns this into
-		// a skip, including one that has since failed: the failed or
-		// importBlocked row it leaves is not reclaimed here, as RetryFailed
-		// would do.
+		// RetryDeadForAutoGrab resets every per grab column, owner and
+		// import_path included, so the reused row carries nothing of the
+		// attempt it replaces, and the history row and the queue entry below
+		// describe this grab alone. It re-checks the same conditions in SQL,
+		// so a row a manual grab claimed between the read above and here is a
+		// skip rather than a second send to the client.
 		dl.ID = existing.ID
-		ok, err := s.downloads.RetryOrphanedImport(ctx, dl)
+		ok, err := claimDeadRowForAutoGrab(ctx, s.downloads, dl, time.Now().UTC().Add(-deadRegrabCooldown))
 		if err != nil {
 			slog.Error("SearchAndGrabBook: failed to reuse download record", "download_id", existing.ID, "error", err)
 			outcome = "download record failed"
 			return
 		}
 		if !ok {
-			outcome = "already grabbed"
+			slog.Info("a concurrent grab claimed the release first",
+				"book", book.Title, "guid", best.GUID, "existing_download_id", existing.ID)
+			outcome = "claimed by another grab"
 			return
 		}
 	} else if err := s.downloads.Create(ctx, dl); err != nil {
