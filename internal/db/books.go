@@ -909,6 +909,13 @@ func (r *BookRepo) BookFilesFingerprint(ctx context.Context) (int64, int64, erro
 	return r.files.Fingerprint(ctx)
 }
 
+// BookFilesPathEpoch returns the in place path rewrite counter for book_files
+// (see BookFileRepo.PathEpoch). Fingerprint alone misses the reorganize
+// action's UpdatePath, which changes neither the row count nor the max id.
+func (r *BookRepo) BookFilesPathEpoch() uint64 {
+	return r.files.PathEpoch()
+}
+
 // ListFilesForBooks returns every book_files row for the given book IDs in a
 // single query, grouped by book_id. Replaces an N+1 ListFiles-per-book call
 // (the manual-import scan's confident-match format check, #2480).

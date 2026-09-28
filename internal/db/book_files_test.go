@@ -406,3 +406,51 @@ func TestBookRepo_RemoveBookFile_StatusFlips(t *testing.T) {
 		t.Errorf("EbookFilePath should be cleared, got %q", got2.EbookFilePath)
 	}
 }
+
+// TestBookFileRepo_PathEpoch pins the half of the #2480 cache key that
+// Fingerprint cannot provide: UpdatePath rewrites a row in place, leaving
+// (count, maxID) untouched, so it must bump the epoch instead. The epoch is
+// per database, not per repo, because reorganize and the manual-import scan
+// reach book_files through different repo instances; and a failed UpdatePath
+// changes nothing, so it must not force a rebuild.
+func TestBookFileRepo_PathEpoch(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	writer := NewBookFileRepo(database)
+	reader := NewBookRepo(database)
+
+	if err := writer.Add(ctx, book.ID, models.MediaTypeEbook, "/lib/old.epub"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	rows, err := writer.ListByBook(ctx, book.ID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("ListByBook: %v (%d rows)", err, len(rows))
+	}
+	count0, maxID0, err := writer.Fingerprint(ctx)
+	if err != nil {
+		t.Fatalf("Fingerprint: %v", err)
+	}
+	epoch0 := reader.BookFilesPathEpoch()
+
+	if err := writer.UpdatePath(ctx, rows[0].ID, "/lib/new.epub"); err != nil {
+		t.Fatalf("UpdatePath: %v", err)
+	}
+	count1, maxID1, err := writer.Fingerprint(ctx)
+	if err != nil {
+		t.Fatalf("Fingerprint: %v", err)
+	}
+	if count1 != count0 || maxID1 != maxID0 {
+		t.Fatalf("premise: UpdatePath changed the fingerprint (%d,%d) -> (%d,%d); the epoch would be redundant", count0, maxID0, count1, maxID1)
+	}
+	epoch1 := reader.BookFilesPathEpoch()
+	if epoch1 == epoch0 {
+		t.Fatalf("PathEpoch did not change after UpdatePath through another repo instance (still %d)", epoch1)
+	}
+
+	if err := writer.UpdatePath(ctx, rows[0].ID+999, "/lib/nowhere.epub"); err == nil {
+		t.Fatal("UpdatePath on a missing row: want error")
+	}
+	if got := reader.BookFilesPathEpoch(); got != epoch1 {
+		t.Errorf("PathEpoch moved on a failed UpdatePath: %d -> %d", epoch1, got)
+	}
+}

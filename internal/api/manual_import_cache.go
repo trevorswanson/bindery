@@ -26,6 +26,7 @@ type trackedFileCache struct {
 
 	count        int64
 	maxID        int64
+	pathEpoch    uint64
 	rootDevID    uint64
 	rootDevKnown bool
 	tracked      map[string]struct{}
@@ -35,7 +36,9 @@ type trackedFileCache struct {
 // trackedFileIndex returns the current already-tracked path set and the
 // os.FileInfo values needed for hardlink detection against scanRoot,
 // rebuilding only when book_files has changed since the last build (per
-// BookRepo.BookFilesFingerprint) or scanRoot's device differs from the one
+// BookRepo.BookFilesFingerprint for inserts and deletes, and
+// BookRepo.BookFilesPathEpoch for the reorganize action's in place path
+// rewrites, which the fingerprint cannot see) or scanRoot's device differs from the one
 // the cached index was built for.
 //
 // A tracked path on a different device than scanRoot can never be a hardlink
@@ -52,6 +55,9 @@ type trackedFileCache struct {
 // build its FileInfo, so a cold rebuild costs exactly one stat per tracked row
 // (plus the directory walk for a genuine tracked folder), not up to five.
 func (h *ManualImportHandler) trackedFileIndex(ctx context.Context, scanRoot string) (map[string]struct{}, []os.FileInfo, error) {
+	// Read the rename epoch first so a reorganize racing this rebuild can only
+	// make the next call rebuild again, never leave a stale path cached.
+	pathEpoch := h.books.BookFilesPathEpoch()
 	count, maxID, err := h.books.BookFilesFingerprint(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -62,7 +68,7 @@ func (h *ManualImportHandler) trackedFileIndex(ctx context.Context, scanRoot str
 	defer h.trackedCache.mu.Unlock()
 
 	c := &h.trackedCache
-	if c.tracked != nil && c.count == count && c.maxID == maxID && c.rootDevID == rootDevID && c.rootDevKnown == rootDevKnown {
+	if c.tracked != nil && c.count == count && c.maxID == maxID && c.pathEpoch == pathEpoch && c.rootDevID == rootDevID && c.rootDevKnown == rootDevKnown {
 		return c.tracked, c.trackedFiles, nil
 	}
 
@@ -101,6 +107,7 @@ func (h *ManualImportHandler) trackedFileIndex(ctx context.Context, scanRoot str
 
 	c.count = count
 	c.maxID = maxID
+	c.pathEpoch = pathEpoch
 	c.rootDevID = rootDevID
 	c.rootDevKnown = rootDevKnown
 	c.tracked = tracked

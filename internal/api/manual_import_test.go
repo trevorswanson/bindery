@@ -1641,6 +1641,91 @@ func TestManualImportScan_RevealsFileAfterBookDeletedByCascade(t *testing.T) {
 	}
 }
 
+// TestManualImportScan_SeesReorganizeMoveBetweenScans pins the second #2480
+// review finding: a (COUNT, MAX(id)) fingerprint cannot see an in place
+// UPDATE of book_files.path, and the library reorganize action does exactly
+// that through UpdateBookFilePath. Without a rename aware cache key the second
+// scan reuses the first scan's index, so a fresh file that lands at the old
+// path stays hidden and the moved file at its new path is offered for import
+// again. The move is done as copy then remove so the new path gets a new
+// inode, the way a cross device reorganize does, and hardlink detection
+// cannot paper over the stale path set. The rename goes through a separate
+// BookRepo, as reorganize does in production.
+func TestManualImportScan_SeesReorganizeMoveBetweenScans(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	ctx := context.Background()
+	authors := db.NewAuthorRepo(database)
+	books := db.NewBookRepo(database)
+	downloads := db.NewDownloadRepo(database)
+	trackedBook := seedBook(t, authors, books, ctx)
+	root := t.TempDir()
+	oldPath := filepath.Join(root, "old.epub")
+	newPath := filepath.Join(root, "Author", "new.epub")
+	writeTestFile(t, oldPath)
+	if err := books.AddBookFile(ctx, trackedBook.ID, models.MediaTypeEbook, oldPath); err != nil {
+		t.Fatalf("attach tracked file: %v", err)
+	}
+	files, err := books.ListBookFiles(ctx, trackedBook.ID)
+	if err != nil || len(files) != 1 {
+		t.Fatalf("list book files: %v (%d rows)", err, len(files))
+	}
+
+	stub := &stubManualImportScanner{lookupResult: importer.LookupResult{Match: "none"}}
+	h := NewManualImportHandler(stub, downloads, books).WithRoots(NewLibraryRoots(nil, root))
+
+	scan := func() []string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.Scan(rec, scanRequest(root))
+		var resp ScanResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+		}
+		paths := make([]string, 0, len(resp.Items))
+		for _, it := range resp.Items {
+			paths = append(paths, it.Path)
+		}
+		return paths
+	}
+
+	if got := scan(); len(got) != 0 {
+		t.Fatalf("before move: items = %v, want the tracked file hidden", got)
+	}
+
+	// Reorganize: copy to the new location (new inode), remove the old file,
+	// then repoint the row in place. Count and max id are unchanged.
+	data, err := os.ReadFile(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(oldPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.NewBookRepo(database).UpdateBookFilePath(ctx, files[0].ID, trackedBook.ID, newPath); err != nil {
+		t.Fatalf("update book file path: %v", err)
+	}
+	// A new, untracked download lands where the old file used to be.
+	if err := os.WriteFile(oldPath, []byte("a different book"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := scan()
+	if len(got) != 1 || got[0] != oldPath {
+		t.Fatalf("after move: items = %v, want only the new file at the old path %q (moved file at %q must stay hidden)", got, oldPath, newPath)
+	}
+}
+
 // TestManualImportHandler_TrackedFileIndex_CachesUntilBookFilesChange
 // verifies the tracked-file index is rebuilt only when book_files actually
 // changes (#2480): mutating the map trackedFileIndex returns and calling it

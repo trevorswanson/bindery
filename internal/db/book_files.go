@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vavallee/bindery/internal/models"
@@ -42,6 +44,29 @@ func (r *BookFileRepo) Fingerprint(ctx context.Context) (count int64, maxID int6
 		return 0, 0, fmt.Errorf("book_files fingerprint: %w", err)
 	}
 	return count, maxID, nil
+}
+
+// pathEpochs holds one counter per database, bumped by every in place rewrite
+// of book_files.path (UpdatePath). Fingerprint's (count, maxID) pair catches
+// inserts and deletes however they happen, including the FK cascade, but an
+// UPDATE changes neither number, so the manual-import scan's tracked-file
+// cache (#2480) keys on this as well. It is keyed by *sql.DB rather than held
+// on the repo because production builds more than one BookFileRepo over the
+// same database (BookRepo owns one, the importer wiring another), and the
+// rename has to be visible to every reader regardless of which one wrote it.
+var pathEpochs sync.Map // *sql.DB -> *atomic.Uint64
+
+func pathEpochFor(db *sql.DB) *atomic.Uint64 {
+	v, _ := pathEpochs.LoadOrStore(db, new(atomic.Uint64))
+	return v.(*atomic.Uint64)
+}
+
+// PathEpoch returns the in place path rewrite counter for this database. Read
+// it before Fingerprint and the rows a cache is built from: a rename that
+// lands mid rebuild then shows up as a changed epoch on the next read, so the
+// cache errs toward rebuilding, never toward serving a stale path.
+func (r *BookFileRepo) PathEpoch() uint64 {
+	return pathEpochFor(r.db).Load()
 }
 
 // Add inserts a book_files row. Duplicate paths are silently ignored (INSERT OR IGNORE).
@@ -97,6 +122,7 @@ func (r *BookFileRepo) UpdatePath(ctx context.Context, id int64, newPath string)
 	if n == 0 {
 		return fmt.Errorf("book_files update path: no row with id %d", id)
 	}
+	pathEpochFor(r.db).Add(1)
 	return nil
 }
 
