@@ -284,8 +284,23 @@ describe('FolderImportView', () => {
     fireEvent.change(screen.getByPlaceholderText('manualImport.pathPlaceholder'), { target: { value: '/dl' } })
     fireEvent.click(screen.getByText('manualImport.scan'))
 
-    await waitFor(() => expect(screen.getByText('manualImport.empty')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('manualImport.emptyHidesImported')).toBeInTheDocument())
     expect(screen.getByText('manualImport.truncated')).toBeInTheDocument()
+  })
+
+  it('says already imported files are hidden rather than calling the folder empty (#2480)', async () => {
+    mockScan.mockResolvedValue({ truncated: false, items: [] })
+    render(<FolderImportView />)
+    fireEvent.change(screen.getByPlaceholderText('manualImport.pathPlaceholder'), { target: { value: '/dl' } })
+    fireEvent.click(screen.getByText('manualImport.scan'))
+
+    await waitFor(() => expect(screen.getByText('manualImport.emptyHidesImported')).toBeInTheDocument())
+    expect(screen.queryByText('manualImport.empty')).not.toBeInTheDocument()
+
+    // With nothing filtered, an empty result really is an empty folder.
+    fireEvent.click(screen.getByLabelText('manualImport.showImported'))
+    await waitFor(() => expect(screen.getByText('manualImport.empty')).toBeInTheDocument())
+    expect(screen.queryByText('manualImport.emptyHidesImported')).not.toBeInTheDocument()
   })
 
   it('clears a stale truncation banner once a later scan reports untruncated', async () => {

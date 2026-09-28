@@ -116,6 +116,7 @@
     "scan": "Scan folder",
     "scanning": "Scanning…",
     "empty": "No book files or folders found here.",
+    "emptyHidesImported": "Nothing new to import here. Files already in your library are hidden; tick Show already imported to list them.",
     "truncated": "Showing the first 1000 units; narrow the folder to see the rest.",
     "showImported": "Show already imported",
     "alreadyImported": "already imported",
