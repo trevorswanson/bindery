@@ -1,9 +1,9 @@
 import { useEffect } from 'react'
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router'
 import AuthorDetailPage from './AuthorDetailPage'
-import { api } from '../api/client'
+import { api, ApiError } from '../api/client'
 import type { Author, Book } from '../api/client'
 import '../i18n'
 import { acceptConfirm, cancelConfirm, confirmDialog } from '../test-utils'
@@ -94,13 +94,36 @@ function LocationProbe({ onLocation }: { onLocation?: (location: string) => void
   return null
 }
 
-function renderAuthorDetailPage(books: Book[], view: 'grid' | 'table' = 'grid', authorOverride: Partial<Author> = {}, initialPath = '/author/42', onLocation?: (location: string) => void) {
+type NavEntry = string | { pathname: string; state?: unknown }
+
+// Unlike LocationProbe above, this also exposes router `state` — needed to
+// verify the {ids, index} payload a book link/row carries, not just where it
+// points.
+function StateProbe({ onState }: { onState: (state: unknown) => void }) {
+  const location = useLocation()
+  useEffect(() => {
+    onState(location.state)
+  }, [location, onState])
+  return null
+}
+
+function renderAuthorDetailPage(
+  books: Book[],
+  view: 'grid' | 'table' = 'grid',
+  authorOverride: Partial<Author> = {},
+  initialPath: NavEntry | NavEntry[] = '/author/42',
+  onLocation?: (location: string) => void,
+) {
   localStorage.setItem('bindery.view.author-detail', view)
   vi.mocked(api.getAuthor).mockResolvedValue({ ...author, ...authorOverride })
   vi.mocked(api.listAllBooks).mockResolvedValue(books)
 
+  // A multi-entry array simulates real browser history (e.g. arriving from
+  // the Books list) so Back's navigate(-1) fallback has somewhere to land.
+  const initialEntries = Array.isArray(initialPath) ? initialPath : [initialPath]
+
   return render(
-    <MemoryRouter initialEntries={[initialPath]}>
+    <MemoryRouter initialEntries={initialEntries} initialIndex={initialEntries.length - 1}>
       <LocationProbe onLocation={onLocation} />
       <Routes>
         <Route path="/author/:id" element={<AuthorDetailPage />} />
@@ -253,6 +276,23 @@ describe('AuthorDetailPage', () => {
     await waitFor(() => expect(api.searchAuthorWanted).toHaveBeenCalledWith(42))
   })
 
+  // #2669: with automatic grabbing off the server refuses the search. Before
+  // the fix it answered ok:true, so the button flashed for a moment and the
+  // page said nothing at all.
+  it('says no search was run when automatic grabbing is off', async () => {
+    vi.mocked(api.searchAuthorWanted).mockResolvedValue({
+      results: { '42': { ok: false, code: 'auto_grab_disabled', error: 'automatic grabbing is disabled' } },
+    })
+
+    renderAuthorDetailPage([makeBook({ id: 10, title: 'Wanted Book', status: 'wanted' })])
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Search 1 wanted' }))
+
+    expect(await screen.findByText(/No search was run/i)).toBeInTheDocument()
+    // The message has to name the way out, not just report a failure.
+    expect(screen.getByText(/Enable automatic grabbing/i)).toBeInTheDocument()
+  })
+
   it('disables author search when there are no monitored wanted books', async () => {
     renderAuthorDetailPage([
       makeBook({ id: 10, title: 'Unmonitored Wanted Book', status: 'wanted', monitored: false }),
@@ -333,6 +373,23 @@ describe('AuthorDetailPage', () => {
       foreignAuthorId: 'hc:emilia-jae',
       authorName: 'Emilia Jae',
     }))
+  })
+
+  it('shows find-better metadata for linked authors with a full record, not just sparse ones', async () => {
+    renderAuthorDetailPage([], 'grid', {
+      foreignAuthorId: 'OL13200512A',
+      authorName: 'Emilia Jae',
+      sortName: 'Jae, Emilia',
+      metadataProvider: 'openlibrary',
+      description: 'Fantasy author of the Shades of Magic series.',
+      imageUrl: 'https://example.com/emilia.jpg',
+      disambiguation: 'Fantasy author, not the botanist',
+      ratingsCount: 128,
+      averageRating: 4.4,
+    })
+
+    fireEvent.click(await screen.findByRole('button', { name: /More/ }))
+    expect(await screen.findByRole('menuitem', { name: 'Find better metadata' })).toBeInTheDocument()
   })
 
   it('opens link metadata from the query string once and removes the trigger param', async () => {
@@ -927,5 +984,491 @@ describe('AuthorDetailPage — last sync outcome', () => {
     renderAuthorDetailPage([makeBook({ id: 1, title: 'Only Book', status: 'imported' })])
     await screen.findByRole('heading', { name: 'Only Book' })
     expect(screen.queryByTestId('author-sync-notice')).toBeNull()
+  })
+})
+
+describe('AuthorDetailPage — Previous/Next navigation (#2548, frontend-only)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    installLocalStorageMock()
+    vi.mocked(api.listAuthorSeries).mockResolvedValue([])
+  })
+
+  it('hides the controls when there is no router state at all (opened from a Series tab, a bookmark, or after a refresh)', async () => {
+    renderAuthorDetailPage([])
+    await screen.findByText('Brandon Sanderson')
+    expect(screen.queryByLabelText('Previous author')).toBeNull()
+    expect(screen.queryByLabelText('Next author')).toBeNull()
+  })
+
+  it('renders Previous/Next from router state and follows Next to the right id, carrying the chain state', async () => {
+    let lastLocation = ''
+    renderAuthorDetailPage(
+      [], 'grid', {},
+      { pathname: '/author/42', state: { ids: [40, 42, 43, 44, 45], index: 1 } },
+      loc => { lastLocation = loc },
+    )
+    await screen.findByText('Brandon Sanderson')
+
+    fireEvent.click(screen.getByLabelText('Next author'))
+
+    await waitFor(() => expect(lastLocation).toBe('/author/43'))
+  })
+
+  it('hides Previous at the first position and shows only Next', async () => {
+    renderAuthorDetailPage([], 'grid', {}, { pathname: '/author/42', state: { ids: [42, 43], index: 0 } })
+    await screen.findByText('Brandon Sanderson')
+
+    expect(screen.queryByLabelText('Previous author')).toBeNull()
+    expect(screen.getByLabelText('Next author')).toBeInTheDocument()
+  })
+
+  it('hides the controls for a single-author list (both ends null)', async () => {
+    renderAuthorDetailPage([], 'grid', {}, { pathname: '/author/42', state: { ids: [42], index: 0 } })
+    await screen.findByText('Brandon Sanderson')
+    expect(screen.queryByLabelText('Previous author')).toBeNull()
+    expect(screen.queryByLabelText('Next author')).toBeNull()
+  })
+
+  it('ignores state that does not match this author (stale browser back/forward state)', async () => {
+    // ids[index] is 99, not 42 — a mismatch that must be treated as no
+    // navigation info rather than pointing at the wrong neighbour.
+    renderAuthorDetailPage([], 'grid', {}, { pathname: '/author/42', state: { ids: [98, 99, 100], index: 1 } })
+    await screen.findByText('Brandon Sanderson')
+    expect(screen.queryByLabelText('Previous author')).toBeNull()
+    expect(screen.queryByLabelText('Next author')).toBeNull()
+  })
+
+  it('returns to the Authors list on Back when arrived via a Previous/Next chain', async () => {
+    let lastLocation = ''
+    renderAuthorDetailPage(
+      [], 'grid', {}, { pathname: '/author/42', state: { ids: [40, 42, 43], index: 1 } },
+      loc => { lastLocation = loc },
+    )
+    await screen.findByText('Brandon Sanderson')
+
+    fireEvent.click(screen.getByText('← Back'))
+
+    await waitFor(() => expect(lastLocation).toBe('/'))
+  })
+
+  it('falls back to browser history on Back when there is no nav state, so Wanted/Books/a book page are not stranded on the Authors list', async () => {
+    let lastLocation = ''
+    renderAuthorDetailPage([], 'grid', {}, ['/books/9', '/author/42'], loc => { lastLocation = loc })
+    await screen.findByText('Brandon Sanderson')
+
+    fireEvent.click(screen.getByText('← Back'))
+
+    await waitFor(() => expect(lastLocation).toBe('/books/9'))
+  })
+
+  it("refetches the new author's series after Next instead of reusing the previous author's (state leak)", async () => {
+    localStorage.setItem('bindery.view.author-detail', 'table')
+    vi.mocked(api.getAuthor).mockImplementation((id: number) =>
+      Promise.resolve({ ...author, id, authorName: id === 42 ? 'Brandon Sanderson' : 'Patrick Rothfuss' }))
+    vi.mocked(api.listAllBooks).mockImplementation(({ authorId }: { authorId?: number } = {}) =>
+      Promise.resolve(authorId === 42
+        ? [makeBook({ id: 10, title: 'The Final Empire', status: 'imported' })]
+        : [makeBook({ id: 20, title: 'The Name of the Wind', status: 'imported' })]))
+    vi.mocked(api.listAuthorSeries).mockImplementation((authorId: number) =>
+      Promise.resolve(authorId === 42
+        ? [{
+            id: 1, foreignSeriesId: 'OL-MB', title: 'Mistborn', description: '', monitored: true,
+            books: [{ seriesId: 1, bookId: 10, positionInSeries: '1' }],
+          }]
+        : [{
+            id: 2, foreignSeriesId: 'OL-KING', title: 'Kingkiller Chronicle', description: '', monitored: true,
+            books: [{ seriesId: 2, bookId: 20, positionInSeries: '1' }],
+          }]))
+
+    render(
+      <MemoryRouter initialEntries={[{ pathname: '/author/42', state: { ids: [42, 43], index: 0 } }]}>
+        <Routes>
+          <Route path="/author/:id" element={<AuthorDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    await screen.findByText('Brandon Sanderson')
+    fireEvent.click(screen.getByRole('switch', { name: 'Group by series' }))
+    expect(await screen.findByRole('heading', { name: /Mistborn/ })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Next author'))
+    await screen.findByText('Patrick Rothfuss')
+
+    // Without the fix, authorSeries.length > 0 (still 42's Mistborn) skips the
+    // refetch, and book id 20 doesn't match series 1's bookId 10 — so this
+    // would render Standalone only, with the Kingkiller heading missing.
+    expect(await screen.findByRole('heading', { name: /Kingkiller Chronicle/ })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: /Mistborn/ })).not.toBeInTheDocument()
+  })
+
+  it('clears a stale error from the previous author after Next', async () => {
+    vi.mocked(api.getAuthor).mockImplementation((id: number) =>
+      Promise.resolve({ ...author, id, authorName: id === 42 ? 'Brandon Sanderson' : 'Patrick Rothfuss' }))
+    vi.mocked(api.listAllBooks).mockResolvedValue([])
+    vi.mocked(api.updateAuthor).mockRejectedValue(new Error('Update failed'))
+
+    render(
+      <MemoryRouter initialEntries={[{ pathname: '/author/42', state: { ids: [42, 43], index: 0 } }]}>
+        <Routes>
+          <Route path="/author/:id" element={<AuthorDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    await screen.findByText('Brandon Sanderson')
+    fireEvent.click(screen.getByRole('switch', { name: 'Stop monitoring' }))
+    expect(await screen.findByText('Update failed')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Next author'))
+    await screen.findByText('Patrick Rothfuss')
+
+    expect(screen.queryByText('Update failed')).not.toBeInTheDocument()
+  })
+})
+
+// #2601: Refresh answers 202 and the sync runs in the background. The page used
+// to re-read the author and books as soon as the 202 landed, which showed the
+// state from before the click, and nothing looked again afterwards.
+describe('AuthorDetailPage: manual refresh', () => {
+  const oldBooks = [makeBook({ id: 1, title: 'Ancillary Justice', status: 'imported' })]
+  const newBooks = [
+    makeBook({ id: 1, title: 'Ancillary Justice', status: 'imported' }),
+    makeBook({ id: 2, title: 'Translation State', status: 'wanted' }),
+  ]
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    installLocalStorageMock()
+    vi.mocked(api.listAuthorSeries).mockResolvedValue([])
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  // Serves the author and books the way the server does: the pre-refresh state
+  // with syncInProgress set until the sync finishes at finishAt, then the new
+  // state. Call after vi.useFakeTimers so Date.now is the fake clock.
+  function serveSyncFinishingAt(finishAt: number) {
+    const synced = () => Date.now() >= finishAt
+    vi.mocked(api.getAuthor).mockImplementation(async () =>
+      synced() ? { ...author, description: 'New bio' } : { ...author, description: 'Old bio', syncInProgress: true },
+    )
+    vi.mocked(api.listAllBooks).mockImplementation(async () => (synced() ? newBooks : oldBooks))
+  }
+
+  async function advance(ms: number) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms)
+    })
+  }
+
+  it('waits for the background sync to finish and then shows its result', async () => {
+    renderAuthorDetailPage(oldBooks, 'grid', { description: 'Old bio' })
+    await screen.findByRole('heading', { name: 'Ancillary Justice' })
+
+    vi.useFakeTimers()
+    serveSyncFinishingAt(Date.now() + 3000)
+    vi.mocked(api.refreshAuthor).mockResolvedValue(undefined)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await advance(0)
+    expect(api.refreshAuthor).toHaveBeenCalledWith(42)
+    expect(screen.getByRole('button', { name: 'Refreshing…' })).toBeDisabled()
+
+    // First poll: the sync is still running, so nothing changes on the page.
+    await advance(2000)
+    expect(screen.queryByRole('heading', { name: 'Translation State' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Refreshing…' })).toBeDisabled()
+
+    // Second poll: the sync is done, so the page shows what it wrote.
+    await advance(2000)
+    expect(screen.getByRole('heading', { name: 'Translation State' })).toBeInTheDocument()
+    expect(screen.getByText('New bio')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled()
+
+    // And it stops polling.
+    const calls = vi.mocked(api.getAuthor).mock.calls.length
+    await advance(10000)
+    expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(calls)
+  })
+
+  it('gives up waiting after a minute and shows whatever the server has', async () => {
+    renderAuthorDetailPage(oldBooks, 'grid', { description: 'Old bio' })
+    await screen.findByRole('heading', { name: 'Ancillary Justice' })
+
+    vi.useFakeTimers()
+    serveSyncFinishingAt(Date.now() + 10 * 60 * 1000)
+    vi.mocked(api.refreshAuthor).mockResolvedValue(undefined)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await advance(58000)
+    expect(screen.getByRole('button', { name: 'Refreshing…' })).toBeDisabled()
+    await advance(2000)
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled()
+
+    const calls = vi.mocked(api.getAuthor).mock.calls.length
+    await advance(10000)
+    expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(calls)
+  })
+
+  it('waits on a sync that was already running instead of reporting the 409', async () => {
+    renderAuthorDetailPage(oldBooks, 'grid', { description: 'Old bio' })
+    await screen.findByRole('heading', { name: 'Ancillary Justice' })
+
+    vi.useFakeTimers()
+    serveSyncFinishingAt(Date.now() + 1000)
+    vi.mocked(api.refreshAuthor).mockRejectedValue(
+      new ApiError(409, { error: 'a refresh for this author is already running' }, 'Conflict'),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await advance(2000)
+    expect(screen.getByRole('heading', { name: 'Translation State' })).toBeInTheDocument()
+    expect(screen.queryByText(/already running/)).toBeNull()
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled()
+  })
+
+  // The 409 fires for any running sync, and the scheduled, bulk, Refresh all
+  // and add syncs all read the metadata cache. Showing their result would
+  // hand the user the cached data the click was meant to skip, so once that
+  // sync ends the page asks for its own refresh and waits for that one.
+  it('asks again once a background sync that answered 409 ends, and shows that refresh', async () => {
+    renderAuthorDetailPage(oldBooks, 'grid', { description: 'Old bio' })
+    await screen.findByRole('heading', { name: 'Ancillary Justice' })
+
+    vi.useFakeTimers()
+    const backgroundEndsAt = Date.now() + 1000
+    let ownEndsAt: number | null = null
+    const ownDone = () => ownEndsAt !== null && Date.now() >= ownEndsAt
+    vi.mocked(api.getAuthor).mockImplementation(async () => {
+      if (ownDone()) return { ...author, description: 'New bio' }
+      const syncing = Date.now() < backgroundEndsAt || ownEndsAt !== null
+      return { ...author, description: 'Old bio', syncInProgress: syncing }
+    })
+    vi.mocked(api.listAllBooks).mockImplementation(async () => (ownDone() ? newBooks : oldBooks))
+    vi.mocked(api.refreshAuthor)
+      .mockRejectedValueOnce(new ApiError(409, { error: 'a refresh for this author is already running' }, 'Conflict'))
+      .mockImplementationOnce(async () => {
+        ownEndsAt = Date.now() + 3000
+      })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    // First poll: the background sync has ended with cached data. The page
+    // starts its own refresh instead of showing that.
+    await advance(2000)
+    expect(api.refreshAuthor).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('heading', { name: 'Translation State' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Refreshing…' })).toBeDisabled()
+
+    // Its own sync ends at 5 seconds; the poll at 6 seconds sees it.
+    await advance(4000)
+    expect(screen.getByRole('heading', { name: 'Translation State' })).toBeInTheDocument()
+    expect(screen.getByText('New bio')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled()
+  })
+
+  it('stops after a second 409 instead of looping', async () => {
+    renderAuthorDetailPage(oldBooks, 'grid', { description: 'Old bio' })
+    await screen.findByRole('heading', { name: 'Ancillary Justice' })
+
+    vi.useFakeTimers()
+    serveSyncFinishingAt(Date.now() + 1000)
+    vi.mocked(api.refreshAuthor).mockRejectedValue(
+      new ApiError(409, { error: 'a refresh for this author is already running' }, 'Conflict'),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await advance(2000)
+    expect(api.refreshAuthor).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('heading', { name: 'Translation State' })).toBeInTheDocument()
+    expect(screen.queryByText(/already running/)).toBeNull()
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled()
+
+    const posts = vi.mocked(api.refreshAuthor).mock.calls.length
+    const polls = vi.mocked(api.getAuthor).mock.calls.length
+    await advance(20000)
+    expect(vi.mocked(api.refreshAuthor).mock.calls.length).toBe(posts)
+    expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(polls)
+  })
+
+  // The reload after the wait used the filter captured when Refresh was
+  // clicked, so switching to Excluded meanwhile had its rows overwritten by a
+  // list fetched without them.
+  it('reloads with the status filter picked while it waited', async () => {
+    const excludedBook = makeBook({ id: 3, title: 'Provenance', status: 'wanted', excluded: true })
+    renderAuthorDetailPage(oldBooks, 'table', { description: 'Old bio' })
+    await screen.findByText('Ancillary Justice')
+
+    vi.useFakeTimers()
+    const finishAt = Date.now() + 3000
+    const synced = () => Date.now() >= finishAt
+    vi.mocked(api.getAuthor).mockImplementation(async () =>
+      synced() ? { ...author, description: 'New bio' } : { ...author, description: 'Old bio', syncInProgress: true },
+    )
+    vi.mocked(api.listAllBooks).mockImplementation(async params => {
+      const base = synced() ? newBooks : oldBooks
+      return params?.includeExcluded ? [...base, excludedBook] : base
+    })
+    vi.mocked(api.refreshAuthor).mockResolvedValue(undefined)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await advance(0)
+    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'excluded' } })
+    await advance(0)
+
+    // The sync ends at 3 seconds; the poll at 4 seconds sees it and reloads.
+    await advance(4000)
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled()
+    expect(screen.getByText('Provenance')).toBeInTheDocument()
+    expect(api.listAllBooks).toHaveBeenLastCalledWith({ authorId: 42, includeExcluded: true })
+  })
+})
+
+describe('AuthorDetailPage — book link nav state (#2548, book side)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    installLocalStorageMock()
+    vi.mocked(api.listAuthorSeries).mockResolvedValue([])
+  })
+
+  it('carries {ids, index} on book links and the row click, scoped to filteredBooks order', async () => {
+    vi.mocked(api.getAuthor).mockResolvedValue(author)
+    vi.mocked(api.listAllBooks).mockResolvedValue([
+      makeBook({ id: 10, title: 'The Final Empire', status: 'imported' }),
+      makeBook({ id: 11, title: 'The Well of Ascension', status: 'imported' }),
+    ])
+    localStorage.setItem('bindery.view.author-detail', 'table')
+
+    let capturedState: unknown
+    render(
+      <MemoryRouter initialEntries={['/author/42']}>
+        <StateProbe onState={s => { capturedState = s }} />
+        <Routes>
+          <Route path="/author/:id" element={<AuthorDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    const row = (await screen.findByText('The Well of Ascension')).closest('tr')!
+    fireEvent.click(row)
+
+    await waitFor(() => expect(capturedState).toEqual({ ids: [10, 11], index: 1, hopDepth: 1 }))
+  })
+
+  it('carries {ids, index} on the grid card link too, not just the table row', async () => {
+    vi.mocked(api.getAuthor).mockResolvedValue(author)
+    vi.mocked(api.listAllBooks).mockResolvedValue([
+      makeBook({ id: 10, title: 'The Final Empire', status: 'imported' }),
+      makeBook({ id: 11, title: 'The Well of Ascension', status: 'imported' }),
+    ])
+    // No view override — grid is the page default, unlike the table-row test above.
+
+    let capturedState: unknown
+    render(
+      <MemoryRouter initialEntries={['/author/42']}>
+        <StateProbe onState={s => { capturedState = s }} />
+        <Routes>
+          <Route path="/author/:id" element={<AuthorDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    const link = (await screen.findByRole('heading', { name: 'The Well of Ascension' })).closest('a')!
+    fireEvent.click(link)
+
+    await waitFor(() => expect(capturedState).toEqual({ ids: [10, 11], index: 1, hopDepth: 1 }))
+  })
+
+  it('follows the seriesGroups order for the nav chain when Group by series is on', async () => {
+    vi.mocked(api.getAuthor).mockResolvedValue(author)
+    vi.mocked(api.listAllBooks).mockResolvedValue([
+      makeBook({ id: 10, title: 'Elantris', status: 'imported' }),
+      makeBook({ id: 11, title: 'The Final Empire', status: 'imported' }),
+      makeBook({ id: 12, title: 'The Well of Ascension', status: 'imported' }),
+    ])
+    vi.mocked(api.listAuthorSeries).mockResolvedValue([
+      {
+        id: 1, foreignSeriesId: 'OL-MB', title: 'Mistborn', description: '', monitored: true,
+        books: [
+          { seriesId: 1, bookId: 11, positionInSeries: '1' },
+          { seriesId: 1, bookId: 12, positionInSeries: '2' },
+        ],
+      },
+    ])
+    localStorage.setItem('bindery.view.author-detail', 'table')
+
+    let capturedState: unknown
+    render(
+      <MemoryRouter initialEntries={['/author/42']}>
+        <StateProbe onState={s => { capturedState = s }} />
+        <Routes>
+          <Route path="/author/:id" element={<AuthorDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    await screen.findByText('Elantris')
+    fireEvent.click(screen.getByRole('switch', { name: 'Group by series' }))
+    // Confirms grouping is actually active: Elantris (no series) renders
+    // under Standalone, visually last, behind Mistborn's two books.
+    await screen.findByRole('heading', { name: /Standalone/ })
+
+    const row = screen.getByText('Elantris').closest('tr')!
+    fireEvent.click(row)
+
+    // Elantris is index 0 in filteredBooks (load order) but renders last
+    // under Standalone. #2548 asks for the order the user sees, so with
+    // grouping on the chain follows the series section (Mistborn's two
+    // books, in series order) then Standalone — Elantris lands at index 2.
+    await waitFor(() => expect(capturedState).toEqual({ ids: [11, 12, 10], index: 2, hopDepth: 1 }))
+  })
+
+  it('counts a book that appears in two series once, at its first-occurrence position', async () => {
+    vi.mocked(api.getAuthor).mockResolvedValue(author)
+    vi.mocked(api.listAllBooks).mockResolvedValue([
+      makeBook({ id: 10, title: 'Shadows of Self', status: 'imported' }),
+      makeBook({ id: 11, title: 'The Alloy of Law', status: 'imported' }),
+    ])
+    vi.mocked(api.listAuthorSeries).mockResolvedValue([
+      {
+        id: 1, foreignSeriesId: 'OL-MB', title: 'Mistborn', description: '', monitored: true,
+        books: [
+          { seriesId: 1, bookId: 11, positionInSeries: '1' },
+          { seriesId: 1, bookId: 10, positionInSeries: '2' },
+        ],
+      },
+      {
+        id: 2, foreignSeriesId: 'OL-WA', title: 'Wax and Wayne', description: '', monitored: true,
+        books: [
+          { seriesId: 2, bookId: 11, positionInSeries: '1' },
+          { seriesId: 2, bookId: 10, positionInSeries: '2' },
+        ],
+      },
+    ])
+    localStorage.setItem('bindery.view.author-detail', 'table')
+
+    let capturedState: unknown
+    render(
+      <MemoryRouter initialEntries={['/author/42']}>
+        <StateProbe onState={s => { capturedState = s }} />
+        <Routes>
+          <Route path="/author/:id" element={<AuthorDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    await screen.findByText('Shadows of Self')
+    fireEvent.click(screen.getByRole('switch', { name: 'Group by series' }))
+    await screen.findByRole('heading', { name: /Wax and Wayne/ })
+
+    // Both series list the same two books; the row under Mistborn (this
+    // book's first occurrence) is the one that determines its chain index.
+    const row = screen.getAllByText('The Alloy of Law')[0].closest('tr')!
+    fireEvent.click(row)
+
+    await waitFor(() => expect(capturedState).toEqual({ ids: [11, 10], index: 0, hopDepth: 1 }))
   })
 })

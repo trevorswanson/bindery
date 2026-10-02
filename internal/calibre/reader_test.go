@@ -1,9 +1,11 @@
 package calibre
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -280,6 +282,80 @@ func TestReader_Books_FullShape(t *testing.T) {
 	}
 }
 
+// TestReader_Books_UnescapesAuthorCommas is the regression for #2666. Calibre
+// writes a literal comma in an author name as "|" because a comma separates
+// authors in its comma-joined author columns, and its own readers turn the
+// pipe back into a comma (calibre/db/write.py get_adapter). Both the name and
+// the sort column carry the escaped form, and the unescaping has to stay
+// inside one author row so a co-author pair is still two authors.
+func TestReader_Books_UnescapesAuthorCommas(t *testing.T) {
+	root := buildFixtureLibrary(t)
+	db, err := sql.Open("sqlite", filepath.Join(root, metadataDB))
+	if err != nil {
+		t.Fatalf("open fixture writer: %v", err)
+	}
+	extra := []string{
+		// One escaped comma, in the name and in the sort.
+		`INSERT INTO authors (id, name, sort) VALUES (4, 'Scalzi| John', 'Scalzi| John')`,
+		// No pipe: the name and the real comma in the sort must be left alone.
+		`INSERT INTO authors (id, name, sort) VALUES (5, 'Ursula K. Le Guin', 'Le Guin, Ursula K.')`,
+		// Two authors on one book, both escaped.
+		`INSERT INTO authors (id, name, sort) VALUES (6, 'Gaiman| Neil', 'Gaiman| Neil')`,
+		`INSERT INTO authors (id, name, sort) VALUES (7, 'McKean| Dave', 'McKean| Dave')`,
+		`INSERT INTO books (id, title, sort, path) VALUES (4, 'Old Man''s War', 'Old Man''s War', '')`,
+		`INSERT INTO books (id, title, sort, path) VALUES (5, 'Good Omens', 'Good Omens', '')`,
+		`INSERT INTO books (id, title, sort, path) VALUES (6, 'The Dispossessed', 'The Dispossessed', '')`,
+		`INSERT INTO books_authors_link (book, author) VALUES (4, 4), (5, 6), (5, 7), (6, 5)`,
+	}
+	for _, stmt := range extra {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close fixture writer: %v", err)
+	}
+
+	r, err := OpenReader(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	byID := map[int64]CalibreBook{}
+	if err := r.Books(context.Background(), func(b CalibreBook) error {
+		byID[b.CalibreID] = b
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Book 4: the escaped comma becomes a comma again in both columns.
+	authors := byID[4].Authors
+	if len(authors) != 1 {
+		t.Fatalf("book 4 authors = %+v, want 1 author", authors)
+	}
+	if authors[0].Name != "Scalzi, John" || authors[0].Sort != "Scalzi, John" {
+		t.Errorf("book 4 author = %+v, want name and sort %q", authors[0], "Scalzi, John")
+	}
+	// Book 6: no pipe to unescape, so the name is unchanged and the comma the
+	// sort form already has stays put.
+	authors = byID[6].Authors
+	if len(authors) != 1 || authors[0].Name != "Ursula K. Le Guin" || authors[0].Sort != "Le Guin, Ursula K." {
+		t.Errorf("book 6 author = %+v, want the stored name and sort unchanged", authors)
+	}
+	// Book 5: two escaped authors stay two authors, each unescaped.
+	authors = byID[5].Authors
+	if len(authors) != 2 {
+		t.Fatalf("book 5 authors = %+v, want 2 separate authors", authors)
+	}
+	names := []string{authors[0].Name, authors[1].Name}
+	sort.Strings(names)
+	if names[0] != "Gaiman, Neil" || names[1] != "McKean, Dave" {
+		t.Errorf("book 5 authors = %v, want the two unescaped names", names)
+	}
+}
+
 // TestReader_Books_StopsOnError: returning an error from the visitor must
 // abort the walk — the importer relies on this to honour context cancel.
 func TestReader_Books_StopsOnError(t *testing.T) {
@@ -341,4 +417,199 @@ func mustOpenFixture(t *testing.T) *Reader {
 		t.Fatalf("open fixture: %v", err)
 	}
 	return r
+}
+
+// openWALWriter switches the fixture's metadata.db to WAL mode and returns a
+// pinned connection with automatic checkpointing disabled, so anything
+// written through it stays in metadata.db-wal for as long as the connection
+// is open. This is the shape a long running Calibre (content server,
+// Calibre-Web-Automated) leaves the library in between checkpoints.
+func openWALWriter(t *testing.T, root string) *sql.Conn {
+	t.Helper()
+	ctx := context.Background()
+	w, err := sql.Open("sqlite", filepath.Join(root, metadataDB))
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+	conn, err := w.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin writer conn: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	for _, p := range []string{"PRAGMA journal_mode=WAL", "PRAGMA wal_autocheckpoint=0"} {
+		if _, err := conn.ExecContext(ctx, p); err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+	}
+	return conn
+}
+
+// TestReader_SeesUncheckpointedWAL is the regression for #2631: a row that
+// Calibre has committed but not yet checkpointed must be visible to the
+// reader. Opening with immutable=1 made SQLite ignore the -wal file, so
+// Bindery read a snapshot as of the last checkpoint.
+func TestReader_SeesUncheckpointedWAL(t *testing.T) {
+	root := buildFixtureLibrary(t)
+	ctx := context.Background()
+	w := openWALWriter(t, root)
+	if _, err := w.ExecContext(ctx, `INSERT INTO books (id, title, sort, path) VALUES (4, 'Book Four', 'Book Four', 'Alice Author/Book Four (4)')`); err != nil {
+		t.Fatalf("insert into wal: %v", err)
+	}
+	if st, err := os.Stat(filepath.Join(root, metadataDB+"-wal")); err != nil || st.Size() == 0 {
+		t.Fatalf("precondition: expected a non-empty metadata.db-wal, stat err=%v", err)
+	}
+
+	r, err := OpenReader(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	n, err := r.Count(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 4 {
+		t.Errorf("Count = %d, want 4 (row committed to the WAL but not checkpointed is invisible)", n)
+	}
+}
+
+// TestOpenReader_ReadOnlyDirFallsBackToImmutable covers the one case where
+// a plain `mode=ro` open cannot work: a WAL mode metadata.db in a directory
+// Bindery cannot write to, with no -shm file present (Calibre not running).
+// SQLite refuses that open outright, so the reader must fall back to
+// immutable=1 rather than fail the import.
+func TestOpenReader_ReadOnlyDirFallsBackToImmutable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	root := buildFixtureLibrary(t)
+	w, err := sql.Open("sqlite", filepath.Join(root, metadataDB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		t.Fatal(err)
+	}
+	// Closing the last connection checkpoints and removes -wal and -shm.
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, metadataDB+"-shm")); !os.IsNotExist(err) {
+		t.Fatalf("precondition: -shm should be absent, stat err=%v", err)
+	}
+	if err := os.Chmod(filepath.Join(root, metadataDB), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
+
+	r, err := OpenReader(root)
+	if err != nil {
+		t.Fatalf("OpenReader should fall back to immutable=1, got: %v", err)
+	}
+	defer r.Close()
+	n, err := r.Count(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("Count = %d, want 3", n)
+	}
+}
+
+// TestOpenReader_NetworkFSProbeFailureFallsBack simulates a library on NFS
+// or SMB, where the plain read-only open of a WAL database fails with an
+// IOERR_SHM family code rather than READONLY or CANTOPEN. Any probe failure
+// must retry immutable, which then reads the last checkpoint: the row still
+// sitting in the WAL is invisible, proving the immutable handle was used.
+func TestOpenReader_NetworkFSProbeFailureFallsBack(t *testing.T) {
+	root := buildFixtureLibrary(t)
+	ctx := context.Background()
+	w := openWALWriter(t, root)
+	if _, err := w.ExecContext(ctx, `INSERT INTO books (id, title, sort, path) VALUES (4, 'Book Four', 'Book Four', 'Alice Author/Book Four (4)')`); err != nil {
+		t.Fatalf("insert into wal: %v", err)
+	}
+
+	var probed []bool
+	probe := func(ctx context.Context, conn *sql.DB, immutable bool) error {
+		probed = append(probed, immutable)
+		if !immutable {
+			return errors.New("disk I/O error (4618)")
+		}
+		return probeRead(ctx, conn, immutable)
+	}
+	conn, err := openReadOnlyWith(filepath.Join(root, metadataDB), probe)
+	if err != nil {
+		t.Fatalf("expected immutable fallback, got: %v", err)
+	}
+	defer conn.Close()
+	if len(probed) != 2 || probed[0] || !probed[1] {
+		t.Fatalf("probe calls (immutable flag) = %v, want [false true]", probed)
+	}
+	var n int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM books`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("Count = %d, want 3 (immutable handle ignores the WAL row)", n)
+	}
+}
+
+// TestOpenReader_NotASQLiteFile makes sure the widened fallback does not
+// swallow real breakage: a metadata.db that is not a database fails both
+// probes and OpenReader returns an error.
+func TestOpenReader_NotASQLiteFile(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, metadataDB), []byte("this is not a sqlite database, just some text padding it out past the header size"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenReader(root)
+	if err == nil {
+		r.Close()
+		t.Fatal("expected an error opening a non SQLite metadata.db")
+	}
+}
+
+// TestOpenReadOnlyWaitsOutABusyLock is the v1.36.2 review finding on #2631:
+// the mode=ro open carried no busy timeout, so a probe that landed while
+// Calibre held a lock got SQLITE_BUSY at once and the run fell back to
+// immutable=1, the stale read #2631 fixed. With the timeout the probe waits
+// for the lock and no fallback happens, which the fallback's warning shows.
+func TestOpenReadOnlyWaitsOutABusyLock(t *testing.T) {
+	root := buildFixtureLibrary(t)
+	ctx := context.Background()
+	w, err := sql.Open("sqlite", filepath.Join(root, metadataDB))
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+	conn, err := w.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin writer conn: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if _, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+		t.Fatalf("begin exclusive: %v", err)
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = conn.ExecContext(ctx, "COMMIT")
+	}()
+
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	r, err := OpenReader(root)
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer r.Close()
+	if logs.Len() > 0 {
+		t.Errorf("the reader fell back while Calibre held a lock for 300ms: %s", logs.String())
+	}
 }

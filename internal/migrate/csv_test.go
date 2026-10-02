@@ -19,18 +19,32 @@ import (
 // stubProvider is a minimal metadata.Provider used to drive the migrate
 // package without reaching any real network service.
 type stubProvider struct {
+	// name is the provider name the aggregator sees; "" means "stub". The
+	// #2332 tests name their stubs so the aggregator can tell a primary from
+	// a fallback and route foreign ids back to the right one.
+	name            string
 	searchAuthorsFn func(ctx context.Context, q string) ([]models.Author, error)
 	getAuthorFn     func(ctx context.Context, id string) (*models.Author, error)
+	searchBooksFn   func(ctx context.Context, q string) ([]models.Book, error)
+	getBookByISBNFn func(ctx context.Context, isbn string) (*models.Book, error)
 }
 
-func (s *stubProvider) Name() string { return "stub" }
+func (s *stubProvider) Name() string {
+	if s.name != "" {
+		return s.name
+	}
+	return "stub"
+}
 func (s *stubProvider) SearchAuthors(ctx context.Context, q string) ([]models.Author, error) {
 	if s.searchAuthorsFn != nil {
 		return s.searchAuthorsFn(ctx, q)
 	}
 	return nil, nil
 }
-func (s *stubProvider) SearchBooks(context.Context, string) ([]models.Book, error) {
+func (s *stubProvider) SearchBooks(ctx context.Context, q string) ([]models.Book, error) {
+	if s.searchBooksFn != nil {
+		return s.searchBooksFn(ctx, q)
+	}
 	return nil, nil
 }
 func (s *stubProvider) GetAuthor(ctx context.Context, id string) (*models.Author, error) {
@@ -43,7 +57,10 @@ func (s *stubProvider) GetBook(context.Context, string) (*models.Book, error) { 
 func (s *stubProvider) GetEditions(context.Context, string) ([]models.Edition, error) {
 	return nil, nil
 }
-func (s *stubProvider) GetBookByISBN(context.Context, string) (*models.Book, error) {
+func (s *stubProvider) GetBookByISBN(ctx context.Context, isbn string) (*models.Book, error) {
+	if s.getBookByISBNFn != nil {
+		return s.getBookByISBNFn(ctx, isbn)
+	}
 	return nil, nil
 }
 
@@ -411,8 +428,118 @@ func TestImportCSVAuthors_NoMatch(t *testing.T) {
 	if res.Added != 0 || res.Errors != 1 {
 		t.Errorf("Added=%d Errors=%d; want 0/1", res.Added, res.Errors)
 	}
-	if msg := res.Failures["Nobody"]; !strings.Contains(msg, "no OpenLibrary match") {
-		t.Errorf("failure reason = %q", msg)
+	if msg := res.Failures["Nobody"]; msg != "no match on stub" {
+		t.Errorf("failure reason = %q, want %q", msg, "no match on stub")
+	}
+}
+
+// TestImportCSVAuthors_NameOnlyMatchDoesNotBypassGuard: with OpenLibrary
+// down, a Google Books name only record used to reach authors.Create with
+// foreign_id "" and metadata_provider=openlibrary, because SafeToBind read
+// the empty id as the primary's. Now the same name merge keeps DNB's record,
+// which has an id, and the guard refuses it because the primary did not
+// answer: the row fails and says so, and nothing is bound.
+func TestImportCSVAuthors_NameOnlyMatchDoesNotBypassGuard(t *testing.T) {
+	repo := db.NewAuthorRepo(newTestDB(t))
+
+	res, err := ImportCSVAuthors(context.Background(), strings.NewReader(guardAuthorName+"\n"), repo, nil, olTimesOutGoogleBooksAndDNBAnswer(), nil)
+	if err != nil {
+		t.Fatalf("ImportCSVAuthors: %v", err)
+	}
+	if res.Added != 0 || res.Errors != 1 {
+		t.Errorf("Added=%d Errors=%d; want 0/1 (failures=%v)", res.Added, res.Errors, res.Failures)
+	}
+	const want = "primary metadata provider openlibrary did not answer, so the dnb match was not used; run the import again once it responds"
+	if msg := res.Failures[guardAuthorName]; msg != want {
+		t.Errorf("failure reason = %q, want %q", msg, want)
+	}
+	assertNoAuthorBound(t, repo, dnbAuthorID)
+}
+
+// TestImportCSVAuthors_NameOnlyMatchIsNotLinked: a record with no foreign id
+// is not something an author can be linked to, even with every provider
+// answering. It used to be created with an empty foreign id.
+func TestImportCSVAuthors_NameOnlyMatchIsNotLinked(t *testing.T) {
+	repo := db.NewAuthorRepo(newTestDB(t))
+	agg := metadata.NewAggregator(failingProvider("openlibrary", nil), googleBooksNameOnly())
+
+	res, err := ImportCSVAuthors(context.Background(), strings.NewReader(guardAuthorName+"\n"), repo, nil, agg, nil)
+	if err != nil {
+		t.Fatalf("ImportCSVAuthors: %v", err)
+	}
+	if res.Added != 0 || res.Errors != 1 {
+		t.Errorf("Added=%d Errors=%d; want 0/1 (failures=%v)", res.Added, res.Errors, res.Failures)
+	}
+	if msg := res.Failures[guardAuthorName]; !strings.HasPrefix(msg, "no linkable match on openlibrary, googlebooks") {
+		t.Errorf("failure reason = %q, want it to say no linkable match and name the providers asked", msg)
+	}
+	assertNoAuthorBound(t, repo, dnbAuthorID)
+}
+
+// TestImportCSVAuthors_NameOnlyMatchDoesNotFallToAnotherAuthor: only
+// Google Books knows the name searched for, and OpenLibrary answers with a
+// different person who has an id. The importer used to skip past the name
+// only record to that one and create the wrong author as added.
+func TestImportCSVAuthors_NameOnlyMatchDoesNotFallToAnotherAuthor(t *testing.T) {
+	repo := db.NewAuthorRepo(newTestDB(t))
+	const otherID = "OL999A"
+	other := func(id string) models.Author {
+		return models.Author{ForeignID: id, Name: "Andrew Weir", SortName: "Weir, Andrew"}
+	}
+	openLibrary := &stubProvider{
+		name: "openlibrary",
+		searchAuthorsFn: func(context.Context, string) ([]models.Author, error) {
+			return []models.Author{other(otherID)}, nil
+		},
+		getAuthorFn: func(_ context.Context, id string) (*models.Author, error) {
+			a := other(id)
+			return &a, nil
+		},
+	}
+	agg := metadata.NewAggregator(openLibrary, googleBooksNameOnly())
+
+	res, err := ImportCSVAuthors(context.Background(), strings.NewReader(guardAuthorName+"\n"), repo, nil, agg, nil)
+	if err != nil {
+		t.Fatalf("ImportCSVAuthors: %v", err)
+	}
+	if res.Added != 0 || res.Errors != 1 {
+		t.Errorf("Added=%d Errors=%d; want 0/1 (failures=%v)", res.Added, res.Errors, res.Failures)
+	}
+	if msg := res.Failures[guardAuthorName]; !strings.HasPrefix(msg, "no linkable match on ") {
+		t.Errorf("failure reason = %q, want it to say no linkable match", msg)
+	}
+	assertNoAuthorBound(t, repo, otherID)
+}
+
+// TestImportCSVAuthors_PrimaryDownNoMatchSaysRetry: with the primary down and
+// nothing else matching, the row's reason must say the primary did not
+// answer. "no OpenLibrary match" reads as a verdict on the name.
+func TestImportCSVAuthors_PrimaryDownNoMatchSaysRetry(t *testing.T) {
+	repo := db.NewAuthorRepo(newTestDB(t))
+	agg := metadata.NewAggregator(failingProvider("openlibrary", errOpenLibraryTimeout), failingProvider("dnb", nil))
+
+	res, err := ImportCSVAuthors(context.Background(), strings.NewReader(guardAuthorName+"\n"), repo, nil, agg, nil)
+	if err != nil {
+		t.Fatalf("ImportCSVAuthors: %v", err)
+	}
+	if msg := res.Failures[guardAuthorName]; msg != wantPrimaryDownReason {
+		t.Errorf("failure reason = %q, want %q", msg, wantPrimaryDownReason)
+	}
+}
+
+// TestImportCSVAuthors_NoMatchNamesProviders: a genuine miss names the
+// providers that answered, not OpenLibrary, which a Hardcover or DNB primary
+// never asked.
+func TestImportCSVAuthors_NoMatchNamesProviders(t *testing.T) {
+	repo := db.NewAuthorRepo(newTestDB(t))
+	agg := metadata.NewAggregator(failingProvider("hardcover", nil), failingProvider("dnb", nil))
+
+	res, err := ImportCSVAuthors(context.Background(), strings.NewReader(guardAuthorName+"\n"), repo, nil, agg, nil)
+	if err != nil {
+		t.Fatalf("ImportCSVAuthors: %v", err)
+	}
+	if msg := res.Failures[guardAuthorName]; msg != "no match on hardcover, dnb" {
+		t.Errorf("failure reason = %q, want %q", msg, "no match on hardcover, dnb")
 	}
 }
 
@@ -633,5 +760,44 @@ func TestImportCSVAuthors_CatalogueFetchSurvivesCallerContextCancellation(t *tes
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("catalogue-fetch callback never fired — fan-out was not detached from the caller's context")
+	}
+}
+
+// TestImportCSVAuthors_PrimaryTimeoutDoesNotBindFallback is #2332's repro:
+// OpenLibrary times out, DNB answers, and the search as a whole reports
+// success. The author must not be created from the DNB record, and the row
+// must say why in the same name to reason shape as every other failure.
+func TestImportCSVAuthors_PrimaryTimeoutDoesNotBindFallback(t *testing.T) {
+	repo := db.NewAuthorRepo(newTestDB(t))
+
+	res, err := ImportCSVAuthors(context.Background(), strings.NewReader(guardAuthorName+"\n"), repo, nil, olTimesOutDNBAnswers(), nil)
+	if err != nil {
+		t.Fatalf("ImportCSVAuthors: %v", err)
+	}
+	if res.Added != 0 || res.Errors != 1 {
+		t.Errorf("Added=%d Errors=%d; want 0/1 (failures=%v)", res.Added, res.Errors, res.Failures)
+	}
+	if msg := res.Failures[guardAuthorName]; !strings.Contains(msg, "openlibrary did not answer") {
+		t.Errorf("failure reason = %q, want it to name the provider that did not answer", msg)
+	}
+	assertNoAuthorBound(t, repo, dnbAuthorID)
+}
+
+// TestImportCSVAuthors_StoresResolvedProvider: when binding is allowed, the
+// stored metadata_provider is the one the record's foreign id belongs to,
+// not a hardcoded "openlibrary" (#2332).
+func TestImportCSVAuthors_StoresResolvedProvider(t *testing.T) {
+	for _, tc := range allowedBindCases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := db.NewAuthorRepo(newTestDB(t))
+			res, err := ImportCSVAuthors(context.Background(), strings.NewReader(guardAuthorName+"\n"), repo, nil, tc.agg(), nil)
+			if err != nil {
+				t.Fatalf("ImportCSVAuthors: %v", err)
+			}
+			if res.Added != 1 {
+				t.Fatalf("Added=%d; want 1 (failures=%v)", res.Added, res.Failures)
+			}
+			assertAuthorBound(t, repo, tc.wantID, tc.wantProvider)
+		})
 	}
 }

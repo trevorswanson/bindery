@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import ViewToggle from '../components/ViewToggle'
+import BulkNotice from '../components/BulkNotice'
+import { isAutoGrabRefusal } from '../util/autoGrabRefusal'
 import { bookStatusBadge } from '../components/bookStatus'
 import FilterPopover, { FilterGroup } from '../components/FilterPopover'
 import BookStatusLegend from '../components/BookStatusLegend'
@@ -13,6 +15,7 @@ import { api, BINDERY_BASE, Book, MediaType } from '../api/client'
 import BulkActionBar from '../components/BulkActionBar'
 import Pagination from '../components/Pagination'
 import { useServerPagination } from '../components/usePagination'
+import AddToLibraryModal from '../components/AddToLibraryModal'
 
 type SortMode =
   | 'title-az' | 'title-za'
@@ -32,6 +35,7 @@ const statusLabelKeys: Record<string, string> = {
 
 export default function BooksPage() {
   const { t } = useTranslation()
+  const navigate = useNavigate()
   const { confirm, confirmDialog } = useConfirmDialog()
   const [books, setBooks] = useState<Book[]>([])
   const [total, setTotal] = useState(0)
@@ -52,7 +56,14 @@ export default function BooksPage() {
   const { needsIndexer, needsClient, needsAny } = useNeedsSetup()
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [bulkBusy, setBulkBusy] = useState(false)
+  // A message from the last bulk action that is not an exception, e.g. the
+  // server refusing a search because automatic grabbing is off (#2669).
+  const [bulkNotice, setBulkNotice] = useState<string | null>(null)
+  const [showAddBook, setShowAddBook] = useState(false)
+  const addBookButtonRef = useRef<HTMLButtonElement>(null)
+  const addBookWasOpenRef = useRef(false)
   const selectAllRef = useRef<HTMLInputElement>(null)
+  const loadRequestRef = useRef(0)
 
   const monitoredParam = monitoredFilter === 'monitored' ? true : monitoredFilter === 'unmonitored' ? false : undefined
 
@@ -65,6 +76,7 @@ export default function BooksPage() {
   // and sort are all applied by the API so a library with >100 books is fully
   // reachable (issue #1010). load() refetches the current page after mutations.
   const load = useCallback(() => {
+    const request = ++loadRequestRef.current
     setLoading(true)
     api.listBooks({
       limit: pageSize,
@@ -74,9 +86,15 @@ export default function BooksPage() {
       mediaType: mediaFilter || undefined,
       monitored: monitoredParam,
       sort,
-    }).then(({ items, total }) => { setBooks(items); setTotal(total) })
+    }).then(({ items, total }) => {
+      if (request !== loadRequestRef.current) return
+      setBooks(items)
+      setTotal(total)
+    })
       .catch(console.error)
-      .finally(() => setLoading(false))
+      .finally(() => {
+        if (request === loadRequestRef.current) setLoading(false)
+      })
   }, [page, pageSize, debouncedSearch, statusFilter, mediaFilter, monitoredParam, sort])
 
   useEffect(() => { load() }, [load])
@@ -108,6 +126,11 @@ export default function BooksPage() {
     return () => { document.title = 'Bindery' }
   }, [])
 
+  useEffect(() => {
+    if (addBookWasOpenRef.current && !showAddBook) addBookButtonRef.current?.focus()
+    addBookWasOpenRef.current = showAddBook
+  }, [showAddBook])
+
   const toggleSelect = (id: number) => {
     setSelectedIds(prev => {
       const next = new Set(prev)
@@ -128,8 +151,17 @@ export default function BooksPage() {
       confirmLabel: t('common.delete'),
     })) return
     setBulkBusy(true)
+    setBulkNotice(null)
     try {
-      await api.bulkActionBooks([...selectedIds], action, mediaType)
+      const res = await api.bulkActionBooks([...selectedIds], action, mediaType)
+      // The server refused rather than queued: say so and keep the selection,
+      // so retrying after flipping the switch does not mean re-picking every
+      // book (#2669). Reloading here would also be a lie, since nothing
+      // changed.
+      if (isAutoGrabRefusal(res)) {
+        setBulkNotice(t('search.autoGrabDisabled'))
+        return
+      }
       clearSelection()
       load()
     } catch (err) {
@@ -180,14 +212,31 @@ export default function BooksPage() {
     )
   }
 
+  // This page's loaded ids, in order — handed to BookDetailPage as router
+  // state (#2548) for Previous/Next; see BookNavState there.
+  const bookIds = books.map(b => b.id)
+  // hopDepth: 1 — this is the first hop into a book detail page from a list,
+  // not a further Previous/Next chain hop; see BookNavState in
+  // BookDetailPage.tsx for how Back uses it to skip the whole chain.
+  const bookNavState = (index: number) => ({ ids: bookIds, index, hopDepth: 1 })
+
   return (
     <div className={selectedIds.size > 0 ? 'pb-16' : ''}>
       {confirmDialog}
-      <div className="flex items-center justify-between mb-4">
+      <BulkNotice message={bulkNotice} onDismiss={() => setBulkNotice(null)} />
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
         <h2 className="text-2xl font-bold">{t('books.title')}</h2>
-        <div className="flex items-center gap-3">
+        <div className="ml-auto flex items-center gap-3 flex-wrap justify-end">
           <span className="text-sm text-fg-muted">{t('books.countLabel', { count: total, defaultValue: '{{count}} books' })}</span>
           <ViewToggle view={view} onChange={setView} />
+          <button
+            ref={addBookButtonRef}
+            type="button"
+            onClick={() => setShowAddBook(true)}
+            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-md text-sm font-medium text-white transition-colors"
+          >
+            {t('addToLibrary.addBook')}
+          </button>
         </div>
       </div>
 
@@ -327,11 +376,17 @@ export default function BooksPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-zinc-800">
-                {books.map(book => (
+                {books.map((book, i) => (
                   <tr
                     key={book.id}
                     className={`hover:bg-slate-200/50 dark:hover:bg-zinc-800/50 cursor-pointer ${selectedIds.has(book.id) ? 'bg-emerald-500/10 dark:bg-emerald-500/10' : 'bg-slate-100/50 dark:bg-zinc-900/50'}`}
-                    onClick={() => (window.location.href = `${BINDERY_BASE}/book/${book.id}`)}
+                    // Client-side, matching the <Link> in this same row (was a
+                    // full page reload via window.location.href while the
+                    // link inside it routed client-side, so one row had two
+                    // different navigation behaviours — also the reason
+                    // Previous/Next state couldn't reach the detail page from
+                    // anywhere in the row except the title text).
+                    onClick={() => navigate(`/book/${book.id}`, { state: bookNavState(i) })}
                   >
                     <td className="px-3 py-2 w-8" onClick={e => e.stopPropagation()}>
                       <input
@@ -342,7 +397,7 @@ export default function BooksPage() {
                       />
                     </td>
                     <td className="px-3 py-2">
-                      <Link to={`/book/${book.id}`} className="flex items-center gap-2" onClick={e => e.stopPropagation()}>
+                      <Link to={`/book/${book.id}`} state={bookNavState(i)} className="flex items-center gap-2" onClick={e => e.stopPropagation()}>
                         {book.imageUrl ? (
                           <img src={book.imageUrl} alt="" className="w-6 h-9 object-cover rounded flex-shrink-0" />
                         ) : (
@@ -388,7 +443,7 @@ export default function BooksPage() {
         </div>
         ) : (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
-          {books.map(book => (
+          {books.map((book, i) => (
             <div
               key={book.id}
               className={`border rounded-lg bg-slate-100 dark:bg-zinc-900 overflow-hidden group text-left transition-colors ${selectedIds.has(book.id) ? 'border-emerald-500' : 'border-slate-200 dark:border-zinc-800 hover:border-emerald-500'}`}
@@ -402,7 +457,7 @@ export default function BooksPage() {
                   title={`Select ${book.title}`}
                   onClick={e => e.stopPropagation()}
                 />
-                <Link to={`/book/${book.id}`} className="block w-full h-full">
+                <Link to={`/book/${book.id}`} state={bookNavState(i)} className="block w-full h-full">
                   {book.imageUrl ? (
                     <img src={book.imageUrl} alt={book.title} className="w-full h-full object-cover" />
                   ) : (
@@ -481,6 +536,20 @@ export default function BooksPage() {
           { label: t('common.delete'), onClick: () => runBulk('delete'), variant: 'danger' },
         ]}
       />
+
+      {showAddBook && (
+        <AddToLibraryModal
+          mode="book"
+          onClose={() => setShowAddBook(false)}
+          onAdded={added => {
+            // An author add has nothing on this list until its catalogue
+            // syncs, so land on the author instead of refreshing an unchanged
+            // page.
+            if (added.kind === 'author') navigate(`/author/${added.author.id}`)
+            else load()
+          }}
+        />
+      )}
     </div>
   )
 }

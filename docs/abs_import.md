@@ -80,6 +80,22 @@ Bootstrap:
 9. Progress is exposed through `GET /api/v1/abs/import/status`.
 10. Completed runs are persisted and surfaced through recent-runs and rollback endpoints.
 
+## Per-Item Timeout
+
+Each ABS item is imported under its own 10 minute deadline. A healthy item takes seconds, and even the largest upstream author catalogues (OpenLibrary returns at most 2,000 works per author) load in well under a minute, so the deadline only fires for an item whose upstream lookups never converge.
+
+When it fires:
+
+- the item is recorded as `failed` with the message `timed out after 10m0s and was skipped so the rest of the import could continue; changes made before the timeout were kept, import again to retry it`
+- Bindery logs `abs import: item timed out, skipping it and continuing` at WARN with the run id, library id, item id, and title
+- the import continues with the next item
+- the checkpoint moves past the timed out item, so a restart resumes after it rather than back into it
+- whatever the item wrote before the deadline stays in place, and importing again retries the item
+
+Stopping the process while an item is in flight is different: the checkpoint stays on the previous item, so the resumed run retries the interrupted one instead of skipping it.
+
+The deadline is a backstop. The stall that motivated it (#2578) came from the book title lookup, which matches an ABS title against the author's upstream works. It used to ask for the enriched catalogue, and building that runs a cover lookup for every work without a cover. For an author like Arthur Conan Doyle that meant thousands of rate limited requests inside one item, all logged at DEBUG. The lookup now uses the provider's plain works list, which is all a title match needs.
+
 ## Mapping Rules
 
 ### Authors
@@ -130,7 +146,7 @@ ebook-only book to `both`, and because status is derived from the formats still
 missing, the book was then demoted from imported back to wanted while its ebook
 sat on disk and attached (#2169).
 
-The importer distinguishes an *unmatched* item from an *ambiguous* one. When the local matcher finds nothing close, the item is unmatched: the book is created directly (step 4 above) and `enrichBook` performs a confidence-gated upstream lookup. Only an *ambiguous* match — a close-but-uncertain local candidate — is parked in the review queue rather than guessed. The same distinction applies to author resolution.
+The importer distinguishes an *unmatched* item from an *ambiguous* one. When the local matcher finds nothing close, the item is unmatched: the book is created directly (step 4 above) and `enrichBook` performs a confidence-gated upstream lookup. Only an *ambiguous* match — a close-but-uncertain local candidate — is parked in the review queue rather than guessed. The same distinction applies to author resolution. An ISBN match that only a fallback provider returned while the primary was not answering is not relinked: the row keeps its current identity, the result carries a `book relink skipped` reason naming the provider that failed, and the next import retries. A primary that answered without the ISBN still lets the fallback's record through (#2237).
 
 ### Series
 
@@ -169,6 +185,12 @@ Effective roots can come from:
 - `library.defaultRootFolderId`
 
 When a path is visible and valid, Bindery records it through the normal book-file write path. When it is not, the item remains metadata-only and contributes to pending/manual follow-up rather than failing the whole run.
+
+When an item's files are left unattached, Bindery logs one line for that item, `abs import: item files not attached, imported metadata only`, carrying the item id, title, the reason, the roots accepted for that format (`ebookRoots`, `audiobookRoots`), and the configured `pathRemap`. It logs at INFO when the path is outside Bindery storage, missing from ABS metadata, or not matched by any `abs.path_remap` rule, and at WARN when the path is inside Bindery storage but cannot be read, which usually means a missing mount or a permission problem. The same reason is also in the item's result message.
+
+`abs.path_remap` translates ABS paths into Bindery paths; it does not widen what Bindery accepts. A remapped path still has to sit under one of the effective roots above. For example, with ABS reporting `/audiobooks/...`, `abs.path_remap = /audiobooks:/abs-audiobooks`, and the ABS library mounted into Bindery at `/abs-audiobooks`, files are attached only when `/abs-audiobooks` is one of those roots or sits under one. Otherwise every item imports as metadata only, and the log line above says so with the roots it compared against. Keep in mind that `BINDERY_AUDIOBOOK_DIR` and root folders are also where Bindery places new downloads, so a read only mount is a poor fit for either.
+
+So there are two ways forward. If you want Bindery to own those files, move the audiobooks onto storage Bindery manages as a root, writable, and accept that Bindery will rename and delete files there like any other library. If ABS should stay the owner of the files, leave the mount out of Bindery's roots and accept a metadata only import: the books, authors and series still arrive, and nothing on the ABS side is touched. A dry run logs `abs import: item files would not be attached (dry run)` instead, so you can check which of the two you are in before importing.
 
 ## Storage Model
 

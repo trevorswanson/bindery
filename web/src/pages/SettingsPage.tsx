@@ -33,11 +33,12 @@ const ApiKeysTab = lazy(() => import('./settings/ApiKeysTab'))
 const ImportTab = lazy(() => import('./settings/ImportTab'))
 const BlocklistTab = lazy(() => import('./settings/BlocklistTab'))
 const LogsTab = lazy(() => import('./settings/LogsTab'))
+const AdvancedTab = lazy(() => import('./settings/AdvancedTab'))
 const AboutTab = lazy(() => import('./settings/AboutTab'))
 
-type Tab = 'indexers' | 'clients' | 'notifications' | 'quality' | 'metadata' | 'general' | 'import' | 'rootfolders' | 'logs' | 'blocklist' | 'calibre' | 'abs' | 'grimmory' | 'api-keys' | 'about'
+type Tab = 'indexers' | 'clients' | 'notifications' | 'quality' | 'metadata' | 'general' | 'import' | 'rootfolders' | 'logs' | 'blocklist' | 'calibre' | 'abs' | 'grimmory' | 'api-keys' | 'advanced' | 'about'
 
-const ADMIN_TABS: Tab[] = ['indexers', 'clients', 'notifications', 'quality', 'metadata', 'import', 'rootfolders', 'logs', 'blocklist', 'calibre', 'abs', 'grimmory', 'api-keys']
+const ADMIN_TABS: Tab[] = ['indexers', 'clients', 'notifications', 'quality', 'metadata', 'import', 'rootfolders', 'logs', 'blocklist', 'calibre', 'abs', 'grimmory', 'api-keys', 'advanced']
 
 // 'general' and 'about' are visible to every authenticated user — About is where
 // the in-app update message and bug_report.yml ("check Settings → About") point
@@ -156,6 +157,7 @@ export default function SettingsPage() {
       case 'blocklist': return <BlocklistTab />
       case 'logs': return <LogsTab />
       case 'api-keys': return <ApiKeysTab />
+      case 'advanced': return <AdvancedTab />
       case 'about': return <AboutTab />
     }
   }
@@ -185,7 +187,6 @@ export default function SettingsPage() {
                 <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-zinc-600 px-3 mb-1">Sources</p>
                 <SettingsNavLink tab="indexers" active={tab} onSelect={setTab} label={t('settings.tabs.indexers')} />
                 <SettingsNavLink tab="clients" active={tab} onSelect={setTab} label={t('settings.tabs.clients')} />
-                <SettingsNavLink tab="notifications" active={tab} onSelect={setTab} label={t('settings.tabs.notifications')} />
               </div>
 
               <div className="pt-3 pb-0.5">
@@ -197,6 +198,11 @@ export default function SettingsPage() {
 
               <div className="pt-3 pb-0.5">
                 <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-zinc-600 px-3 mb-1">Integrations</p>
+                {/* Notifications used to sit under Sources next to Indexers and
+                    Download Clients, which it is not: nothing comes in from it.
+                    A webhook, Discord or Apprise target is an outbound
+                    connection to another service, so it belongs here. */}
+                <SettingsNavLink tab="notifications" active={tab} onSelect={setTab} label={t('settings.tabs.notifications')} />
                 <SettingsNavLink tab="calibre" active={tab} onSelect={setTab} label={t('settings.tabs.calibre')} />
                 <SettingsNavLink tab="abs" active={tab} onSelect={setTab} label={t('settings.tabs.abs')} />
                 <button
@@ -220,6 +226,9 @@ export default function SettingsPage() {
                 <SettingsNavLink tab="import" active={tab} onSelect={setTab} label={t('settings.tabs.import')} />
                 <SettingsNavLink tab="blocklist" active={tab} onSelect={setTab} label={t('settings.tabs.blocklist')} />
                 <SettingsNavLink tab="logs" active={tab} onSelect={setTab} label={t('settings.tabs.logs')} />
+                {/* Advanced is last on purpose: it is the escape hatch for the
+                    rare keys, not a place to start (#2311). */}
+                <SettingsNavLink tab="advanced" active={tab} onSelect={setTab} label={t('settings.tabs.advanced', 'Advanced')} />
               </div>
             </>
           )}

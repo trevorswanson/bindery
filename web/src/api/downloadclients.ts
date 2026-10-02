@@ -55,12 +55,58 @@ export interface PathVisibility {
   path?: string
 }
 
+// Diagnose (the download client path doctor) answers with an ordered
+// checklist. code is stable; message and fix are English sentences from the
+// server. A check after a failure comes back as 'skipped'.
+export type DiagnoseStatus = 'pass' | 'warn' | 'fail' | 'skipped' | 'unknown'
+
+// mediaType is set on the per folder rows when ebook and audiobook grabs land
+// in different folders, and absent when they share one.
+export type DiagnoseMediaType = 'ebook' | 'audiobook'
+
+export interface DiagnoseCheck {
+  code: string
+  mediaType?: DiagnoseMediaType
+  status: DiagnoseStatus
+  message: string
+  fix?: string
+}
+
+export interface DiagnosePathRow {
+  mediaType?: DiagnoseMediaType
+  clientPath: string
+  // source says where clientPath came from, e.g. "the save path Bindery sends".
+  source?: string
+  remapRule: string
+  localPath: string
+}
+
+export interface DiagnoseHardlinkRow {
+  mediaType?: DiagnoseMediaType
+  downloadPath: string
+  root: string
+  // unknown: no test file could be written in the download folder.
+  // missing: the library folder does not exist, so it was not probed.
+  result: 'yes' | 'no' | 'unknown' | 'missing'
+  linkable: boolean
+  reason?: string
+}
+
+export interface DiagnoseResult {
+  clientType: string
+  checks: DiagnoseCheck[]
+  paths: DiagnosePathRow[]
+  hardlinks: DiagnoseHardlinkRow[]
+  primaryFix: string
+}
+
 export const downloadClientsApi = {
   // Download clients
   listDownloadClients: () => request<DownloadClient[]>('/downloadclient'),
   addDownloadClient: (data: Partial<DownloadClient>) => request<DownloadClient>('/downloadclient', { method: 'POST', body: JSON.stringify(data) }),
   updateDownloadClient: (id: number, data: DownloadClientUpdate) => request<DownloadClient>(`/downloadclient/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteDownloadClient: (id: number) => request<void>(`/downloadclient/${id}`, { method: 'DELETE' }),
+  diagnoseDownloadClient: (id: number) => request<DiagnoseResult>(`/downloadclient/${id}/diagnose`, { method: 'POST' }),
   testDownloadClient: (id: number) => request<{ message: string; health?: DownloadClientHealth; pathVisibility?: PathVisibility }>(`/downloadclient/${id}/test`, { method: 'POST' }),
   // Test an unsaved download-client config (Add/Edit form Test button). Does
   // not persist; mirrors testDownloadClient's response (minus async health).

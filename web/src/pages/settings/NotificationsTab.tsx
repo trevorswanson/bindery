@@ -5,6 +5,46 @@ import { inputCls } from './formStyles'
 import Toggle from './Toggle'
 import { dangerLink } from '../../components/buttons'
 
+// The seven trigger chips, in the order both forms render them, paired with the
+// hint that says what actually sends the event. Wording checked against the
+// senders: Grab is internal/api/queue.go and the scheduler's auto grab, Import
+// and Failure are internal/importer/scanner.go, Health is the indexer and
+// download client health checks, New book is internal/api/author_discovery.go,
+// and Request is internal/api/requests.go. Upgrade has no sender at all today,
+// and its hint says so rather than describing behaviour Bindery does not have.
+const TRIGGER_HINTS: Array<{ key: string; label: string; labelKey?: string }> = [
+  { key: 'grab', label: 'Grab' },
+  { key: 'import', label: 'Import' },
+  { key: 'failure', label: 'Failure' },
+  { key: 'upgrade', label: 'Upgrade' },
+  { key: 'health', label: 'Health' },
+  { key: 'bookAnnounced', label: 'New book', labelKey: 'settings.notifications.onBookAnnouncedToggle' },
+  { key: 'requestCreated', label: 'Request', labelKey: 'settings.notifications.requestToggle' },
+]
+
+// Plain descriptions under the chip row. The chips are jargon on their own, and
+// a title attribute alone never reaches a touch user, so the same text is
+// rendered as a list and reused as each chip's tooltip.
+function TriggerHints() {
+  const { t } = useTranslation()
+  return (
+    <ul className="mt-2 space-y-0.5 text-xs text-slate-500 dark:text-zinc-500" aria-label={t('settings.notifications.triggerHintsLabel')}>
+      {TRIGGER_HINTS.map(h => (
+        <li key={h.key}>
+          <span className="font-medium text-slate-600 dark:text-zinc-400">{h.labelKey ? t(h.labelKey) : h.label}</span>
+          {': '}
+          {t(`settings.notifications.eventHints.${h.key}`)}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+// triggerTitle is the tooltip for a chip, keyed the same way as the list above.
+function triggerTitle(t: (k: string) => string, key: string): string {
+  return t(`settings.notifications.eventHints.${key}`)
+}
+
 export default function NotificationsTab() {
   const { t } = useTranslation()
   const [notifications, setNotifications] = useState<NotificationConfig[]>([])
@@ -51,6 +91,8 @@ export default function NotificationsTab() {
                         {n.onUpgrade && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{t('settings.notifications.onUpgrade')}</span>}
                         {n.onFailure && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{t('settings.notifications.onFailure')}</span>}
                         {n.onHealth && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{t('settings.notifications.onHealth')}</span>}
+                        {n.onBookAnnounced && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{t('settings.notifications.onBookAnnounced')}</span>}
+                        {n.onRequestCreated && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{t('settings.notifications.onRequestCreated')}</span>}
                       </div>
                     </div>
                   </div>
@@ -135,6 +177,8 @@ function EditNotificationForm({ notification, onClose, onSaved }: { notification
   const [onFailure, setOnFailure] = useState(notification.onFailure)
   const [onUpgrade, setOnUpgrade] = useState(notification.onUpgrade)
   const [onHealth, setOnHealth] = useState(notification.onHealth)
+  const [onBookAnnounced, setOnBookAnnounced] = useState(notification.onBookAnnounced ?? false)
+  const [onRequestCreated, setOnRequestCreated] = useState(notification.onRequestCreated ?? false)
   const [saveError, setSaveError] = useState('')
   const [saving, setSaving] = useState(false)
 
@@ -147,7 +191,7 @@ function EditNotificationForm({ notification, onClose, onSaved }: { notification
     }
     setSaving(true)
     try {
-      const updated = await api.updateNotification(notification.id, { ...notification, name, url, topic, method, headers: headersJSON, onGrab, onImport, onFailure, onUpgrade, onHealth })
+      const updated = await api.updateNotification(notification.id, { ...notification, name, url, topic, method, headers: headersJSON, onGrab, onImport, onFailure, onUpgrade, onHealth, onBookAnnounced, onRequestCreated })
       onSaved(updated)
     } catch (err: unknown) {
       setSaveError(t('settings.notifications.saveFailed', { error: err instanceof Error ? err.message : 'Unknown error' }))
@@ -193,12 +237,15 @@ function EditNotificationForm({ notification, onClose, onSaved }: { notification
       <div>
         <p className="text-xs text-slate-600 dark:text-zinc-400 mb-2">Trigger on:</p>
         <div className="flex flex-wrap gap-2">
-          <button type="button" onClick={() => setOnGrab(!onGrab)} className={toggleCls(onGrab)}>Grab</button>
-          <button type="button" onClick={() => setOnImport(!onImport)} className={toggleCls(onImport)}>Import</button>
-          <button type="button" onClick={() => setOnFailure(!onFailure)} className={toggleCls(onFailure)}>Failure</button>
-          <button type="button" onClick={() => setOnUpgrade(!onUpgrade)} className={toggleCls(onUpgrade)}>Upgrade</button>
-          <button type="button" onClick={() => setOnHealth(!onHealth)} className={toggleCls(onHealth)}>Health</button>
+          <button type="button" onClick={() => setOnGrab(!onGrab)} title={triggerTitle(t, 'grab')} className={toggleCls(onGrab)}>Grab</button>
+          <button type="button" onClick={() => setOnImport(!onImport)} title={triggerTitle(t, 'import')} className={toggleCls(onImport)}>Import</button>
+          <button type="button" onClick={() => setOnFailure(!onFailure)} title={triggerTitle(t, 'failure')} className={toggleCls(onFailure)}>Failure</button>
+          <button type="button" onClick={() => setOnUpgrade(!onUpgrade)} title={triggerTitle(t, 'upgrade')} className={toggleCls(onUpgrade)}>Upgrade</button>
+          <button type="button" onClick={() => setOnHealth(!onHealth)} title={triggerTitle(t, 'health')} className={toggleCls(onHealth)}>Health</button>
+          <button type="button" aria-pressed={onBookAnnounced} onClick={() => setOnBookAnnounced(!onBookAnnounced)} title={triggerTitle(t, 'bookAnnounced')} className={toggleCls(onBookAnnounced)}>{t('settings.notifications.onBookAnnouncedToggle')}</button>
+          <button type="button" aria-pressed={onRequestCreated} onClick={() => setOnRequestCreated(!onRequestCreated)} title={triggerTitle(t, 'requestCreated')} className={toggleCls(onRequestCreated)}>{t('settings.notifications.requestToggle')}</button>
         </div>
+        <TriggerHints />
       </div>
       {saveError && (
         <div role="alert" className="px-3 py-1.5 rounded text-xs bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300">
@@ -225,6 +272,8 @@ function AddNotificationForm({ onClose, onAdded }: { onClose: () => void; onAdde
   const [onFailure, setOnFailure] = useState(true)
   const [onUpgrade, setOnUpgrade] = useState(false)
   const [onHealth, setOnHealth] = useState(false)
+  const [onBookAnnounced, setOnBookAnnounced] = useState(false)
+  const [onRequestCreated, setOnRequestCreated] = useState(false)
   const [saveError, setSaveError] = useState('')
   const [saving, setSaving] = useState(false)
 
@@ -240,7 +289,7 @@ function AddNotificationForm({ onClose, onAdded }: { onClose: () => void; onAdde
       const n = await api.addNotification({
         name, url, topic, method, type: 'webhook',
         headers: headersJSON,
-        onGrab, onImport, onFailure, onUpgrade, onHealth,
+        onGrab, onImport, onFailure, onUpgrade, onHealth, onBookAnnounced, onRequestCreated,
         enabled: true,
       })
       onAdded(n)
@@ -288,12 +337,15 @@ function AddNotificationForm({ onClose, onAdded }: { onClose: () => void; onAdde
       <div>
         <p className="text-xs text-slate-600 dark:text-zinc-400 mb-2">Trigger on:</p>
         <div className="flex flex-wrap gap-2">
-          <button type="button" onClick={() => setOnGrab(!onGrab)} className={toggleCls(onGrab)}>Grab</button>
-          <button type="button" onClick={() => setOnImport(!onImport)} className={toggleCls(onImport)}>Import</button>
-          <button type="button" onClick={() => setOnFailure(!onFailure)} className={toggleCls(onFailure)}>Failure</button>
-          <button type="button" onClick={() => setOnUpgrade(!onUpgrade)} className={toggleCls(onUpgrade)}>Upgrade</button>
-          <button type="button" onClick={() => setOnHealth(!onHealth)} className={toggleCls(onHealth)}>Health</button>
+          <button type="button" onClick={() => setOnGrab(!onGrab)} title={triggerTitle(t, 'grab')} className={toggleCls(onGrab)}>Grab</button>
+          <button type="button" onClick={() => setOnImport(!onImport)} title={triggerTitle(t, 'import')} className={toggleCls(onImport)}>Import</button>
+          <button type="button" onClick={() => setOnFailure(!onFailure)} title={triggerTitle(t, 'failure')} className={toggleCls(onFailure)}>Failure</button>
+          <button type="button" onClick={() => setOnUpgrade(!onUpgrade)} title={triggerTitle(t, 'upgrade')} className={toggleCls(onUpgrade)}>Upgrade</button>
+          <button type="button" onClick={() => setOnHealth(!onHealth)} title={triggerTitle(t, 'health')} className={toggleCls(onHealth)}>Health</button>
+          <button type="button" aria-pressed={onBookAnnounced} onClick={() => setOnBookAnnounced(!onBookAnnounced)} title={triggerTitle(t, 'bookAnnounced')} className={toggleCls(onBookAnnounced)}>{t('settings.notifications.onBookAnnouncedToggle')}</button>
+          <button type="button" aria-pressed={onRequestCreated} onClick={() => setOnRequestCreated(!onRequestCreated)} title={triggerTitle(t, 'requestCreated')} className={toggleCls(onRequestCreated)}>{t('settings.notifications.requestToggle')}</button>
         </div>
+        <TriggerHints />
       </div>
       {saveError && (
         <div role="alert" className="px-3 py-1.5 rounded text-xs bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300">

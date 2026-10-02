@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/vavallee/bindery/internal/covers"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/textutil"
@@ -68,6 +70,13 @@ type Importer struct {
 	// minimal). Production wires this via WithSeries from cmd/bindery/main.go.
 	series *db.SeriesRepo
 
+	// covers is where a library's cover.jpg files are copied so the image
+	// proxy can serve them (#2564). Nil means no cover is stored at all:
+	// the importer never writes the library path into image_url, because
+	// nothing in Bindery can serve a host path and the row would only look
+	// populated.
+	covers *covers.Store
+
 	openReader func(libraryPath string) (readerIface, error)
 
 	mu       sync.Mutex
@@ -124,6 +133,14 @@ func (i *Importer) WithRunTracking(runs *db.CalibreImportRunRepo, snapshots *db.
 // test wiring that doesn't need series semantics.
 func (i *Importer) WithSeries(series *db.SeriesRepo) *Importer {
 	i.series = series
+	return i
+}
+
+// WithCoverStore attaches the store each imported book's cover.jpg is copied
+// into (#2564). Production wires <DataDir>/covers, the same store the image
+// proxy serves bindery-cover: references from.
+func (i *Importer) WithCoverStore(store *covers.Store) *Importer {
+	i.covers = store
 	return i
 }
 
@@ -332,6 +349,12 @@ func (i *Importer) importOne(ctx context.Context, runID int64, cb CalibreBook, s
 		stats.Skipped++
 		return
 	}
+	// Copy the library's cover.jpg into the covers store once per Calibre
+	// book (every format shares it) and give the book row that cover unless
+	// a metadata provider already supplied one. Done before the after
+	// snapshot below so a rollback can put the previous value back.
+	coverRef := i.storeCover(cb)
+	i.applyBookCover(ctx, book.row, coverRef)
 	if newBook {
 		stats.BooksAdded++
 	} else {
@@ -366,7 +389,7 @@ func (i *Importer) importOne(ctx context.Context, runID int64, cb CalibreBook, s
 	}
 
 	for _, f := range cb.Formats {
-		added, edition, err := i.upsertEdition(ctx, runID, book.row, cb, f)
+		added, edition, err := i.upsertEdition(ctx, runID, book.row, cb, f, coverRef)
 		if err != nil {
 			slog.Warn("calibre import: edition upsert failed",
 				"calibre_id", cb.CalibreID, "format", f.Format, "error", err)
@@ -391,7 +414,7 @@ func (i *Importer) importOne(ctx context.Context, runID int64, cb CalibreBook, s
 	// book with none, and there was no supported way to re-point a stale row
 	// for a Calibre library: a folder scan fights the Calibre-shaped layout,
 	// and manual-import/match needs a downloadId a Calibre book never has.
-	i.registerBookFiles(ctx, book.row, cb)
+	i.registerBookFiles(ctx, runID, book.row, cb)
 
 	// Series persistence (#905). Calibre's books_series_link plus series
 	// table is read by the cursor as cb.Series; we propagate the membership
@@ -434,16 +457,21 @@ func calibreFormatMediaType(format string) string {
 // than a choice between them; registering only the first would leave the
 // audiobook untracked on exactly the libraries most likely to hold both.
 //
-// AddBookFile is INSERT OR IGNORE on a globally unique path, so re-running an
-// import is a no-op and a path another book already owns is left alone rather
-// than stolen. A file that has MOVED inside the Calibre library appends the
-// new row beside the old one; which of the two the book then renders is
-// decided by the file-tracking rules in #2186, not here.
+// The insert is OR IGNORE on a globally unique path, so re-running an import is
+// a no-op and a path another book already owns is left alone rather than
+// stolen. A file that has MOVED inside the Calibre library appends the new row
+// beside the old one; which of the two the book then renders is decided by the
+// file-tracking rules in #2186, not here.
+//
+// Ownership is narrowed the way #1868 narrowed series links: a row is claimed,
+// and therefore eligible for rollback, only when this run is the one that
+// inserted it. A path a real download placed, or an earlier run created, gets
+// its provenance refreshed but is never unwound by this run's rollback.
 //
 // Failures are logged and never abort the import: the book and its metadata
 // are already committed, and losing the whole row over a file-tracking write
 // would be a worse outcome than an untracked path.
-func (i *Importer) registerBookFiles(ctx context.Context, book *models.Book, cb CalibreBook) {
+func (i *Importer) registerBookFiles(ctx context.Context, runID int64, book *models.Book, cb CalibreBook) {
 	if i.books == nil || book == nil || book.ID == 0 {
 		return
 	}
@@ -452,11 +480,38 @@ func (i *Importer) registerBookFiles(ctx context.Context, book *models.Book, cb 
 		if path == "" {
 			continue
 		}
-		if err := i.books.SetFormatFilePath(ctx, book.ID, calibreFormatMediaType(f.Format), path); err != nil {
+		created, err := i.books.AddBookFileIfMissing(ctx, book.ID, calibreFormatMediaType(f.Format), path)
+		if err != nil {
 			slog.Warn("calibre import: could not track book file",
 				"calibre_id", cb.CalibreID, "book_id", book.ID, "format", f.Format, "path", path, "error", err)
+			continue
+		}
+		externalID := calibreBookFileExternalID(path)
+		i.upsertProvenance(ctx, runID, entityTypeBookFile, externalID, book.ID)
+		if created {
+			i.recordCreateSnapshot(ctx, runID, entityTypeBookFile, externalID, book.ID)
 		}
 	}
+}
+
+const bookFileExternalIDPrefix = "calibre:book-file:"
+
+// calibreBookFileExternalID is the provenance key for a book_files row created
+// during a Calibre import run. The path is the natural key: book_files.path is
+// globally UNIQUE, and rollback deletes by path rather than by row id, which
+// the provenance row's local_id (the book) does not carry.
+func calibreBookFileExternalID(path string) string {
+	return bookFileExternalIDPrefix + path
+}
+
+// parseCalibreBookFileExternalID recovers the on-disk path a book-file
+// provenance key was built from.
+func parseCalibreBookFileExternalID(externalID string) (path string, ok bool) {
+	rest, found := strings.CutPrefix(externalID, bookFileExternalIDPrefix)
+	if !found || rest == "" {
+		return "", false
+	}
+	return rest, true
 }
 
 // attachBookToSeries upserts the Bindery series row for cb.Series and links
@@ -481,14 +536,15 @@ func (i *Importer) attachBookToSeries(ctx context.Context, runID int64, book *mo
 	if cs.Position > 0 {
 		position = strconv.FormatFloat(cs.Position, 'f', -1, 64)
 	}
-	// LinkBookIfMissing first so we learn whether this run actually created
-	// the membership. Only a link this run created may be unwound by a
+	// Link first so we learn whether this run actually created the
+	// membership. Only a link this run created may be unwound by a
 	// rollback — a membership the user (or an earlier run) already had must
-	// survive. When the link already existed, refresh position/primary the
-	// way UpsertBookLink always did.
-	created, err := i.series.LinkBookIfMissing(ctx, series.ID, book.ID, position, true)
+	// survive. When the link already existed, refresh the position only:
+	// rewriting primary_series here re-promoted a series the user had
+	// demoted, on every re-import (#2525).
+	created, err := i.series.LinkBookPreservingPrimary(ctx, series.ID, book.ID, position)
 	if err == nil && !created {
-		err = i.series.UpsertBookLink(ctx, series.ID, book.ID, position, true)
+		err = i.series.UpdateBookLinkPosition(ctx, series.ID, book.ID, position)
 	}
 	if err != nil {
 		slog.Warn("calibre import: series link failed", "name", cs.Name, "book_id", book.ID, "error", err)
@@ -921,11 +977,49 @@ func (i *Importer) applyBookFields(ctx context.Context, book *models.Book, cb Ca
 	return i.books.Update(ctx, book)
 }
 
+// storeCover copies cb's cover.jpg into the covers store and returns the
+// bindery-cover: reference, or "" when the book has no cover, no store is
+// wired, or the file is not a usable image. Never returns the library path:
+// before #2564 that is exactly what landed in editions.image_url, and it
+// rendered as the SPA shell.
+func (i *Importer) storeCover(cb CalibreBook) string {
+	if i.covers == nil || strings.TrimSpace(cb.CoverPath) == "" {
+		return ""
+	}
+	ref, err := i.covers.Put(cb.CoverPath)
+	if err != nil {
+		slog.Debug("calibre import: cover not stored", "calibre_id", cb.CalibreID, "path", cb.CoverPath, "error", err)
+		return ""
+	}
+	return ref
+}
+
+// applyBookCover sets book.image_url to coverRef when the book has no cover
+// a metadata provider could have supplied: an empty value, a stale host path,
+// or an earlier stored reference (the library's cover may have changed). A
+// provider URL is left alone; Refresh Metadata owns that field once it is
+// populated, and the Calibre cover is only ever the fallback.
+func (i *Importer) applyBookCover(ctx context.Context, book *models.Book, coverRef string) {
+	if book == nil || coverRef == "" || book.ImageURL == coverRef {
+		return
+	}
+	current := strings.TrimSpace(book.ImageURL)
+	if current != "" && !filepath.IsAbs(current) && !covers.IsRef(current) {
+		return
+	}
+	if err := i.books.SetImageURL(ctx, book.ID, coverRef); err != nil {
+		slog.Warn("calibre import: book cover not set", "book_id", book.ID, "error", err)
+		return
+	}
+	book.ImageURL = coverRef
+}
+
 // upsertEdition upserts one Bindery edition for a single Calibre format.
 // Returns (added, edition, err) where added is true only when a brand-new
 // row was created; the returned edition is the resulting row so caller can
-// snapshot it.
-func (i *Importer) upsertEdition(ctx context.Context, runID int64, book *models.Book, cb CalibreBook, f CalibreFormat) (bool, *models.Edition, error) {
+// snapshot it. coverRef is the stored-cover reference for the book (see
+// storeCover), shared by every format.
+func (i *Importer) upsertEdition(ctx context.Context, runID int64, book *models.Book, cb CalibreBook, f CalibreFormat, coverRef string) (bool, *models.Edition, error) {
 	if f.Format == "" {
 		return false, nil, nil
 	}
@@ -956,12 +1050,21 @@ func (i *Importer) upsertEdition(ctx context.Context, runID int64, book *models.
 		PublishDate: cb.PublishDate,
 		Format:      strings.ToUpper(f.Format),
 		Language:    lang,
-		ImageURL:    cb.CoverPath,
+		ImageURL:    coverRef,
 		IsEbook:     true,
 		Monitored:   true,
 	}
 	if err := i.editions.Upsert(ctx, e); err != nil {
 		return false, nil, err
+	}
+	// Upsert keeps the existing image_url when the new one is empty, which
+	// is right for a provider cover but wrong for the host path an older
+	// importer stored: that value can never be served, so clear it rather
+	// than let it outlive the fix.
+	if coverRef == "" && prior != nil && filepath.IsAbs(prior.ImageURL) {
+		if err := i.editions.SetImageURL(ctx, e.ID, ""); err != nil {
+			return false, nil, err
+		}
 	}
 	// Re-fetch to get the assigned ID (Upsert may have created or updated).
 	stored, lookupErr := i.editions.GetByForeignID(ctx, foreignID)

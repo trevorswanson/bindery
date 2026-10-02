@@ -36,7 +36,7 @@ its type definitions) is listed anyway, and modules that only build on one of
 the three release platforms are listed for all of them. Omitting something that
 does ship is the failure that matters.
 
-26 Go modules, 12 npm packages.
+26 Go modules, 13 npm packages.
 
 ## Go modules
 
@@ -44,7 +44,7 @@ does ship is the failure that matters.
 | --- | --- | --- | --- |
 | [github.com/beorn7/perks](https://github.com/beorn7/perks/blob/v1.0.1/LICENSE) | v1.0.1 | MIT | — |
 | [github.com/cespare/xxhash/v2](https://github.com/cespare/xxhash/blob/v2.3.0/LICENSE.txt) | v2.3.0 | MIT | — |
-| [github.com/coreos/go-oidc/v3](https://github.com/coreos/go-oidc/blob/v3.20.0/LICENSE) | v3.20.0 | Apache-2.0 | yes |
+| [github.com/coreos/go-oidc/v3](https://github.com/coreos/go-oidc/blob/v3.21.0/LICENSE) | v3.21.0 | Apache-2.0 | yes |
 | [github.com/dhowden/tag](https://github.com/dhowden/tag/blob/3d75831295e8/LICENSE) | v0.0.0-20240417053706-3d75831295e8 | BSD-2-Clause | — |
 | [github.com/dustin/go-humanize](https://github.com/dustin/go-humanize/blob/v1.0.1/LICENSE) | v1.0.1 | MIT | — |
 | [github.com/go-chi/chi/v5](https://github.com/go-chi/chi/blob/v5.3.2/LICENSE) | v5.3.2 | MIT | — |
@@ -59,15 +59,15 @@ does ship is the failure that matters.
 | [github.com/prometheus/procfs](https://github.com/prometheus/procfs/blob/v0.21.1/LICENSE) | v0.21.1 | Apache-2.0 | yes |
 | [github.com/remyoudompheng/bigfft](https://github.com/remyoudompheng/bigfft/blob/24d4a6f8daec/LICENSE) | v0.0.0-20230129092748-24d4a6f8daec | BSD-3-Clause | — |
 | [github.com/robfig/cron/v3](https://github.com/robfig/cron/blob/v3.0.1/LICENSE) | v3.0.1 | MIT | — |
-| [golang.org/x/crypto](https://cs.opensource.google/go/x/crypto/+/v0.56.0:LICENSE) | v0.56.0 | BSD-3-Clause | — |
-| [golang.org/x/oauth2](https://cs.opensource.google/go/x/oauth2/+/v0.36.0:LICENSE) | v0.36.0 | BSD-3-Clause | — |
-| [golang.org/x/sys](https://cs.opensource.google/go/x/sys/+/v0.47.0:LICENSE) | v0.47.0 | BSD-3-Clause | — |
-| [golang.org/x/text](https://cs.opensource.google/go/x/text/+/v0.41.0:LICENSE) | v0.41.0 | BSD-3-Clause | — |
+| [golang.org/x/crypto](https://cs.opensource.google/go/x/crypto/+/v0.57.0:LICENSE) | v0.57.0 | BSD-3-Clause | — |
+| [golang.org/x/oauth2](https://cs.opensource.google/go/x/oauth2/+/v0.37.0:LICENSE) | v0.37.0 | BSD-3-Clause | — |
+| [golang.org/x/sys](https://cs.opensource.google/go/x/sys/+/v0.48.0:LICENSE) | v0.48.0 | BSD-3-Clause | — |
+| [golang.org/x/text](https://cs.opensource.google/go/x/text/+/v0.42.0:LICENSE) | v0.42.0 | BSD-3-Clause | — |
 | [google.golang.org/protobuf](https://github.com/protocolbuffers/protobuf-go/blob/v1.36.11/LICENSE) | v1.36.11 | BSD-3-Clause | — |
-| [modernc.org/libc](https://gitlab.com/cznic/libc/-/blob/v1.74.4/LICENSE) | v1.74.4 | BSD-3-Clause | — |
+| [modernc.org/libc](https://gitlab.com/cznic/libc/-/blob/v1.74.4/LICENSE) | v1.75.7 | BSD-3-Clause | — |
 | [modernc.org/mathutil](https://gitlab.com/cznic/mathutil/-/blob/v1.7.1/LICENSE) | v1.7.1 | BSD-3-Clause | — |
-| [modernc.org/memory](https://gitlab.com/cznic/memory/blob/v1.11.0/LICENSE-GO) | v1.11.0 | BSD-3-Clause | — |
-| [modernc.org/sqlite](https://gitlab.com/cznic/sqlite/blob/v1.57.0/LICENSE) | v1.57.0 | BSD-3-Clause | — |
+| [modernc.org/memory](https://gitlab.com/cznic/memory/blob/v1.12.1/LICENSE-GO) | v1.12.1 | BSD-3-Clause | — |
+| [modernc.org/sqlite](https://gitlab.com/cznic/sqlite/blob/v1.59.0/LICENSE) | v1.59.0 | BSD-3-Clause | — |
 
 ### Notes on specific modules
 
@@ -79,15 +79,16 @@ does ship is the failure that matters.
 | Package | Version | License |
 | --- | --- | --- |
 | @babel/runtime | 7.29.7 | MIT |
+| @remix-run/route-pattern | 0.22.1 | MIT |
 | cookie-es | 3.1.1 | MIT |
 | html-parse-stringify | 4.0.1 | MIT |
 | i18next | 26.4.2 | MIT |
 | i18next-browser-languagedetector | 8.2.1 | MIT |
-| react | 19.2.8 | MIT |
-| react-dom | 19.2.8 | MIT |
-| react-i18next | 17.0.13 | MIT |
-| react-router | 8.3.1 | MIT |
-| scheduler | 0.27.0 | MIT |
+| react | 19.3.0 | MIT |
+| react-dom | 19.3.0 | MIT |
+| react-i18next | 17.0.14 | MIT |
+| react-router | 8.4.0 | MIT |
+| scheduler | 0.28.0 | MIT |
 | typescript | 6.0.3 | Apache-2.0 |
 | use-sync-external-store | 1.6.0 | MIT |
 
@@ -165,7 +166,7 @@ SoundCloud Ltd. (http://soundcloud.com/).
 
 Each distinct license text appears once, with the dependencies it covers.
 
-### 1. Apache-2.0 — github.com/coreos/go-oidc/v3@v3.20.0 (LICENSE)
+### 1. Apache-2.0 — github.com/coreos/go-oidc/v3@v3.21.0 (LICENSE)
 
 ```
 Apache License
@@ -1022,15 +1023,15 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 10. BSD-3-Clause — golang.org/x/crypto@v0.56.0 (LICENSE)
+### 10. BSD-3-Clause — golang.org/x/crypto@v0.57.0 (LICENSE)
 
 <details>
 <summary>Applies to 4 dependencies</summary>
 
-- golang.org/x/crypto@v0.56.0 (LICENSE)
-- golang.org/x/oauth2@v0.36.0 (LICENSE)
-- golang.org/x/sys@v0.47.0 (LICENSE)
-- golang.org/x/text@v0.41.0 (LICENSE)
+- golang.org/x/crypto@v0.57.0 (LICENSE)
+- golang.org/x/oauth2@v0.37.0 (LICENSE)
+- golang.org/x/sys@v0.48.0 (LICENSE)
+- golang.org/x/text@v0.42.0 (LICENSE)
 
 </details>
 
@@ -1096,7 +1097,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 12. BSD-3-Clause — modernc.org/libc@v1.74.4 (LICENSE)
+### 12. BSD-3-Clause — modernc.org/libc@v1.75.7 (LICENSE)
 
 ```
 Copyright (c) 2017 The Libc Authors. All rights reserved.
@@ -1128,7 +1129,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 13. BSD-3-Clause — modernc.org/libc@v1.74.4 (LICENSE-3RD-PARTY.md)
+### 13. BSD-3-Clause — modernc.org/libc@v1.75.7 (LICENSE-3RD-PARTY.md)
 
 ```
 # Third-Party Software Notices
@@ -1470,7 +1471,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 15. BSD-3-Clause — modernc.org/memory@v1.11.0 (LICENSE-GO)
+### 15. BSD-3-Clause — modernc.org/memory@v1.12.1 (LICENSE-GO)
 
 ```
 Copyright (c) 2009 The Go Authors. All rights reserved.
@@ -1502,7 +1503,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 16. BSD-3-Clause — modernc.org/sqlite@v1.57.0 (LICENSE)
+### 16. BSD-3-Clause — modernc.org/sqlite@v1.59.0 (LICENSE)
 
 ```
 Copyright (c) 2017 The Sqlite Authors. All rights reserved.
@@ -1729,7 +1730,33 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 25. MIT — npm:cookie-es@3.1.1 (LICENSE)
+### 25. MIT — npm:@remix-run/route-pattern@0.22.1 (LICENSE)
+
+```
+MIT License
+
+Copyright (c) 2025 Shopify Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 26. MIT — npm:cookie-es@3.1.1 (LICENSE)
 
 ```
 MIT License
@@ -1762,7 +1789,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 26. MIT — npm:html-parse-stringify@4.0.1 (LICENSE)
+### 27. MIT — npm:html-parse-stringify@4.0.1 (LICENSE)
 
 ```
 MIT License
@@ -1789,7 +1816,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 27. MIT — npm:i18next-browser-languagedetector@8.2.1 (LICENSE)
+### 28. MIT — npm:i18next-browser-languagedetector@8.2.1 (LICENSE)
 
 ```
 The MIT License (MIT)
@@ -1815,7 +1842,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 28. MIT — npm:i18next@26.4.2 (LICENSE)
+### 29. MIT — npm:i18next@26.4.2 (LICENSE)
 
 ```
 The MIT License (MIT)
@@ -1841,7 +1868,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 29. MIT — npm:react-i18next@17.0.13 (LICENSE)
+### 30. MIT — npm:react-i18next@17.0.14 (LICENSE)
 
 ```
 The MIT License (MIT)
@@ -1867,7 +1894,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 30. MIT — npm:react-router@8.3.1 (LICENSE.md)
+### 31. MIT — npm:react-router@8.4.0 (LICENSE.md)
 
 ```
 MIT License
@@ -1895,14 +1922,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 31. MIT — npm:react-dom@19.2.8 (LICENSE)
+### 32. MIT — npm:react-dom@19.3.0 (LICENSE)
 
 <details>
 <summary>Applies to 4 dependencies</summary>
 
-- npm:react-dom@19.2.8 (LICENSE)
-- npm:react@19.2.8 (LICENSE)
-- npm:scheduler@0.27.0 (LICENSE)
+- npm:react-dom@19.3.0 (LICENSE)
+- npm:react@19.3.0 (LICENSE)
+- npm:scheduler@0.28.0 (LICENSE)
 - npm:use-sync-external-store@1.6.0 (LICENSE)
 
 </details>

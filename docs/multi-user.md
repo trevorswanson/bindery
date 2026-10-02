@@ -8,9 +8,10 @@ Bindery v1.0 introduces per-user library scoping: authors, books, downloads, qua
 >
 > When enforcement is on, Bindery scopes:
 > - **Tier-2 join-scoped resources** — download queue, history, pending grabs, and the OPDS catalogue — to the requesting user.
-> - **Per-user resources** — each user's own authors, books, profiles, API key, password, and notification preferences. (Root folders are **not** per-user; see the note above.)
+> - **Per-user resources** — each user's own authors, books, quality and metadata profiles, and password. (Root folders are **not** per-user; see the note above. The API key and the notification webhooks are instance wide and admin only.)
+> - **Background Hardcover list syncs** to the list's owner: a list decides whether to create a book by reading only the rows its owner can see, so one user's list never skips, widens or re-opens another user's book and never reuses another user's author. Rows with no owner stay shared and reusable by every list. Because a book's and an author's Hardcover id is unique across the whole instance, a work another user already holds cannot be created a second time; the sync leaves that row untouched, logs whose it is, and counts the book as skipped.
 >
-> **Admins see everything in list views.** With enforcement on, an `admin` is never filtered by ownership: the authors and books list endpoints (and the OPDS feed) return *all* users' libraries plus unowned/global rows, the same way an admin can already open any single item by ID. This is a **shared library across admins**, by design — it does not widen access, it makes lists consistent with per-item access. Non-admin (`user`) accounts stay isolated to their own rows plus unowned/global rows. Requests authenticated by API key (or in `disabled` / `local-only` auth modes) carry no user identity and are likewise unscoped.
+> **Admins see everything in list views.** With enforcement on, an `admin` is never filtered by ownership: the authors and books list endpoints (and the OPDS feed) return *all* users' libraries plus unowned/global rows, the same way an admin can already open any single item by ID. This is a **shared library across admins**, by design: it does not widen access, it makes lists consistent with per-item access. Non-admin (`user`) accounts stay isolated to their own rows plus unowned/global rows. Requests authenticated by API key, and requests the auth mode admits without a login (every request in `disabled` mode, local clients in `local-only` mode), act as the administrator: they carry the admin role and the first admin account's id, so they are likewise unscoped and anything they create is owned by that admin.
 >
 > Role-based gating of admin-only configuration (indexers, download clients, user management, system settings) applies in **both** modes — that does not depend on `BINDERY_ENFORCE_TENANCY`. The flag only controls whether *library data* is partitioned per user.
 >
@@ -18,35 +19,78 @@ Bindery v1.0 introduces per-user library scoping: authors, books, downloads, qua
 
 > **Choosing an auth mode: `local-only` requires `BINDERY_TRUSTED_PROXY` behind a proxy.** In `local-only` mode any client whose resolved IP is private is served with admin rights and no login. Bindery resolves that IP from the TCP peer unless `BINDERY_TRUSTED_PROXY` names the proxies whose `X-Forwarded-For` it may trust, so behind a reverse proxy or a Kubernetes ingress the peer is the proxy's own private address and every proxied request qualifies. Set `BINDERY_TRUSTED_PROXY` to your proxy's IP or CIDR, or pick `enabled` (or `proxy`) mode. Bindery logs a warning at startup and on a mode change when it sees this combination. An instance reached directly on a LAN with no proxy in front is unaffected.
 
+> **The Calibre delivery queue is install wide.** There is one Calibre target per install, so the queue under `/api/v1/calibre/deliveries` is admin only and not scoped by owner: it holds every user's ebooks. The same goes for the Calibre bridge pull routes under `/bridge/v1`: whoever holds the Calibre plugin key can list and download every queued book, whichever account imported it. Treat that key like an admin credential. See [API.md](API.md#calibre-bridge-pull).
+
 For upgrade instructions and migration steps, see [docs/upgrade-v1.md](upgrade-v1.md).
 
 ## Role model
 
-Two roles exist: `admin` and `user`.
+Three roles exist: `admin`, `user` and `requester`.
 
 - The **first account** created through the `/setup` wizard is always `admin`.
 - Users created by an admin via the **Users** page (the people icon in the header) default to the `user` role.
-- OIDC auto-provisioned users get the `user` role by default. To make the IdP authoritative for the admin role, set `BINDERY_OIDC_ADMIN_GROUP` so users in that IdP group are promoted automatically; see [OIDC role mapping](auth-oidc.md#oidc-role-mapping) in [docs/auth-oidc.md](auth-oidc.md).
-- An admin can change any user's role at any time: **Make admin / Make user** on the Users page, or `PUT /api/v1/auth/users/{id}/role` with `{"role": "admin"}`.
+- OIDC auto-provisioned users get the `user` role by default, or whatever `BINDERY_OIDC_DEFAULT_ROLE` says (`requester` is supported). To make the IdP authoritative for the admin role, set `BINDERY_OIDC_ADMIN_GROUP` so users in that IdP group are promoted automatically; see [OIDC role mapping](auth-oidc.md#oidc-role-mapping) in [docs/auth-oidc.md](auth-oidc.md).
+- Proxy auth provisions `user`. There is no header to role mapping; an admin sets the role after the account exists (see [docs/auth-proxy.md](auth-proxy.md#roles)).
+- An admin can change any user's role at any time: the role select on the Users page, or `PUT /api/v1/auth/users/{id}/role` with `{"role": "admin"}`, `{"role": "user"}` or `{"role": "requester"}`. The last admin cannot be demoted to either other role.
 
 ### Capability matrix
 
-| Action | `admin` | `user` |
-|--------|:-------:|:------:|
-| View and manage own authors/books/downloads | Yes | Yes |
-| View and manage own quality/metadata profiles | Yes | Yes |
-| Manage root folders (single shared/global pool) | Yes | No |
-| Change own password and API key | Yes | Yes |
-| Configure own notification preferences | Yes | Yes |
-| View other users' library data | Yes | No |
-| Manage other users' library data | Yes | No |
-| Create, edit, delete users | Yes | No |
-| Change user roles | Yes | No |
-| Configure indexers | Yes | No |
-| Configure download clients | Yes | No |
-| Configure system-wide settings | Yes | No |
-| View admin settings tabs in UI | Yes | No |
-| Trigger system-level operations (backup, scan, migrate) | Yes | No |
+| Action | `admin` | `user` | `requester` |
+|--------|:-------:|:------:|:-----------:|
+| View and manage own authors/books/downloads | Yes | Yes | No |
+| View and manage own quality/metadata profiles | Yes | Yes | No |
+| Manage root folders (single shared/global pool) | Yes | No | No |
+| Change own password | Yes | Yes | Yes |
+| Read or rotate the instance API key | Yes | No | No |
+| Configure notification webhooks | Yes | No | No |
+| View other users' library data | Yes | No | Titles only, read only (see [Requester](#requester)) |
+| Manage other users' library data | Yes | No | No |
+| Search metadata providers | Yes | Yes | Yes, rate limited |
+| Ask for a book or an author | Yes | Yes | Yes |
+| Approve or decline requests | Yes | No | No |
+| Download book files, use OPDS | Yes | Yes | No |
+| Create, edit, delete users | Yes | No | No |
+| Change user roles | Yes | No | No |
+| Configure indexers | Yes | No | No |
+| Configure download clients | Yes | No | No |
+| Configure system-wide settings | Yes | No | No |
+| View admin settings tabs in UI | Yes | No | No |
+| Trigger a backup or a migration import | Yes | No | No |
+| Start a library scan | Yes | Yes | No |
+| See server filesystem paths (storage health, path settings, last library scan) | Yes | No | No |
+
+## Requester
+
+A requester asks for books; an admin decides. It is the role for people who share an instance but should not grab, delete or configure anything: family, friends, a book club.
+
+**What a requester can do**
+
+- Browse the library read only. The Library page lists each book's title, author, series, cover, status and which formats are on disk. It comes from `GET /api/v1/requests/library`, a projection built field by field, so it carries no file paths, owner ids, provider ids or links into book pages.
+- Search the metadata providers from the Request page, the same search the Add dialog runs. Those searches spend provider quota, so each requester is limited to a burst of 20 and then one every 3 seconds; creating a request looks the item up too and spends the same allowance. Cover images have a separate, larger allowance.
+- Request a book or an author, choosing only the format. Bindery looks the item up itself and stores the title and author the provider reports; nothing else the requester sends is kept. A request for something already in the library, or already requested by the same person, is refused with a sentence saying so.
+- Follow their own requests on My requests: waiting, approved, available once a file is imported (for an author, how many of the author's books are in), or declined with the admin's reason. A pending request can be withdrawn.
+- Change their own password, and sign in and out.
+
+**What a requester cannot do**
+
+- Add, grab, search indexers, delete, edit or refresh anything, or see the queue, history, blocklist, wanted list, calendar, series or recommendations.
+- Open book or author pages, download a file, or use OPDS (OPDS answers 403 for a requester whether they sign in with a cookie or with Basic credentials).
+- See settings, profiles, root folders, indexers, download clients, notifications, users or system pages, or read the API key.
+- Have more than 25 requests waiting at once. An admin can change that with the `requests.max_pending_per_user` setting.
+
+These limits are enforced on the server, not just hidden in the UI. Every API route a requester may call is on one allow list (`auth.RequesterAllowList`); any other route, including one added in a later release, answers 403. The list is checked against the path after `BINDERY_URL_BASE` is removed, and a path that is encoded, doubled or dotted in a way that could route differently is refused rather than interpreted.
+
+**Approving a request.** Admins see **Requests** in the nav with a count of pending requests. Approve opens the same choices as adding by hand (metadata profile, root folder, monitoring and format for an author; format and search on add for a book), prefilled from the instance defaults. Bindery then runs the ordinary add with the requester as the owner, so the new author and books belong to the requester. Two admins approving the same request at once produce one add; the second is told it was already decided. Decline takes an optional reason, which the requester sees. Turn on the **Request** toggle on a webhook in Settings, Notifications to hear about new requests; it is off for every existing webhook.
+
+**Auto-approving one account.** An admin can skip the queue for a single requester with the checkbox in the **Auto-approve requests** column on the Users page, or `PUT /api/v1/auth/users/{id}/auto-approve` with `{"enabled": true}`. It is off by default and off for every account that has never had it set. With it on, a request from that account runs the same claim and add an admin's Approve runs, straight away and with no deciding user recorded, so the already-in-the-library check, the stored-payload revalidation and the pending cap all still apply. A book request searches on add; an author request runs the ordinary catalogue sync. If the add fails the request stays pending in the queue rather than being lost.
+
+The account gets the same `requests.max_pending_per_user` limit as a daily ceiling: once it has had that many requests auto-approved since midnight UTC, the next one is left pending for a human, and the counter resets the next day. The limit defaults to 25. An auto-approved request does not fire the Request webhook, so an admin is not pinged for an item that was added without them; a request left pending, whether the add failed or the day's quota is spent, still notifies. The switch only affects the next request: anything already waiting stays waiting for a human.
+
+**Requester restrictions hold in every auth mode.** `disabled` and `local-only` mode serve an anonymous caller (or, in `local-only`, any client on a private network) as the admin, but a request carrying a requester's own session is never elevated that way: it acts as the requester, and so does its OPDS access. Two things still act as the admin whatever cookie rides along: the API key, and, in those two modes, a caller who simply signs out, because the mode itself admits them. So a requester account only means something when the person cannot reach Bindery without signing in, which in practice is `enabled` or `proxy` mode.
+
+New requests notify the **Request** webhook at most once an hour for the same item from the same person, so withdrawing and asking again does not repeat the alert, and at most 10 times an hour per requester; past that the requests are still stored and shown under Requests, only the webhook is skipped. Titles, authors and usernames in that webhook have mentions, Slack escapes, markdown links and link schemes neutralised, so nothing in them is clickable or pings a channel.
+
+**Tenancy.** With `BINDERY_ENFORCE_TENANCY` off (the default), a requester's Library lists every book in the instance, whoever added it, and approved requests are simply part of the shared library. With it on, the Library lists the requester's own books plus unowned ones, which after an approval means what they asked for. Either way a requester only ever sees their own requests, and a request for a book another user already has is refused as already in the library, because a book can only be in the library once.
 
 ## User management
 
@@ -70,7 +114,7 @@ curl http://bindery:8787/api/v1/auth/users \
   -H "X-Api-Key: <admin-api-key>"
 ```
 
-Returns: `[{"id": 1, "username": "admin", "role": "admin", "last_seen": "..."}]`. Passwords and OIDC credentials are never returned.
+Returns: `[{"id": 1, "username": "admin", "role": "admin", "createdAt": "2026-01-01T00:00:00Z"}]`, with `email` and `displayName` present only when the account has them. Passwords and OIDC credentials are never returned.
 
 ### Updating a user
 
@@ -80,6 +124,14 @@ curl -X PUT http://bindery:8787/api/v1/auth/users/2/role \
   -H "X-Api-Key: <admin-api-key>" \
   -H "Content-Type: application/json" \
   -d '{"role": "admin"}'
+```
+
+```bash
+# Make a requester
+curl -X PUT http://bindery:8787/api/v1/auth/users/3/role \
+  -H "X-Api-Key: <admin-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"role": "requester"}'
 ```
 
 ### Deleting a user
@@ -97,18 +149,18 @@ Deleting a user does **not** delete their library data. Authors, books, and down
 
 ## Settings UI layout
 
-Everyone sees the **General** tab (appearance, downloads, file naming, storage, backup, security — including their own API key and password change) and **About**. The remaining tabs are admin-only, in four groups:
+Everyone sees the **General** tab (appearance, and the Security section, which is where a user changes their own password) and **About**. The API key, the session secret rotation, downloads, file naming, storage and backup render inside General for admins only. The remaining tabs are admin-only, in four groups:
 
-- **Sources** — Indexers, Download Clients, Notifications
+- **Sources** — Indexers, Download Clients
 - **Library** — Quality Profiles, Metadata Profiles, Root Folders
-- **Integrations** — Calibre, Audiobookshelf, Grimmory, API Keys
-- **System** — Import, Blocklist, Logs
+- **Integrations** — Notifications, Calibre, Audiobookshelf, Grimmory, API Keys
+- **System** — Import / Migrate, Blocklist, Logs
 
-Non-admins who open an admin tab are redirected back to General; admin API routes return 403. Users are managed on the dedicated **Users** page (the people icon in the header), not inside Settings.
+Non-admins who open an admin tab are redirected back to General; admin API routes return 403. Inside General itself, a non admin sees Appearance and Security; the sections that describe or configure the server (file naming, downloads, search, the default library location, storage, the library scan panel and the schedule intervals) render for admins only, and the routes behind them, including `GET /system/storage` and `GET /library/scan/status`, answer 403 to anyone else. Users are managed on the dedicated **Users** page (the people icon in the header), not inside Settings.
 
 ## CSRF tokens
 
-v1.0 replaces the `X-Requested-With` header check with a proper double-submit CSRF token on all session-cookie-authenticated mutations.
+Session cookie mutations pass two guards: the `X-Requested-With: bindery-ui` header, and a double submit `X-CSRF-Token`. Both must be present. v1.0 added the token alongside the header check rather than replacing it.
 
 **Browser users:** the UI handles this transparently.
 
@@ -116,7 +168,7 @@ v1.0 replaces the `X-Requested-With` header check with a proper double-submit CS
 
 ```bash
 TOKEN=$(curl -s -b "bindery_session=<value>" \
-  http://bindery:8787/api/v1/auth/csrf | jq -r .token)
+  http://bindery:8787/api/v1/auth/csrf | jq -r .csrfToken)
 
 curl -X POST http://bindery:8787/api/v1/author \
   -b "bindery_session=<value>" \

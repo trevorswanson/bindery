@@ -30,6 +30,8 @@ import { grimmoryApi } from './grimmory'
 import { absApi } from './abs'
 import { importListsApi } from './importlists'
 import { recommendationsApi } from './recommendations'
+import { adoptionApi } from './adoption'
+import { requestsApi } from './requests'
 
 // Shared core: public constant, error class, helpers, and CSRF init.
 export { ApiError, BINDERY_BASE, isNoDownloadClientError, initCSRF } from './core'
@@ -59,6 +61,8 @@ export type * from './grimmory'
 export type * from './abs'
 export type * from './importlists'
 export type * from './recommendations'
+export type * from './adoption'
+export type * from './requests'
 
 // The single `api` object, composed from each domain's slice. Key order mirrors
 // the original file's section ordering; all method names are unique across
@@ -88,4 +92,6 @@ export const api = {
   ...absApi,
   ...importListsApi,
   ...recommendationsApi,
+  ...adoptionApi,
+  ...requestsApi,
 }

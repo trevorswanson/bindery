@@ -2,6 +2,21 @@
 
 Solutions to recurring problems, organised by symptom. Add new entries here as patterns come up in support.
 
+## A release names a different book or author
+
+Release matching rejects extra meaningful words inside a requested title and
+preserves its numbers: `12 More Rules for Life` cannot satisfy `12 Rules for Life`,
+even when both name the same author. An explicit trailing `by Author` or
+`Title - Author` credit that conflicts with the requested author is also rejected.
+Title-only releases, connecting words, file-format labels and narrator credits
+remain supported. Unrecognised trailing text can be conservatively rejected;
+inspect the release's title and author rather than relying only on shared words.
+
+These checks use the release name. They do not verify the contents of a download
+or repair an existing incorrect import. If a previously imported file is another
+book, use **Fix match** to assign it to the correct book before requesting a
+replacement for the original.
+
 ## Bindery will not start after upgrading: "foreign_key_check found N violation(s)"
 
 ```
@@ -51,6 +66,16 @@ You may see `add torrent failed: {"added_torrent_ids":...}` or `failed to send t
 
 ### Bindery cannot read the completed files
 
+**Start with Diagnose.** In **Settings → Download clients**, press **Diagnose** on the client. It works out where Bindery's grabs actually land for ebooks and for audiobooks (the save path Bindery sends, the category's folder, or the client default, and it says which), applies the path remap the same way the importer does, checks that Bindery can read and write the result, and tries a hardlink into each library folder. The panel puts the first thing to fix at the top and shows the paths side by side: where the client puts the files, which remap applied, and where Bindery looks. **Copy report** copies the check results and paths without the host, port or username, so it is safe to paste into an issue or Discord.
+
+A few answers need explaining:
+
+* **Outside every folder it is configured to use.** The remapped path is not under `BINDERY_DOWNLOAD_DIR`, `BINDERY_AUDIOBOOK_DOWNLOAD_DIR` or a library folder. Bindery does not look inside such a folder at all. Almost always a missing or wrong path remap.
+* **Differs only in letter case.** Linux folder names are case sensitive, so `/Downloads` and `/downloads` are different folders. Fix the case in the remap.
+* **SABnzbd did not share its folder settings.** SABnzbd only gives its folders to the full API key. With the NZB key the folder rows stay unknown; that is not a failure.
+* **Did not respond within 10 seconds.** A stat on that folder hung, which is what a network mount that has stopped answering does. Check the mount; the request gives up rather than waiting.
+* **Client reaching indexers: unknown.** This row is always unknown. Bindery fetches NZB and torrent files itself, but it cannot test the client's own network, VPN or DNS.
+
 If Bindery and the download client see the storage at different paths (different container mounts), Bindery cannot find the finished download. This usually surfaces as `importFailed` in the Queue with *nothing at `<path>` on this host*.
 
 That message lists three causes, because all three produce the same missing path and only you can tell them apart:
@@ -65,20 +90,52 @@ Bindery does not spend import retry attempts while there is nothing at the path,
 
 If the files never appear, it does not wait forever: after about 30 minutes of finding nothing (120 poll cycles) the download flips to `importBlocked` with a message naming the path it checked. From there you can **Retry import** once you've fixed the path, or grab the release again from search — a blocked entry no longer blocks a re-grab.
 
+**Stuck at `grabbed` rather than `importFailed`?** On Bindery 1.35.x and earlier, a qBittorrent download the client called complete while sending no content path sat at `grabbed` forever, with the log repeating *will retry next cycle*. Upgrade: from 1.36.0 that case fails the import with the missing path message above, retries if the files turn up, and blocks once they never do.
+
 ### "Already grabbed" when re-grabbing a release
 
 Clicking **Grab** on a release you already have a Queue entry for is refused with *already grabbed*, and the message now names the state that entry is in.
 
 - **`importFailed`** — the scanner is still working on that download. Use **Queue → Retry import** to re-run the import against the files it already has, or remove the Queue entry if you want to grab the release fresh. If its files are simply not there, it turns into `importBlocked` (see above) and becomes re-grabbable on its own.
-- **`imported`** — you already have it.
+- **`imported`**: you already have it. If you have since deleted that book (or its author), the release is no longer held: grabbing it again goes through and reuses the old Queue entry, and automatic search will pick it too once you add the book back. Usually you can leave your download client as it is; the two exceptions are under the table. What happens next depends on the client:
+
+  | Client | If it still has the release |
+  |---|---|
+  | qBittorrent, Transmission, Deluge, rTorrent | Bindery picks up the torrent the client already holds and imports its files, as long as they are still in the client's download folder. Nothing downloads again. |
+  | SABnzbd, NZBGet | The release downloads again. Bindery adds NZBGet jobs past its duplicate check, and SABnzbd's duplicate detection is off unless you turned it on, in which case SABnzbd may hold or refuse the job. |
+
+  If you removed the torrent from the client, it downloads again like any new grab. In two cases you need to do exactly that: remove the torrent from the client first, then grab again.
+
+  - **Import mode `move`.** The earlier import moved the files out of the client's folder, so the torrent Bindery picks up has nothing left to import. The Queue entry never imports, and every later grab picks up the same empty torrent.
+  - **qBittorrent 5.1 or older.** Bindery recognises a torrent qBittorrent already holds from its `409 Conflict` reply, which qBittorrent sends from 5.2 on. Older versions answer with a plain `Fails.`, the same reply as any other refused add, so the grab fails.
 - **downloading / grabbed / importing** — it's in flight; check the Queue.
 - **`importBlocked`** — a re-grab is allowed and reuses the existing Queue row with a fresh retry budget. Use this when the original files are gone; use **Retry import** instead when they're still on disk.
+
+### Automatic search skips a release you have a failed Queue row for
+
+Automatic search applies a narrower rule than the Grab button. A Queue row stops the sweep from grabbing that release again when it is in flight, when it is imported into a book you still have, or when it is `importBlocked`. A `failed` row does not: six hours after it failed, the next sweep grabs the release again and reuses the same Queue row, with the old error message, import path and client id cleared.
+
+The six hour wait counts from the failure itself, not from when the download was added or started. A torrent grabbed at noon that your client gives up on at ten in the evening is retried from ten in the evening. The wait is there because a release that fails at the download client usually fails again the moment it is re-sent, and nothing blocklists it automatically, so without the wait a bad release would be re-grabbed on every sweep. Clicking **Grab**, or **Retry download** on the row (below), has no wait and retries straight away.
+
+`importBlocked` is deliberately left to you. Those files downloaded fine and are still on disk; what failed was the import. The sweep cannot tell whether they are still there, and re-downloading them would fetch bytes you already have and leave the old torrent in your client with nothing tracking it, so a blocked row is only ever re-grabbed when you ask for it. Use **Retry import** if the files are still in place, and **Grab** if they are gone.
+
+Earlier releases let a failed row block the release permanently, and the skip was silent: the log showed `auto-grabbing book` and then nothing, as though the grab had gone ahead. Every skip now writes a line naming the release, its GUID, the blocking Queue row and its status, and the `book search finished` line for that book ends with an `outcome` that says the same thing.
+
+### Retrying a download that failed
+
+A Queue row in `failed` never produced a file: the grab did not reach the download client, or the client gave up on it. There is nothing to import, so **Retry import** does not apply and is not offered. Use **Retry download** on the row instead. It sends the same release to your download client again, which is the right move when the cause was transient (the client was down, the indexer answered 429 or 500). It deliberately does not search for a different release; when the release itself is gone, search the book and grab another one, or blocklist this one first.
+
+To retry in bulk, tick the rows and use **Retry selected**, or use **Retry all failed** above the list, which covers both stages: an import failure has its import re-armed, a failed download has its release re-sent. Both ask for confirmation when a re-send is in the batch, because that hands work back to your download client.
+
+### The Queue looks empty, or shorter than it should be
+
+Look for a banner above the list saying *Could not reach `<client>`. This list may be incomplete*. Bindery gives each download client a short deadline when it renders the Queue, and a client that misses it is dropped from that render, so its rows are missing until the next poll succeeds. The rows and the downloads themselves are fine. Check the client is up and reachable at the host and port in **Settings → Download clients** (its **Test** button is the quickest answer), and remember a client that is up but very slow to answer will do this intermittently.
 
 ### "Could not match any book to this download"
 
 The files downloaded fine, but Bindery couldn't tie them to a book in your library, so the item sits in the Queue as `importFailed` with *could not match any book to this download*. This happens when a release was grabbed without a specific book (e.g. from the free-text Search page) or its title didn't parse to a catalogue book.
 
-**Fix:** on the failed Queue item, click **Match to book**, search your library for the correct book, and select it — Bindery imports the already-downloaded files against it and the item flips to **Imported**. If the book isn't in your library yet, add it first (Authors → the author → the book, or Add Book), then match. Once matched, an item shows **Matched to *&lt;book&gt;*** and its **Retry import** button re-runs the import against that book.
+**Fix:** on the failed Queue item, click **Match to book**, search your library for the correct book, and select it — Bindery imports the already-downloaded files against it and the item flips to **Imported**. If the book isn't in your library yet, add it first with **Books → Add Book** (pick the book row, or its author's row to bring the whole catalogue in), then match. Once matched, an item shows **Matched to *&lt;book&gt;*** and its **Retry import** button re-runs the import against that book.
 
 If the item was left unmatched long enough for the scanner to retry it a few times, it turns into `importBlocked` with *import retry limit reached*. That's the same situation — the files are still there — so **Match to book** and **Retry import** work exactly the same on a blocked item; matching it re-imports the recorded files, and Retry import re-arms the scanner with a fresh retry budget.
 
@@ -215,7 +272,7 @@ Prowlarr's indexer API does not report a per-indexer category list, so Bindery d
 
 **Fix:** upgrade. Bindery now takes application scopes only from Readarr and LazyLibrarian, the two Prowlarr applications that actually sync books. With neither registered, the indexer's own advertised categories are used, which is what standalone Prowlarr users already got. Bindery also logs a WARN at sync time when an indexer advertises an ebook category that no registered application syncs.
 
-On an older version, the workaround is the per-indexer **Include parent categories** toggle, which widens the ebook query to `7000,7030` and does return the 7020 releases at the cost of a broader audiobook query. Editing the indexer's categories by hand does not survive the next sync, which rewrites them.
+On an older version, the workaround is the per-indexer **Include broad parent categories** toggle, which widens the ebook query to `7000,7030` and does return the 7020 releases at the cost of a broader audiobook query. Editing the indexer's categories by hand does not survive the next sync, which rewrites them.
 
 ## "Could not reach the metadata provider" / OpenLibrary timeout
 
@@ -236,13 +293,13 @@ Bindery's primary metadata provider is OpenLibrary, DNB (the German national lib
 - Behind a VPN: split-tunnel `openlibrary.org` out of the VPN. Metadata lookups do not need VPN protection — only torrent traffic does — so a paid dedicated IP is not required. Switching to a different VPN exit location also often helps, since some exit IPs are blocked and others are not.
 - Not on a VPN: retry later, and check the status of `openlibrary.org` / `archive.org`.
 
-## A book is on hardcover.app but doesn't show up in Add Book / Add Author search
+## A book is on hardcover.app but doesn't show up in the Add to library search
 
-Hardcover does not have to be the primary provider for its titles to show up: it always runs as a **search enricher** too. Add Book and Add Author fan the query out to the primary provider **plus** Hardcover (and Google Books, if an API key is set), then merge in any titles the primary didn't return. Books that only exist on hardcover.app are exactly what that path is meant to surface.
+Hardcover does not have to be the primary provider for its titles to show up: it always runs as a **search enricher** too. The Add to library dialog (behind both **Add Author** and **Add Book**) fans the query out to the primary provider **plus** Hardcover (and Google Books, if an API key is set), then merges in any titles the primary didn't return. Books that only exist on hardcover.app are exactly what that path is meant to surface.
 
 The catch is that **Hardcover's GraphQL API requires an API token for every query, including search** — an unauthenticated request returns `{"error":"Unable to verify token"}`. With no token saved, Bindery skips Hardcover before sending anything, so it contributes nothing silently and you only see OpenLibrary / DNB results. Startup says so too: the log reads `hardcover enrichment idle: no api token configured` instead of `hardcover enrichment enabled`. Saving a token takes effect on the next lookup, with no restart.
 
-**Fix:** add a Hardcover API token in `Settings → General` (the same token used for [Enhanced Hardcover Series](./Hardcover-Series-Wiki.md) and wishlist features), then re-run the search. Hardcover-only titles should appear in the merged results.
+**Fix:** add a Hardcover API token in `Settings → API Keys` (the same token used for [Enhanced Hardcover Series](./Hardcover-Series-Wiki.md) and wishlist features), then re-run the search. Hardcover-only titles should appear in the merged results.
 
 If you want Hardcover to *define* author catalogues rather than only add to them, set it as the primary provider in `Settings → Metadata Profiles → Library Defaults` and restart. The option stays disabled until a token is saved, and clearing the token is refused while Hardcover is primary — a tokenless Hardcover primary would fail every lookup. If the token is removed out-of-band (direct DB edit, restored backup), Bindery logs a warning at startup and falls back to OpenLibrary rather than booting with dead metadata.
 
@@ -269,27 +326,35 @@ The error tells you which side failed:
 
 **On token formats:** Hardcover issues `hc_pat_` personal access tokens alongside the older JWTs, and **both work**. Bindery sends whatever you save as `Authorization: Bearer <token>`, which is the scheme Hardcover accepts for either format, so there is nothing to configure per format. Pasting the whole header is fine too: a leading `Bearer ` or `Authorization: ` is stripped before the token is stored. Verified against the live API on 2026-08-24, a made up `hc_pat_...` value comes back as `401 invalid_token`, so a PAT that fails with 401 is a token to reissue, while a PAT that fails with 500 is an outage to wait out.
 
-## Why is the metadata button on some authors but not others?
+## Why does the metadata button say "Link metadata" on some authors and "Find better metadata" on others?
 
-The metadata button on an author's page only appears when Bindery thinks the author's record could be improved, so you'll see it on some authors and not others. Two cases show it:
+The button is on every author's page. Only its wording changes, and the wording tells you what Bindery thinks it is doing:
 
-- **"Link metadata"** — the author isn't linked to a metadata provider yet, or was created from an **Audiobookshelf / Calibre import** (those use `abs:` / `calibre:` foreign IDs). The button lets you attach a real provider record.
-- **"Find better metadata"** — the author *is* linked, but the stored record is **sparse**: no description, no image, no disambiguation, and no ratings. The button searches the providers for a richer match to relink to.
+- **"Link metadata"** means the author is not linked to a metadata provider yet, or was created from an **Audiobookshelf / Calibre import** (those use `abs:` / `calibre:` foreign IDs). The button attaches a real provider record.
+- **"Find better metadata"** means the author is already linked. The button searches the providers for another record to relink to, which is how you move an author whose catalogue came from the wrong record or the wrong provider.
 
-An author that already has a filled-in record (a description, an image, ratings) hides the button, because there's nothing obviously better to fetch. So a missing button means that author already has good metadata. If an author looks well populated but still shows the button, the stored description/image/ratings are likely empty even though the page renders other fields — relink and pick the best match to fill them in.
+Relinking is valid either way, so an author with a full description, image and ratings still offers it. Before v1.35.0 the button was hidden on authors whose record already looked complete, which left a well described author with a wrong catalogue reachable only through the API.
 
 ## Books are filed under the wrong author after a Calibre import
 
 Symptom: a Calibre library imports, and an author you own dozens of books by
 has no author page at all. Their titles are on somebody else's page, usually a
-co-author or a joint pen name. The log shows lines like:
+co-author or a joint pen name. On an affected version (before v1.32.2) the log
+shows lines like:
 
 ```
 DEBUG calibre import: alias record skipped error="alias \"Isaac Asimov\" already points at author 1125 (refusing to reassign to 105)" name="Isaac Asimov"
 ```
 
-The scan then reports those same names under **Unmatched files** with "Parsed
-author isn't in your library", because the name only exists as an alias.
+On a current version the import reports the same situation as it steps over the
+bad alias instead of obeying it:
+
+```
+INFO calibre import: ignoring untrusted author alias name="Isaac Asimov" aliasAuthor="Janet Asimov" aliasAuthorID=1125
+```
+
+The scan then lists those books on **Import → In your library** as by an
+author who is not in your library, because the name only exists as an alias.
 
 What happened: for a book credited to several people, the import used to record
 every co-author as an *alias* of the first credited author ([#1684](https://github.com/vavallee/bindery/issues/1684)).
@@ -320,7 +385,7 @@ to "村上春樹" case). Those keep working exactly as before.
 
 The catalogue sync filters the works the metadata provider returns before creating book rows, so a refresh can legitimately end with far fewer books than the author has written. After the refresh finishes, the author's page shows a note above the book list saying how many works were skipped and by which filter — reload the page if the refresh was still running when you last looked.
 
-The usual culprit is the **allowed languages** list on the author's metadata profile (`Settings → Metadata`). Two halves of that setting drop books:
+The usual culprit is the **allowed languages** list on the author's metadata profile (`Settings → Metadata Profiles`). Two halves of that setting drop books:
 
 - **The language list itself.** A work whose language is outside the list is skipped. Foreign-language editions of an English author are the common case.
 - **"When book language is unknown".** OpenLibrary carries no language on many *work* records, so a large tail of an author's catalogue arrives with no language at all. Set to **fail**, every one of those is skipped too — which is what turns "a few translations were dropped" into "most of this author is missing". Setting it to **pass** and refreshing again brings them back.
@@ -332,7 +397,7 @@ Two more settings on the same profile drop books by looking at the work's **edit
 
 Both read the full edition list. Older versions fetched only the first 50 editions of an OpenLibrary work, in an order OpenLibrary does not sort, so a heavily reprinted title whose ISBN or page count happened to sit further down the list was skipped even though it qualified. If either setting is on and books went missing that way, refresh the author again after upgrading.
 
-The skip counts are also in the log (`Settings → Logs`): the `author books synced` line carries `added`, `skipped_language`, `skipped_junk` and `skipped_media_type`, and is logged at WARN whenever anything was skipped. Per-book detail (which title, which language) is at DEBUG.
+The skip counts are also in the log (`Settings → Logs`): the `author books synced` line carries `added`, `matched`, `failed`, `total` and one counter per filter, including `skipped_language`, `skipped_junk`, `skipped_media_type`, `skipped_part_books`, `skipped_missing_date`, `skipped_min_pages` and `skipped_missing_isbn`. It is logged at WARN when a filter or a failed write dropped something, and at Info when the only skips were ones you configured on purpose (`skipped_excluded`, `skipped_not_accepted`). Per-book detail (which title, which language) is at DEBUG.
 
 ## A book shows a file path that no longer exists
 
@@ -349,9 +414,32 @@ Two things this does not do:
 
 If you reshape your library regularly, **Rename files** on the book or author page is the supported way to do it: it moves the file *and* repoints the same tracking row at the new location, so there is never a second row to clean up.
 
+## A scan leaves files unmatched
+
+Go to **Import → In your library**. Every book the last scan could not match
+is listed there, one row per book, with a sentence saying what the scan found
+and what to do: add the missing author and scan again, confirm a suggested
+book, or choose one. Adopting registers the files where they are and can be
+undone. The full walkthrough is in the user guide under [Adopting files
+already in your library](User-Guide-Wiki.md#adopting-files-already-in-your-library).
+
+A few things that look wrong but are not:
+
+- **A file you expected is not listed.** Symlinks are never listed, and a file
+  whose folder resolves outside your library folders is skipped. Replace the
+  link with the file, or add the real folder as a root.
+- **The list did not change after the volume came back.** A scan that finds no
+  files at all changes nothing on the list, so an unmounted library does not
+  erase your decisions. Scan again once it is mounted.
+- **A row you ignored is gone for good.** It is on the **Ignored** list, and
+  **Unignore** brings it back.
+
+If you file a bug about a row, include the reason code that shows when you
+hover its sentence.
+
 ## Collecting logs for a bug report
 
-`Settings → Logs` is the whole log store, so you don't need shell access to the container (rootless images give you nowhere to `cat` a file anyway).
+`Settings → Logs` is the whole log store, so you don't need shell access to the container (rootless images give you nowhere to `cat` a file anyway). Entries age out on the retention window, fourteen days by default, so collect the logs while the problem is recent. The window is the **Log retention** setting on the General tab if you need longer.
 
 Filter down to the problem first — level, component, a search term, and a date range around when it happened — then click **Download** next to *Clear filters*. You get a plain-text file named `bindery-logs-<timestamp>.txt` containing exactly the entries the table was showing, with a header block recording which filters produced it. Attach that to the issue.
 

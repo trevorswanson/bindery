@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/metadata"
 	"github.com/vavallee/bindery/internal/models"
@@ -1187,6 +1189,82 @@ func TestBuildHardcoverDiffEnrichesMissingWithOwnedLibraryBook(t *testing.T) {
 	}
 }
 
+// TestSeriesHardcoverDiffPrunesBundleTitles covers the display half of #2524:
+// the diff listed every unclaimed catalogue entry as missing, including the
+// box sets that fillHardcoverCatalogBook refuses (#2239). The result was an
+// Add button that silently did nothing and a "N missing" count a complete
+// series could never clear.
+func TestSeriesHardcoverDiffPrunesBundleTitles(t *testing.T) {
+	catalog := stormlightCatalog()
+	catalog.Books = append(catalog.Books,
+		metadata.SeriesCatalogBook{
+			ForeignID:  "hc:stormlight-box-set",
+			ProviderID: "900",
+			Title:      "The Stormlight Archive 3 Books Collection Set",
+			Position:   "",
+			Book: models.Book{
+				ForeignID: "hc:stormlight-box-set",
+				Title:     "The Stormlight Archive 3 Books Collection Set",
+				Author:    catalog.Books[0].Book.Author,
+			},
+		},
+		metadata.SeriesCatalogBook{
+			ForeignID:  "hc:oathbringer",
+			ProviderID: "103",
+			Title:      "Oathbringer",
+			Position:   "3",
+			Book: models.Book{
+				ForeignID: "hc:oathbringer",
+				Title:     "Oathbringer",
+				Author:    catalog.Books[0].Book.Author,
+			},
+		},
+	)
+	catalog.BookCount = len(catalog.Books)
+	h, seriesRepo, _, _ := seriesFixtureWithProvider(t, &stubSeriesProvider{
+		catalogs: map[string]*metadata.SeriesCatalog{catalog.ForeignID: catalog},
+	}, nil)
+	ctx := context.Background()
+	series := &models.Series{ForeignID: "manual:series:stormlight", Title: "Stormlight"}
+	if err := seriesRepo.Create(ctx, series); err != nil {
+		t.Fatal(err)
+	}
+	if err := seriesRepo.UpsertHardcoverLink(ctx, &models.SeriesHardcoverLink{
+		SeriesID:            series.ID,
+		HardcoverSeriesID:   catalog.ForeignID,
+		HardcoverProviderID: catalog.ProviderID,
+		HardcoverTitle:      catalog.Title,
+		HardcoverAuthorName: catalog.AuthorName,
+		HardcoverBookCount:  catalog.BookCount,
+		Confidence:          1,
+		LinkedBy:            "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.HardcoverDiff(rec, withURLParam(httptest.NewRequest(http.MethodGet, "/api/v1/series/1/hardcover-diff", nil), "id", strconv.FormatInt(series.ID, 10)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got seriesHardcoverDiffResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range got.Missing {
+		if item.ForeignBookID == "hc:stormlight-box-set" {
+			t.Fatalf("the box set the add path refuses must not be offered as missing: %+v", got.Missing)
+		}
+	}
+	if got.MissingCount != len(got.Missing) {
+		t.Fatalf("missingCount %d disagrees with the list length %d", got.MissingCount, len(got.Missing))
+	}
+	// The real books are untouched.
+	if len(got.Missing) != 2 {
+		t.Fatalf("missing = %+v, want The Way of Kings and Oathbringer", got.Missing)
+	}
+}
+
 func TestSeriesHardcoverDiffEndpointErrors(t *testing.T) {
 	catalog := stormlightCatalog()
 	h, seriesRepo, _, _ := seriesFixtureWithProvider(t, &stubSeriesProvider{
@@ -2039,6 +2117,313 @@ func TestSeriesFillSkipsExcludedHardcoverForeignIDMatch(t *testing.T) {
 	}
 	if len(books) != 0 {
 		t.Fatalf("expected excluded foreign-id match to remain unlinked, got %+v", books)
+	}
+}
+
+// TestSeriesFillMatchesASavedAlternateForeignID covers the identity half of
+// #2524: a book the library already holds under a different provider's id
+// carries that id in book_identifiers (#1705). Fill matched only the primary
+// foreign_id column, so the same work came back as a second row and got queued
+// for download.
+func TestSeriesFillMatchesASavedAlternateForeignID(t *testing.T) {
+	catalog := stormlightCatalog()
+	searcher := newMockBookSearcher()
+	h, seriesRepo, authorRepo, bookRepo := seriesFixtureWithProvider(t, &stubSeriesProvider{
+		catalogs: map[string]*metadata.SeriesCatalog{catalog.ForeignID: catalog},
+	}, searcher)
+	ctx := context.Background()
+	series := &models.Series{ForeignID: "ol-series:stormlight", Title: "The Stormlight Archive"}
+	if err := seriesRepo.Create(ctx, series); err != nil {
+		t.Fatal(err)
+	}
+	if err := seriesRepo.UpsertHardcoverLink(ctx, &models.SeriesHardcoverLink{
+		SeriesID:            series.ID,
+		HardcoverSeriesID:   catalog.ForeignID,
+		HardcoverProviderID: catalog.ProviderID,
+		HardcoverTitle:      catalog.Title,
+		HardcoverAuthorName: catalog.AuthorName,
+		HardcoverBookCount:  catalog.BookCount,
+		Confidence:          1,
+		LinkedBy:            "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	author := &models.Author{
+		ForeignID:        "hc:brandon-sanderson",
+		Name:             "Brandon Sanderson",
+		SortName:         "Sanderson, Brandon",
+		MetadataProvider: "hardcover",
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	// The library holds the book under its OpenLibrary identity, with the
+	// Hardcover id recorded as an alternate. The stored title is the German
+	// edition's, so the title-similarity fallback cannot rescue this: the
+	// saved identifier is the only thing that says these are one work, which
+	// is the case #2524 is about.
+	book := &models.Book{
+		ForeignID:        "ol:OL1W",
+		AuthorID:         author.ID,
+		Title:            "Der Weg der Koenige",
+		SortTitle:        "Weg der Koenige, Der",
+		Status:           models.BookStatusImported,
+		Genres:           []string{},
+		MetadataProvider: "openlibrary",
+	}
+	if err := bookRepo.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+	if err := bookRepo.UpsertBookIdentifier(ctx, book.ID, "hc:the-way-of-kings"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := bytes.NewBufferString(`{"foreignBookId":"hc:the-way-of-kings","providerId":"101","position":"1"}`)
+	rec := httptest.NewRecorder()
+	h.Fill(rec, withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/series/1/fill", body), "id", strconv.FormatInt(series.ID, 10)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]int
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response["queued"] != 0 {
+		t.Fatalf("an already-held book must not be queued, got %+v", response)
+	}
+	searcher.assertNoCall(t, 50*time.Millisecond)
+
+	// Exactly one book row, and it is the one already in the library, now
+	// linked into the series.
+	all, err := bookRepo.ListByAuthorIncludingExcluded(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].ID != book.ID {
+		t.Fatalf("expected the existing row to be reused, got %+v", all)
+	}
+	linked, err := seriesRepo.ListBooksInSeries(ctx, series.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(linked) != 1 || linked[0].ID != book.ID {
+		t.Fatalf("expected the existing book linked into the series, got %+v", linked)
+	}
+}
+
+// TestSeriesFillDoesNotResolveVolume17OntoVolume7 reproduces #2538. A LitRPG
+// series numbered with no volume marker at all scores 97 between volume 7 and
+// volume 17, so the fuzzy fallback picked the already-imported volume 7,
+// queueSeriesBook skipped it as satisfied, and Add answered queued:0 while the
+// missing volume stayed missing. Reported by magrhino against
+// hc-series:23984.
+func TestSeriesFillDoesNotResolveVolume17OntoVolume7(t *testing.T) {
+	catalog := &metadata.SeriesCatalog{
+		ForeignID:  "hc-series:23984",
+		ProviderID: "23984",
+		Title:      "Defiance of the Fall",
+		AuthorName: "TheFirstDefier",
+		Books:      []metadata.SeriesCatalogBook{},
+	}
+	author := &models.Author{
+		ForeignID:        "hc:thefirstdefier",
+		Name:             "TheFirstDefier",
+		SortName:         "TheFirstDefier",
+		MetadataProvider: "hardcover",
+	}
+	for i := 1; i <= 17; i++ {
+		title := fmt.Sprintf("Defiance of the Fall %d", i)
+		foreignID := fmt.Sprintf("hc:defiance-of-the-fall-%d", i)
+		catalog.Books = append(catalog.Books, metadata.SeriesCatalogBook{
+			ForeignID:  foreignID,
+			ProviderID: strconv.Itoa(2200700 + i),
+			Title:      title,
+			Position:   strconv.Itoa(i),
+			Book: models.Book{
+				ForeignID:        foreignID,
+				Title:            title,
+				SortTitle:        title,
+				MetadataProvider: "hardcover",
+				MediaType:        models.MediaTypeAudiobook,
+				Author:           author,
+			},
+		})
+	}
+	catalog.BookCount = len(catalog.Books)
+
+	searcher := newMockBookSearcher()
+	h, seriesRepo, authorRepo, bookRepo := seriesFixtureWithProvider(t, &stubSeriesProvider{
+		catalogs: map[string]*metadata.SeriesCatalog{catalog.ForeignID: catalog},
+	}, searcher)
+	ctx := context.Background()
+	series := &models.Series{ForeignID: "hc-series:23984", Title: "Defiance of the Fall"}
+	if err := seriesRepo.Create(ctx, series); err != nil {
+		t.Fatal(err)
+	}
+	if err := seriesRepo.UpsertHardcoverLink(ctx, &models.SeriesHardcoverLink{
+		SeriesID:            series.ID,
+		HardcoverSeriesID:   catalog.ForeignID,
+		HardcoverProviderID: catalog.ProviderID,
+		HardcoverTitle:      catalog.Title,
+		HardcoverAuthorName: catalog.AuthorName,
+		HardcoverBookCount:  catalog.BookCount,
+		Confidence:          1,
+		LinkedBy:            "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	storedAuthor := *author
+	if err := authorRepo.Create(ctx, &storedAuthor); err != nil {
+		t.Fatal(err)
+	}
+	// Volumes 1 to 16 are on disk. 17 is not.
+	for i := 1; i <= 16; i++ {
+		title := fmt.Sprintf("Defiance of the Fall %d", i)
+		book := &models.Book{
+			ForeignID:        fmt.Sprintf("hc:defiance-of-the-fall-%d", i),
+			AuthorID:         storedAuthor.ID,
+			Title:            title,
+			SortTitle:        title,
+			Status:           models.BookStatusImported,
+			MediaType:        models.MediaTypeAudiobook,
+			MetadataProvider: "hardcover",
+			Monitored:        true,
+			Genres:           []string{},
+		}
+		if err := bookRepo.Create(ctx, book); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := seriesRepo.LinkBookIfMissing(ctx, series.ID, book.ID, strconv.Itoa(i), true); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	body := bytes.NewBufferString(`{"foreignBookId":"hc:defiance-of-the-fall-17","providerId":"2200717","position":"17","mediaType":"audiobook"}`)
+	rec := httptest.NewRecorder()
+	h.Fill(rec, withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/series/1/fill", body), "id", strconv.FormatInt(series.ID, 10)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]int
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response["queued"] != 1 {
+		t.Fatalf("volume 17 should have been created and queued, got %+v", response)
+	}
+
+	created, err := bookRepo.GetByForeignID(ctx, "hc:defiance-of-the-fall-17")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created == nil {
+		t.Fatal("volume 17 was not created")
+	}
+	if created.Title != "Defiance of the Fall 17" {
+		t.Fatalf("created book = %q, want Defiance of the Fall 17", created.Title)
+	}
+	if created.MediaType != models.MediaTypeAudiobook {
+		t.Fatalf("created media type = %q, want audiobook", created.MediaType)
+	}
+
+	// Volume 7 is untouched: still imported, still its own record, and it did
+	// not gain volume 17's position in the series.
+	seven, err := bookRepo.GetByForeignID(ctx, "hc:defiance-of-the-fall-7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seven == nil || seven.Status != models.BookStatusImported {
+		t.Fatalf("volume 7 = %+v, want an untouched imported book", seven)
+	}
+	linked, err := seriesRepo.GetByID(ctx, series.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, member := range linked.Books {
+		if member.BookID == seven.ID && member.PositionInSeries != "7" {
+			t.Fatalf("volume 7 was moved to position %q", member.PositionInSeries)
+		}
+	}
+}
+
+// TestSeriesFillDoesNotResolveANumberedVolumeOntoAnUnnumberedOne is the
+// second #2538 shape, found by magrhino testing #2540: the library holds
+// volume 1 under the bare series title "The Primal Hunter", so the bare-number
+// veto has nothing to compare, the title scores 95 against "The Primal Hunter
+// 13", and every later volume resolved onto volume 1 with queued:0. The book's
+// existing position in this series is the evidence that settles it.
+func TestSeriesFillDoesNotResolveANumberedVolumeOntoAnUnnumberedOne(t *testing.T) {
+	author := &models.Author{
+		ForeignID:        "hc:zogarth",
+		Name:             "Zogarth",
+		SortName:         "Zogarth",
+		MetadataProvider: "hardcover",
+	}
+	catalog := &metadata.SeriesCatalog{
+		ForeignID:  "hc-series:primal-hunter",
+		ProviderID: "777",
+		Title:      "The Primal Hunter",
+		AuthorName: "Zogarth",
+	}
+	for _, v := range []struct{ title, id, pos string }{
+		{"The Primal Hunter", "hc:the-primal-hunter", "1"},
+		{"The Primal Hunter 13", "hc:the-primal-hunter-13", "13"},
+	} {
+		catalog.Books = append(catalog.Books, metadata.SeriesCatalogBook{
+			ForeignID: v.id, ProviderID: v.id, Title: v.title, Position: v.pos,
+			Book: models.Book{ForeignID: v.id, Title: v.title, SortTitle: v.title, MetadataProvider: "hardcover", Author: author},
+		})
+	}
+	catalog.BookCount = len(catalog.Books)
+
+	searcher := newMockBookSearcher()
+	h, seriesRepo, authorRepo, bookRepo := seriesFixtureWithProvider(t, &stubSeriesProvider{
+		catalogs: map[string]*metadata.SeriesCatalog{catalog.ForeignID: catalog},
+	}, searcher)
+	ctx := context.Background()
+	series := &models.Series{ForeignID: catalog.ForeignID, Title: catalog.Title}
+	if err := seriesRepo.Create(ctx, series); err != nil {
+		t.Fatal(err)
+	}
+	if err := seriesRepo.UpsertHardcoverLink(ctx, &models.SeriesHardcoverLink{
+		SeriesID: series.ID, HardcoverSeriesID: catalog.ForeignID, HardcoverProviderID: catalog.ProviderID,
+		HardcoverTitle: catalog.Title, HardcoverAuthorName: catalog.AuthorName, HardcoverBookCount: catalog.BookCount,
+		Confidence: 1, LinkedBy: "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored := *author
+	if err := authorRepo.Create(ctx, &stored); err != nil {
+		t.Fatal(err)
+	}
+	// Volume 1 is held under a different identity, so only the title
+	// fallback can reach it.
+	one := &models.Book{
+		ForeignID: "ol:OL-PRIMAL-1", AuthorID: stored.ID, Title: "The Primal Hunter", SortTitle: "The Primal Hunter",
+		Status: models.BookStatusImported, Monitored: true, Genres: []string{},
+	}
+	if err := bookRepo.Create(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seriesRepo.LinkBookIfMissing(ctx, series.ID, one.ID, "1", true); err != nil {
+		t.Fatal(err)
+	}
+
+	body := bytes.NewBufferString(`{"foreignBookId":"hc:the-primal-hunter-13","providerId":"hc:the-primal-hunter-13","position":"13"}`)
+	rec := httptest.NewRecorder()
+	h.Fill(rec, withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/series/1/fill", body), "id", strconv.FormatInt(series.ID, 10)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]int
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response["queued"] != 1 {
+		t.Fatalf("volume 13 should have been created and queued, got %+v", response)
+	}
+	if got, err := bookRepo.GetByForeignID(ctx, "hc:the-primal-hunter-13"); err != nil || got == nil {
+		t.Fatalf("volume 13 was not created: %+v err=%v", got, err)
 	}
 }
 
@@ -3393,5 +3778,797 @@ func TestBuildHardcoverDiffDoesNotDoubleClaimOneCatalogEntry(t *testing.T) {
 	}
 	if len(diff.Missing) != 0 {
 		t.Fatalf("Missing = %v, want empty", diffForeignIDs(diff.Missing))
+	}
+}
+
+// withURLParams is withURLParam for the two-segment routes
+// /series/{id}/books/{bookId}.
+func withURLParams(req *http.Request, kv map[string]string) *http.Request {
+	rctx := chi.NewRouteContext()
+	for k, v := range kv {
+		rctx.URLParams.Add(k, v)
+	}
+	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+}
+
+// TestSeriesMembershipRemoveAndSetPrimary covers #2525: a book in two series
+// needs a way to say which one names its files, and a way to leave the wrong
+// one, without Re-bind metadata wiping and rebuilding every membership.
+func TestSeriesMembershipRemoveAndSetPrimary(t *testing.T) {
+	h, seriesRepo, authorRepo, bookRepo := seriesFixture(t)
+	ctx := context.Background()
+
+	author := &models.Author{ForeignID: "hc:kel-kade", Name: "Kel Kade", SortName: "Kade, Kel"}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	book := &models.Book{
+		ForeignID: "hc:free-the-darkness", AuthorID: author.ID, Title: "Free the Darkness",
+		SortTitle: "Free the Darkness", Status: models.BookStatusImported,
+	}
+	if err := bookRepo.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+	umbrella := &models.Series{ForeignID: "hc-series:universe", Title: "King's Dark Tidings Universe"}
+	if err := seriesRepo.Create(ctx, umbrella); err != nil {
+		t.Fatal(err)
+	}
+	real := &models.Series{ForeignID: "hc-series:kdt", Title: "King's Dark Tidings"}
+	if err := seriesRepo.Create(ctx, real); err != nil {
+		t.Fatal(err)
+	}
+	if err := seriesRepo.LinkBook(ctx, umbrella.ID, book.ID, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := seriesRepo.LinkBook(ctx, real.ID, book.ID, "1", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Promote the umbrella: the renamer follows, and the sibling is demoted.
+	rec := httptest.NewRecorder()
+	h.SetPrimaryBook(rec, withURLParams(httptest.NewRequest(http.MethodPut, "/api/v1/series/1/books/1/primary", nil), map[string]string{
+		"id":     strconv.FormatInt(umbrella.ID, 10),
+		"bookId": strconv.FormatInt(book.ID, 10),
+	}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set primary: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	title, _, err := seriesRepo.GetPrimarySeriesForBook(ctx, book.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if title != "King's Dark Tidings Universe" {
+		t.Fatalf("primary series = %q, want the umbrella", title)
+	}
+
+	// A book that is not a member of the series is a 404, not a silent write.
+	stray := &models.Series{ForeignID: "hc-series:none", Title: "Unrelated"}
+	if err := seriesRepo.Create(ctx, stray); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	h.SetPrimaryBook(rec, withURLParams(httptest.NewRequest(http.MethodPut, "/api/v1/series/1/books/1/primary", nil), map[string]string{
+		"id":     strconv.FormatInt(stray.ID, 10),
+		"bookId": strconv.FormatInt(book.ID, 10),
+	}))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("set primary on a non-member: expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Leaving the umbrella drops only that membership; the book and its other
+	// series survive.
+	rec = httptest.NewRecorder()
+	h.RemoveBook(rec, withURLParams(httptest.NewRequest(http.MethodDelete, "/api/v1/series/1/books/1", nil), map[string]string{
+		"id":     strconv.FormatInt(umbrella.ID, 10),
+		"bookId": strconv.FormatInt(book.ID, 10),
+	}))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("remove book: expected 204, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got, err := bookRepo.GetByID(ctx, book.ID); err != nil || got == nil {
+		t.Fatalf("remove membership should preserve the book, got %+v err=%v", got, err)
+	}
+	ids, err := seriesRepo.GetSeriesIDsForBook(ctx, book.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != real.ID {
+		t.Fatalf("memberships after remove = %v, want only series %d", ids, real.ID)
+	}
+
+	// Removing from an unknown series is a 404 rather than a no-op 204.
+	rec = httptest.NewRecorder()
+	h.RemoveBook(rec, withURLParams(httptest.NewRequest(http.MethodDelete, "/api/v1/series/1/books/1", nil), map[string]string{
+		"id":     strconv.FormatInt(stray.ID+999, 10),
+		"bookId": strconv.FormatInt(book.ID, 10),
+	}))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("remove from a missing series: expected 404, got %d", rec.Code)
+	}
+}
+
+// TestSeriesMembershipRejectsMalformedIDs pins the 400s. Both routes take two
+// path parameters, so either one can be junk.
+func TestSeriesMembershipRejectsMalformedIDs(t *testing.T) {
+	h, _, _, _ := seriesFixture(t)
+
+	cases := []struct {
+		name   string
+		params map[string]string
+	}{
+		{name: "bad series id", params: map[string]string{"id": "not-a-number", "bookId": "1"}},
+		{name: "bad book id", params: map[string]string{"id": "1", "bookId": "not-a-number"}},
+		{name: "missing book id", params: map[string]string{"id": "1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			h.RemoveBook(rec, withURLParams(httptest.NewRequest(http.MethodDelete, "/api/v1/series/1/books/1", nil), tc.params))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("RemoveBook: expected 400, got %d: %s", rec.Code, rec.Body.String())
+			}
+			rec = httptest.NewRecorder()
+			h.SetPrimaryBook(rec, withURLParams(httptest.NewRequest(http.MethodPut, "/api/v1/series/1/books/1/primary", nil), tc.params))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("SetPrimaryBook: expected 400, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestHardcoverDiffBindsIdentityFirstAndRespectsPositions reproduces #2553
+// (He Who Fights with Monsters, hc-series:12723). The library holds volumes
+// 1, 4, 9 and two rows for 12, each at its stored position, and volume 9
+// carries the catalogue's own foreign ID. Assigned in library order, fuzzy
+// titles bound volume 12 to catalogue 1, volume 1 to catalogue 4, and volume
+// 4 to catalogue 9, which left the real volume 9 Local only. Locals are fed
+// in an adversarial order on purpose: the answer must not depend on it.
+func TestHardcoverDiffBindsIdentityFirstAndRespectsPositions(t *testing.T) {
+	cat := func(pos, fid, title string) metadata.SeriesCatalogBook {
+		return metadata.SeriesCatalogBook{ForeignID: fid, Title: title, Position: pos, Book: models.Book{ForeignID: fid, Title: title}}
+	}
+	catalog := &metadata.SeriesCatalog{
+		ForeignID: "hc-series:12723",
+		Title:     "He Who Fights with Monsters",
+		Books: []metadata.SeriesCatalogBook{
+			cat("1", "hc:he-who-fights-with-monsters-2021", "He Who Fights with Monsters"),
+			cat("4", "hc:he-who-fights-with-monsters-4-he-who-fights-with-monsters-book-4-2021", "He Who Fights with Monsters 4: He Who Fights with Monsters, Book 4"),
+			cat("9", "hc:he-who-fights-with-monsters-9", "He Who Fights with Monsters 9: A LitRPG Adventure (He Who Fights with Monsters, Book 9)"),
+			cat("12", "hc:he-who-fights-with-monsters-12", "He Who Fights with Monsters 12: A LitRPG Adventure"),
+		},
+	}
+	local := func(id int64, pos, fid, title string) models.SeriesBook {
+		return models.SeriesBook{SeriesID: 7, BookID: id, PositionInSeries: pos,
+			Book: &models.Book{ID: id, ForeignID: fid, Title: title, Status: models.BookStatusImported}}
+	}
+	series := &models.Series{ID: 7, Title: "He Who Fights with Monsters", Books: []models.SeriesBook{
+		local(9, "12", "abs:hwfwm-12-a", "He Who Fights with Monsters 12: A LitRPG Adventure"),
+		local(125, "12", "abs:hwfwm-12-b", "He Who Fights with Monsters 12: A LitRPG Adventure"),
+		local(114, "1", "abs:hwfwm-1", "He Who Fights with Monsters: A LitRPG Adventure"),
+		local(117, "4", "abs:hwfwm-4", "He Who Fights with Monsters 4"),
+		local(122, "9", "hc:he-who-fights-with-monsters-9", "He Who Fights with Monsters 9"),
+	}}
+
+	diff := buildHardcoverDiff(context.Background(), nil, 0, series, nil, catalog)
+
+	boundTo := map[int64]string{}
+	for _, row := range append(append([]seriesHardcoverDiffBook{}, diff.Present...), diff.Uncertain...) {
+		if row.LocalBookID != nil {
+			boundTo[*row.LocalBookID] = row.Position
+		}
+	}
+	for id, want := range map[int64]string{114: "1", 117: "4", 122: "9"} {
+		if got := boundTo[id]; got != want {
+			t.Errorf("local %d bound to catalogue position %q, want %q (bindings %v)", id, got, want, boundTo)
+		}
+	}
+	if boundTo[9] != "12" && boundTo[125] != "12" {
+		t.Errorf("neither volume 12 row bound to catalogue 12 (bindings %v)", boundTo)
+	}
+	if len(diff.Missing) != 0 {
+		t.Errorf("missing = %+v, want none: every catalogue volume is held", diff.Missing)
+	}
+	for _, row := range diff.LocalOnly {
+		if row.LocalBookID != nil && *row.LocalBookID == 122 {
+			t.Errorf("volume 9 is Local only despite carrying catalogue 9's foreign ID")
+		}
+	}
+}
+
+// TestHardcoverDiffDuplicateRowNeverBindsANeighbour reproduces #2410. The
+// library holds The Way of Kings twice, an ebook row and an audiobook row with
+// distinct foreign IDs, and the catalogue carries a near identical neighbour,
+// The Way of Kings Prime. The first row binds to The Way of Kings. The second
+// used to fall through the #2343 exclusion set to Prime on title similarity
+// alone, which listed Prime as owned and dropped it from Missing and so from
+// series fill. A duplicate row for a book that already bound is Local only.
+//
+// Every combination the issue raises is covered: rows with and without stored
+// positions, Prime sharing The Way of Kings' position, at a different one and
+// at none, either row or neither carrying the catalogue's own ID, and both
+// library orders, because the rows' order is SQLite's tiebreak on an equal
+// position and must not decide the answer.
+func TestHardcoverDiffDuplicateRowNeverBindsANeighbour(t *testing.T) {
+	const (
+		wokID   = "hc:the-way-of-kings"
+		primeID = "hc:the-way-of-kings-prime"
+		worID   = "hc:words-of-radiance"
+	)
+	catalogWith := func(primePos string) *metadata.SeriesCatalog {
+		cat := func(pos, fid, title string) metadata.SeriesCatalogBook {
+			return metadata.SeriesCatalogBook{ForeignID: fid, Title: title, Position: pos, Book: models.Book{ForeignID: fid, Title: title}}
+		}
+		return &metadata.SeriesCatalog{
+			ForeignID: "hc-series:42",
+			Title:     "The Stormlight Archive",
+			Books: []metadata.SeriesCatalogBook{
+				cat("1", wokID, "The Way of Kings"),
+				cat(primePos, primeID, "The Way of Kings Prime"),
+				cat("2", worID, "Words of Radiance"),
+			},
+		}
+	}
+	local := func(id int64, pos, fid, title string) models.SeriesBook {
+		return models.SeriesBook{SeriesID: 1, BookID: id, PositionInSeries: pos,
+			Book: &models.Book{ID: id, ForeignID: fid, Title: title, Status: models.BookStatusImported}}
+	}
+	bindings := func(diff seriesHardcoverDiffResponse) map[int64]string {
+		bound := map[int64]string{}
+		for _, row := range append(append([]seriesHardcoverDiffBook{}, diff.Present...), diff.Uncertain...) {
+			if row.LocalBookID != nil {
+				bound[*row.LocalBookID] = row.ForeignBookID
+			}
+		}
+		return bound
+	}
+	primePositions := []struct{ name, pos string }{
+		{"prime shares position 1", "1"},
+		{"prime at a different position", "0.5"},
+		{"prime unpositioned", ""},
+	}
+
+	const ebook, audio = int64(1), int64(2)
+	rowPositions := []struct{ name, ebook, audio string }{
+		{"rows unpositioned", "", ""},
+		{"both rows at position 1", "1", "1"},
+		{"only the ebook row positioned", "1", ""},
+	}
+	identities := []struct {
+		name         string
+		ebook, audio string
+		owner        int64 // the row that must win, 0 when either may
+	}{
+		{"neither row carries the catalogue id", "abs:wok-ebook", "abs:wok-audio", 0},
+		{"ebook row carries the catalogue id", wokID, "abs:wok-audio", ebook},
+		{"audiobook row carries the catalogue id", "abs:wok-ebook", wokID, audio},
+	}
+	for _, pp := range primePositions {
+		for _, rp := range rowPositions {
+			for _, id := range identities {
+				for _, reversed := range []bool{false, true} {
+					order := "library order ebook first"
+					if reversed {
+						order = "library order audiobook first"
+					}
+					t.Run(pp.name+"/"+rp.name+"/"+id.name+"/"+order, func(t *testing.T) {
+						rows := []models.SeriesBook{
+							local(ebook, rp.ebook, id.ebook, "The Way of Kings"),
+							local(audio, rp.audio, id.audio, "The Way of Kings"),
+						}
+						if reversed {
+							rows[0], rows[1] = rows[1], rows[0]
+						}
+						series := &models.Series{ID: 1, Title: "The Stormlight Archive", Books: rows}
+
+						diff := buildHardcoverDiff(context.Background(), nil, 0, series, nil, catalogWith(pp.pos))
+
+						bound := bindings(diff)
+						for localID, fid := range bound {
+							if fid != wokID {
+								t.Errorf("local %d bound to %s, want only The Way of Kings bound (bindings %v)", localID, fid, bound)
+							}
+						}
+						winner, loser := ebook, audio
+						if bound[ebook] != wokID {
+							winner, loser = audio, ebook
+						}
+						if bound[winner] != wokID {
+							t.Fatalf("neither row bound to The Way of Kings (bindings %v)", bound)
+						}
+						if id.owner != 0 && winner != id.owner {
+							t.Errorf("local %d bound to The Way of Kings, want local %d, which carries its foreign ID", winner, id.owner)
+						}
+						localOnly := false
+						for _, row := range diff.LocalOnly {
+							if row.LocalBookID != nil && *row.LocalBookID == loser {
+								localOnly = true
+							}
+						}
+						if !localOnly {
+							t.Errorf("duplicate row %d is not Local only (bindings %v)", loser, bound)
+						}
+						missing := map[string]bool{}
+						for _, row := range diff.Missing {
+							missing[row.ForeignBookID] = true
+						}
+						if !missing[primeID] || !missing[worID] {
+							t.Errorf("Missing = %v, want Prime and Words of Radiance, neither is owned", diffForeignIDs(diff.Missing))
+						}
+						if diff.PresentCount+len(diff.Uncertain) != 1 {
+							t.Errorf("present %d, uncertain %d, want one bound row", diff.PresentCount, len(diff.Uncertain))
+						}
+					})
+				}
+			}
+		}
+	}
+
+	// The issue's order dependence: [Kings, Prime] paired correctly while
+	// [Prime, Kings] cross assigned. Each row must bind its own entry in
+	// either order.
+	for _, pp := range primePositions {
+		for _, reversed := range []bool{false, true} {
+			order := "kings first"
+			if reversed {
+				order = "prime first"
+			}
+			t.Run("kings and prime/"+pp.name+"/"+order, func(t *testing.T) {
+				rows := []models.SeriesBook{
+					local(1, "", "abs:wok", "The Way of Kings"),
+					local(2, "", "abs:wok-prime", "The Way of Kings Prime"),
+				}
+				if reversed {
+					rows[0], rows[1] = rows[1], rows[0]
+				}
+				series := &models.Series{ID: 1, Title: "The Stormlight Archive", Books: rows}
+
+				diff := buildHardcoverDiff(context.Background(), nil, 0, series, nil, catalogWith(pp.pos))
+
+				bound := bindings(diff)
+				if bound[1] != wokID || bound[2] != primeID {
+					t.Errorf("bindings %v, want local 1 on %s and local 2 on %s", bound, wokID, primeID)
+				}
+				if got := diffForeignIDs(diff.Missing); len(got) != 1 || got[0] != worID {
+					t.Errorf("Missing = %v, want only %s", got, worID)
+				}
+			})
+		}
+	}
+}
+
+// realisticLocal is one row of a realistic library for the Hardcover diff.
+// owns is the catalogue foreign ID of the book the row really is, which the
+// assertions check independently of the title the row carries.
+type realisticLocal struct {
+	id    int64
+	pos   string
+	fid   string
+	title string
+	owns  string
+}
+
+type realisticDiffCase struct {
+	name    string
+	catalog *metadata.SeriesCatalog
+	locals  []realisticLocal
+}
+
+func (c realisticDiffCase) series(reversed bool) *models.Series {
+	rows := make([]models.SeriesBook, 0, len(c.locals))
+	for _, l := range c.locals {
+		rows = append(rows, models.SeriesBook{SeriesID: 1, BookID: l.id, PositionInSeries: l.pos,
+			Book: &models.Book{ID: l.id, ForeignID: l.fid, Title: l.title, Status: models.BookStatusImported}})
+	}
+	if reversed {
+		for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+			rows[i], rows[j] = rows[j], rows[i]
+		}
+	}
+	return &models.Series{ID: 1, Title: c.catalog.Title, Books: rows}
+}
+
+// realisticDiffOutcome reads a diff against the books each row really is.
+// A starved row is Local only although no other row of the same book is
+// bound, so nothing in the diff stands for it. ownedMissing lists catalogue
+// entries a row owns that the diff nevertheless offers as Missing, which is
+// what series fill creates.
+func realisticDiffOutcome(c realisticDiffCase, diff seriesHardcoverDiffResponse) (bound map[int64]string, starved []int64, ownedMissing []string) {
+	bound = map[int64]string{}
+	for _, row := range append(append([]seriesHardcoverDiffBook{}, diff.Present...), diff.Uncertain...) {
+		if row.LocalBookID != nil {
+			bound[*row.LocalBookID] = row.ForeignBookID
+		}
+	}
+	localOnly := map[int64]bool{}
+	for _, row := range diff.LocalOnly {
+		if row.LocalBookID != nil {
+			localOnly[*row.LocalBookID] = true
+		}
+	}
+	for _, l := range c.locals {
+		if !localOnly[l.id] {
+			continue
+		}
+		copyBound := false
+		for _, other := range c.locals {
+			if _, ok := bound[other.id]; ok && other.id != l.id && other.owns == l.owns {
+				copyBound = true
+			}
+		}
+		if !copyBound {
+			starved = append(starved, l.id)
+		}
+	}
+	missing := map[string]bool{}
+	for _, row := range diff.Missing {
+		missing[row.ForeignBookID] = true
+	}
+	seen := map[string]bool{}
+	for _, l := range c.locals {
+		if missing[l.owns] && !seen[l.owns] {
+			seen[l.owns] = true
+			ownedMissing = append(ownedMissing, l.owns)
+		}
+	}
+	return bound, starved, ownedMissing
+}
+
+func realisticCatalogBook(pos, fid, title string) metadata.SeriesCatalogBook {
+	return metadata.SeriesCatalogBook{ForeignID: fid, Title: title, Position: pos, Book: models.Book{ForeignID: fid, Title: title}}
+}
+
+func hwfwmCatalogID(n int) string {
+	if n == 1 {
+		return "hc:he-who-fights-with-monsters-2021"
+	}
+	return fmt.Sprintf("hc:he-who-fights-with-monsters-%d", n)
+}
+
+// hwfwmCatalog builds He Who Fights with Monsters in the shape Hardcover
+// serves it: volume 1 under the bare series title, and three spellings of a
+// numbered volume after it.
+func hwfwmCatalog(volumes ...int) *metadata.SeriesCatalog {
+	cat := &metadata.SeriesCatalog{ForeignID: "hc-series:12723", ProviderID: "12723", Title: "He Who Fights with Monsters", AuthorName: "Shirtaloon"}
+	for _, n := range volumes {
+		title := fmt.Sprintf("He Who Fights with Monsters %d: A LitRPG Adventure", n)
+		switch n {
+		case 1:
+			title = "He Who Fights with Monsters"
+		case 4:
+			title = "He Who Fights with Monsters 4: He Who Fights with Monsters, Book 4"
+		case 9:
+			title = "He Who Fights with Monsters 9: A LitRPG Adventure (He Who Fights with Monsters, Book 9)"
+		}
+		cat.Books = append(cat.Books, realisticCatalogBook(strconv.Itoa(n), hwfwmCatalogID(n), title))
+	}
+	cat.BookCount = len(cat.Books)
+	return cat
+}
+
+// hwfwmFullLibrary is volumes 1 to 12 under their bare titles, as an
+// Audiobookshelf import carries them, with volume 12 held twice.
+func hwfwmFullLibrary(withPositions bool) []realisticLocal {
+	var locals []realisticLocal
+	add := func(id int64, n int, fid, title string) {
+		pos := ""
+		if withPositions {
+			pos = strconv.Itoa(n)
+		}
+		locals = append(locals, realisticLocal{id, pos, fid, title, hwfwmCatalogID(n)})
+	}
+	add(101, 1, "abs:hwfwm-1", "He Who Fights with Monsters")
+	for n := 2; n <= 12; n++ {
+		add(int64(100+n), n, fmt.Sprintf("abs:hwfwm-%d", n), fmt.Sprintf("He Who Fights with Monsters %d", n))
+	}
+	add(113, 12, "abs:hwfwm-12-b", "He Who Fights with Monsters 12")
+	return locals
+}
+
+func realisticDiffCases() []realisticDiffCase {
+	positionsName := func(on bool) string {
+		if on {
+			return "with positions"
+		}
+		return "without positions"
+	}
+	at := func(on bool, pos string) string {
+		if on {
+			return pos
+		}
+		return ""
+	}
+	var cases []realisticDiffCase
+
+	// The #2553 library: volume 12 twice, volume 1 under a subtitle it
+	// shares with catalogue 12, and volumes 4 and 9 under bare titles.
+	for _, withPositions := range []bool{true, false} {
+		for _, vol9ID := range []bool{true, false} {
+			fid9, idName := "abs:hwfwm-9", "no catalogue ids"
+			if vol9ID {
+				fid9, idName = hwfwmCatalogID(9), "volume 9 carries its catalogue id"
+			}
+			cases = append(cases, realisticDiffCase{
+				name:    "#2553 library/" + positionsName(withPositions) + "/" + idName,
+				catalog: hwfwmCatalog(1, 4, 9, 12),
+				locals: []realisticLocal{
+					{9, at(withPositions, "12"), "abs:hwfwm-12-a", "He Who Fights with Monsters 12: A LitRPG Adventure", hwfwmCatalogID(12)},
+					{125, at(withPositions, "12"), "abs:hwfwm-12-b", "He Who Fights with Monsters 12: A LitRPG Adventure", hwfwmCatalogID(12)},
+					{114, at(withPositions, "1"), "abs:hwfwm-1", "He Who Fights with Monsters: A LitRPG Adventure", hwfwmCatalogID(1)},
+					{117, at(withPositions, "4"), "abs:hwfwm-4", "He Who Fights with Monsters 4", hwfwmCatalogID(4)},
+					{122, at(withPositions, "9"), fid9, "He Who Fights with Monsters 9", hwfwmCatalogID(9)},
+				},
+			})
+		}
+	}
+
+	// Every volume under a bare title. Each "He Who Fights with Monsters N"
+	// scores 0.96 against the umbrella title volume 1 holds and 0.90 against
+	// its own entry.
+	all := make([]int, 0, 12)
+	for n := 1; n <= 12; n++ {
+		all = append(all, n)
+	}
+	for _, withPositions := range []bool{true, false} {
+		cases = append(cases, realisticDiffCase{
+			name:    "He Who Fights with Monsters 1 to 12 plus a second 12/" + positionsName(withPositions),
+			catalog: hwfwmCatalog(all...),
+			locals:  hwfwmFullLibrary(withPositions),
+		})
+	}
+
+	// Defiance of the Fall numbers its volumes with a bare trailing number
+	// in the catalogue (#2538), and the library carries the audiobook
+	// spelling with a subtitle, volume 7 twice.
+	defiance := &metadata.SeriesCatalog{ForeignID: "hc-series:23984", Title: "Defiance of the Fall"}
+	defianceID := func(n int) string { return fmt.Sprintf("hc:defiance-of-the-fall-%d", n) }
+	for n := 1; n <= 17; n++ {
+		defiance.Books = append(defiance.Books, realisticCatalogBook(strconv.Itoa(n), defianceID(n), fmt.Sprintf("Defiance of the Fall %d", n)))
+	}
+	for _, withPositions := range []bool{true, false} {
+		var locals []realisticLocal
+		for n := 1; n <= 16; n++ {
+			locals = append(locals, realisticLocal{int64(200 + n), at(withPositions, strconv.Itoa(n)), fmt.Sprintf("abs:dotf-%d", n),
+				fmt.Sprintf("Defiance of the Fall %d: A LitRPG Adventure", n), defianceID(n)})
+		}
+		locals = append(locals, realisticLocal{217, at(withPositions, "7"), "abs:dotf-7-b", "Defiance of the Fall 7: A LitRPG Adventure", defianceID(7)})
+		cases = append(cases, realisticDiffCase{name: "Defiance of the Fall/" + positionsName(withPositions), catalog: defiance, locals: locals})
+	}
+
+	// The Primal Hunter: catalogue "The Primal Hunter N", library "The
+	// Primal Hunter N: A LitRPG Adventure", volume 1 twice.
+	primal := &metadata.SeriesCatalog{ForeignID: "hc-series:primal-hunter", Title: "The Primal Hunter"}
+	primalID := func(n int) string { return fmt.Sprintf("hc:the-primal-hunter-%d", n) }
+	for n := 1; n <= 13; n++ {
+		primal.Books = append(primal.Books, realisticCatalogBook(strconv.Itoa(n), primalID(n), fmt.Sprintf("The Primal Hunter %d", n)))
+	}
+	for _, withPositions := range []bool{true, false} {
+		locals := []realisticLocal{{301, at(withPositions, "1"), "abs:tph-1-a", "The Primal Hunter 1: A LitRPG Adventure", primalID(1)}}
+		for n := 1; n <= 13; n++ {
+			fid := fmt.Sprintf("abs:tph-%d", n)
+			if n == 1 {
+				fid = "abs:tph-1-b"
+			}
+			locals = append(locals, realisticLocal{int64(301 + n), at(withPositions, strconv.Itoa(n)), fid,
+				fmt.Sprintf("The Primal Hunter %d: A LitRPG Adventure", n), primalID(n)})
+		}
+		cases = append(cases, realisticDiffCase{name: "The Primal Hunter/" + positionsName(withPositions), catalog: primal, locals: locals})
+	}
+
+	// Stormlight, the #2410 shape: The Way of Kings twice beside Prime.
+	stormlight := &metadata.SeriesCatalog{ForeignID: "hc-series:42", Title: "The Stormlight Archive", Books: []metadata.SeriesCatalogBook{
+		realisticCatalogBook("1", "hc:the-way-of-kings", "The Way of Kings"),
+		realisticCatalogBook("", "hc:the-way-of-kings-prime", "The Way of Kings Prime"),
+		realisticCatalogBook("2", "hc:words-of-radiance", "Words of Radiance"),
+	}}
+	for _, withPositions := range []bool{true, false} {
+		cases = append(cases, realisticDiffCase{name: "Stormlight/" + positionsName(withPositions), catalog: stormlight, locals: []realisticLocal{
+			{401, at(withPositions, "1"), "abs:wok-ebook", "The Way of Kings", "hc:the-way-of-kings"},
+			{402, at(withPositions, "1"), "abs:wok-audio", "The Way of Kings", "hc:the-way-of-kings"},
+			{403, at(withPositions, "2"), "abs:wor", "Words of Radiance", "hc:words-of-radiance"},
+		}})
+	}
+	return cases
+}
+
+// TestHardcoverDiffRealisticSeriesNeverStarves guards the other side of
+// #2410. Keeping a second copy of a book off its neighbour must not also
+// keep a real book off its own entry. A rule that refused every weaker
+// fallback did exactly that on libraries without stored positions: each
+// bare "He Who Fights with Monsters N" lost the umbrella entry to volume 1,
+// was treated as a copy of it and listed Local only, and its own volume
+// showed as Missing, so series fill created and searched for books the user
+// already had.
+//
+// Every case runs in both library orders. A row may be Local only only when
+// another row of the same book is bound, and no entry a row owns may appear
+// in Missing. Which entry a row binds is not asserted: title similarity
+// still cross binds a few of these in one order or the other, on main too.
+func TestHardcoverDiffRealisticSeriesNeverStarves(t *testing.T) {
+	for _, c := range realisticDiffCases() {
+		for _, reversed := range []bool{false, true} {
+			order := "library order"
+			if reversed {
+				order = "reversed library order"
+			}
+			t.Run(c.name+"/"+order, func(t *testing.T) {
+				diff := buildHardcoverDiff(context.Background(), nil, 0, c.series(reversed), nil, c.catalog)
+				bound, starved, ownedMissing := realisticDiffOutcome(c, diff)
+				if len(starved) > 0 {
+					t.Errorf("real books %v are Local only with no other copy bound (bindings %v)", starved, bound)
+				}
+				if len(ownedMissing) > 0 {
+					t.Errorf("owned entries %v are listed Missing (bindings %v)", ownedMissing, bound)
+				}
+			})
+		}
+	}
+
+	// The same library through the real fill handler: a complete library
+	// must fill nothing. Starving it created Wanted copies of owned volumes
+	// and queued searches for them.
+	for _, reversed := range []bool{false, true} {
+		order := "library order"
+		if reversed {
+			order = "reversed library order"
+		}
+		t.Run("fill on He Who Fights with Monsters without positions/"+order, func(t *testing.T) {
+			author := &models.Author{ForeignID: "hc:shirtaloon", Name: "Shirtaloon", SortName: "Shirtaloon", MetadataProvider: "hardcover"}
+			all := make([]int, 0, 12)
+			for n := 1; n <= 12; n++ {
+				all = append(all, n)
+			}
+			catalog := hwfwmCatalog(all...)
+			for i := range catalog.Books {
+				b := &catalog.Books[i]
+				b.ProviderID = strconv.Itoa(1272300 + i + 1)
+				b.Book.SortTitle = b.Book.Title
+				b.Book.MetadataProvider = "hardcover"
+				b.Book.MediaType = models.MediaTypeAudiobook
+				b.Book.Author = author
+			}
+			searcher := newMockBookSearcher()
+			h, seriesRepo, authorRepo, bookRepo := seriesFixtureWithProvider(t, &stubSeriesProvider{
+				catalogs: map[string]*metadata.SeriesCatalog{catalog.ForeignID: catalog},
+			}, searcher)
+			ctx := context.Background()
+			series := &models.Series{ForeignID: "abs-series:hwfwm", Title: "He Who Fights with Monsters"}
+			if err := seriesRepo.Create(ctx, series); err != nil {
+				t.Fatal(err)
+			}
+			if err := seriesRepo.UpsertHardcoverLink(ctx, &models.SeriesHardcoverLink{
+				SeriesID: series.ID, HardcoverSeriesID: catalog.ForeignID, HardcoverProviderID: catalog.ProviderID,
+				HardcoverTitle: catalog.Title, HardcoverAuthorName: catalog.AuthorName, HardcoverBookCount: catalog.BookCount,
+				Confidence: 1, LinkedBy: "manual",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			storedAuthor := *author
+			if err := authorRepo.Create(ctx, &storedAuthor); err != nil {
+				t.Fatal(err)
+			}
+			locals := hwfwmFullLibrary(false)
+			if reversed {
+				for i, j := 0, len(locals)-1; i < j; i, j = i+1, j-1 {
+					locals[i], locals[j] = locals[j], locals[i]
+				}
+			}
+			for _, l := range locals {
+				book := &models.Book{ForeignID: l.fid, AuthorID: storedAuthor.ID, Title: l.title, SortTitle: l.title,
+					Status: models.BookStatusImported, MediaType: models.MediaTypeAudiobook, Monitored: true, Genres: []string{}}
+				if err := bookRepo.Create(ctx, book); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := seriesRepo.LinkBookIfMissing(ctx, series.ID, book.ID, "", true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := bookRepo.List(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			rec := httptest.NewRecorder()
+			h.Fill(rec, withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/series/1/fill", nil), "id", strconv.FormatInt(series.ID, 10)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+			var response map[string]int
+			if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+				t.Fatal(err)
+			}
+
+			after, err := bookRepo.List(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(after) != len(before) {
+				existing := map[int64]bool{}
+				for _, b := range before {
+					existing[b.ID] = true
+				}
+				var created []string
+				for _, b := range after {
+					if !existing[b.ID] {
+						created = append(created, b.Title)
+					}
+				}
+				t.Errorf("fill created %d books for a complete library: %q", len(created), created)
+			}
+			if response["queued"] != 0 {
+				t.Errorf("queued = %d, want 0: every volume is already imported", response["queued"])
+			}
+		})
+	}
+}
+
+// TestBoundCopyOfNeedsTheHolderToResembleTheBook pins the second half of the
+// copy test in boundCopyOf: equal title numbers are not enough, the book that
+// holds the entry must also score against this local at least as well as the
+// entry does. Without it every pair of titles without numbers reads as a
+// copy. Here the holder took "Words of Radiance" by its catalogue id although
+// its own title is "Oathbringer", so a local titled "Words of Radiance" is a
+// different row, not a second copy of the holder, and must stay free to fall
+// through to its next best entry.
+func TestBoundCopyOfNeedsTheHolderToResembleTheBook(t *testing.T) {
+	cat := func(fid, title string) metadata.SeriesCatalogBook {
+		return metadata.SeriesCatalogBook{ForeignID: fid, Title: title, Book: models.Book{ForeignID: fid, Title: title}}
+	}
+	books := []metadata.SeriesCatalogBook{cat("hc:words-of-radiance", "Words of Radiance")}
+	row := func(id int64, fid, title string) models.SeriesBook {
+		return models.SeriesBook{SeriesID: 1, BookID: id, Book: &models.Book{ID: id, ForeignID: fid, Title: title}}
+	}
+	local := row(2, "", "Words of Radiance")
+
+	t.Run("holder titled differently is not a twin", func(t *testing.T) {
+		locals := []models.SeriesBook{row(1, "hc:words-of-radiance", "Oathbringer"), local}
+		if entry, _, _ := boundCopyOf(local, locals, books, map[int]int{0: 0}, 0); entry != -1 {
+			t.Errorf("boundCopyOf = entry %d, want -1: %q is not a copy of %q", entry, local.Book.Title, locals[0].Book.Title)
+		}
+	})
+	t.Run("holder with the same title is a twin", func(t *testing.T) {
+		locals := []models.SeriesBook{row(1, "hc:words-of-radiance", "Words of Radiance"), local}
+		if entry, twin, _ := boundCopyOf(local, locals, books, map[int]int{0: 0}, 0); entry != 0 || twin != 0 {
+			t.Errorf("boundCopyOf = entry %d twin %d, want entry 0 held by local 0", entry, twin)
+		}
+	})
+}
+
+// TestHardcoverDiffTitleMatchesBindBestScoreFirst pins the ordering half of
+// the #2410 title pass: title matched locals bind in order of their best
+// score, not library order. In library order, reversed, a bare "He Who
+// Fights with Monsters 12" row reached the umbrella entry before volume 1
+// did and the two swapped. These series have no known misbinding left, so
+// every bound row must sit on its own entry in both orders. The cases with
+// known misbinds are listed in docs/Hardcover-Series-Wiki.md and excluded.
+func TestHardcoverDiffTitleMatchesBindBestScoreFirst(t *testing.T) {
+	clean := func(name string) bool {
+		return strings.Contains(name, "/with positions") ||
+			strings.HasPrefix(name, "He Who Fights with Monsters") ||
+			strings.HasPrefix(name, "Stormlight")
+	}
+	checked := 0
+	for _, c := range realisticDiffCases() {
+		if !clean(c.name) {
+			continue
+		}
+		for _, reversed := range []bool{false, true} {
+			order := "library order"
+			if reversed {
+				order = "reversed library order"
+			}
+			t.Run(c.name+"/"+order, func(t *testing.T) {
+				diff := buildHardcoverDiff(context.Background(), nil, 0, c.series(reversed), nil, c.catalog)
+				bound, _, _ := realisticDiffOutcome(c, diff)
+				for _, l := range c.locals {
+					if fid, ok := bound[l.id]; ok && fid != l.owns {
+						t.Errorf("local %d %q bound to %s, want %s (bindings %v)", l.id, l.title, fid, l.owns, bound)
+					}
+				}
+			})
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no realistic cases matched; the case names changed")
 	}
 }

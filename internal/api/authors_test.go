@@ -23,6 +23,7 @@ import (
 	"github.com/vavallee/bindery/internal/auth"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/importer"
+	"github.com/vavallee/bindery/internal/jobs"
 	"github.com/vavallee/bindery/internal/metadata"
 	"github.com/vavallee/bindery/internal/models"
 )
@@ -114,6 +115,44 @@ type stubMetaProvider struct {
 	// author, when non-nil, is returned by GetAuthor so tests can exercise
 	// the author-profile refresh path (Discussion #1226).
 	author *models.Author
+	// getAuthorBypass, when non-nil, receives whether each GetAuthor call
+	// carried metadata.WithCacheBypass, so a test can tell a refresh that
+	// reached the provider from one the aggregator cache answered (#2601).
+	// Buffered by the test; a full channel drops the report, never blocks.
+	getAuthorBypass chan bool
+	// getAuthorGate, when non-nil, blocks every GetAuthor call until it is
+	// closed, after the getAuthorBypass signal. Holds a catalogue sync open.
+	getAuthorGate chan struct{}
+}
+
+type languageEvidenceMetaProvider struct {
+	stubMetaProvider
+	evidence map[string]metadata.AuthorWorkLanguageEvidence
+	err      error
+	calls    int
+}
+
+func (p *languageEvidenceMetaProvider) GetAuthorWorkLanguageEvidence(_ context.Context, _ []models.Book, _ []string) (map[string]metadata.AuthorWorkLanguageEvidence, error) {
+	p.calls++
+	return p.evidence, p.err
+}
+
+type languageEvidenceFillerMetaProvider struct {
+	languageEvidenceMetaProvider
+	fillLanguage string
+	fillCalls    int
+}
+
+func (p *languageEvidenceFillerMetaProvider) FillMissingWorkLanguages(_ context.Context, books []models.Book) int {
+	p.fillCalls++
+	filled := 0
+	for i := range books {
+		if books[i].Language == "" {
+			books[i].Language = p.fillLanguage
+			filled++
+		}
+	}
+	return filled
 }
 
 func (p *stubMetaProvider) Name() string {
@@ -128,7 +167,16 @@ func (p *stubMetaProvider) SearchAuthors(_ context.Context, _ string) ([]models.
 func (p *stubMetaProvider) SearchBooks(_ context.Context, _ string) ([]models.Book, error) {
 	return nil, nil
 }
-func (p *stubMetaProvider) GetAuthor(_ context.Context, _ string) (*models.Author, error) {
+func (p *stubMetaProvider) GetAuthor(ctx context.Context, _ string) (*models.Author, error) {
+	if p.getAuthorBypass != nil {
+		select {
+		case p.getAuthorBypass <- metadata.CacheBypassed(ctx):
+		default:
+		}
+	}
+	if p.getAuthorGate != nil {
+		<-p.getAuthorGate
+	}
 	return p.author, nil
 }
 func (p *stubMetaProvider) GetBook(_ context.Context, fid string) (*models.Book, error) {
@@ -1137,6 +1185,63 @@ func TestFetchAuthorBooks_SkipsSearchForOwnedBooks(t *testing.T) {
 	}
 	if ownedBook.FilePath != finder.ownedPath {
 		t.Errorf("expected file path %q, got %q", finder.ownedPath, ownedBook.FilePath)
+	}
+}
+
+// TestHandleNewWantedBook_DoesNotBindAnotherBooksFile is the ownership half of
+// #2810: FindExisting matches on the title alone, so a new book must not take
+// a file that book_files already gives to another book. Volume 1 owns its
+// audiobook folder; the match FindExisting offers volume 17 is the m4b inside
+// it. The book must stay unbound so auto-search runs. A file nobody owns is
+// still bound.
+func TestHandleNewWantedBook_DoesNotBindAnotherBooksFile(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	ctx := context.Background()
+
+	author := &models.Author{ForeignID: "hc:thefirstdefier", Name: "TheFirstDefier", SortName: "TheFirstDefier"}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	vol1Dir := "/books/audiobooks/TheFirstDefier/Defiance of the Fall"
+	vol1 := &models.Book{ForeignID: "hc:defiance-of-the-fall", AuthorID: author.ID, Title: "Defiance of the Fall",
+		Status: models.BookStatusImported, MediaType: models.MediaTypeAudiobook, Genres: []string{}}
+	if err := bookRepo.Create(ctx, vol1); err != nil {
+		t.Fatal(err)
+	}
+	if err := bookRepo.AddBookFile(ctx, vol1.ID, models.MediaTypeAudiobook, vol1Dir); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name, title, path string
+		wantBound         bool
+	}{
+		{"track inside an owned folder", "Defiance of the Fall 17", vol1Dir + "/Defiance of the Fall [B094JZMCJX].m4b", false},
+		{"the owned path itself", "Defiance of the Fall 18", vol1Dir, false},
+		{"a file nobody owns", "Defiance of the Fall 19", "/books/audiobooks/TheFirstDefier/Defiance of the Fall 19/Defiance of the Fall 19.m4b", true},
+	} {
+		book := &models.Book{ForeignID: "hc:" + tc.title, AuthorID: author.ID, Title: tc.title,
+			Status: models.BookStatusWanted, MediaType: models.MediaTypeAudiobook, Genres: []string{}}
+		if err := bookRepo.Create(ctx, book); err != nil {
+			t.Fatal(err)
+		}
+		finder := &stubLibraryFinder{ownedTitle: tc.title, ownedPath: tc.path}
+		if got := handleNewWantedBook(ctx, bookRepo, nil, finder, *book, author.Name); got != tc.wantBound {
+			t.Errorf("%s: handleNewWantedBook = %v, want %v", tc.name, got, tc.wantBound)
+		}
+		files, err := bookRepo.ListFiles(ctx, book.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bound := len(files) > 0; bound != tc.wantBound {
+			t.Errorf("%s: book_files rows = %v, want bound=%v", tc.name, files, tc.wantBound)
+		}
 	}
 }
 
@@ -2313,6 +2418,55 @@ func TestCreateAuthor_UsesGlobalMonitorDefaultsWhenOmitted(t *testing.T) {
 	}
 	if got.MonitorMode != models.AuthorMonitorModeFuture || got.MonitorLatestCount != 4 {
 		t.Fatalf("monitor defaults = %q/%d, want future/4", got.MonitorMode, got.MonitorLatestCount)
+	}
+}
+
+// TestCreateAuthor_AcceptsMonitorNewItems: the Add Author dialog now offers
+// Monitor new items, so Create has to take it. Before this it was Update only,
+// and "catalogue once, never let a refresh grow it" could not be said at add
+// time. Invalid values are rejected the same way Update rejects them.
+func TestCreateAuthor_AcceptsMonitorNewItems(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	settingsRepo := db.NewSettingsRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	ctx := context.Background()
+	provider := &fixedAuthorProvider{
+		result: &models.Author{
+			ForeignID:        "OL-MNI-A",
+			Name:             "New Items",
+			SortName:         "Items, New",
+			MetadataProvider: "openlibrary",
+		},
+	}
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(provider), settingsRepo, profileRepo, nil)
+
+	post := func(body map[string]any) *httptest.ResponseRecorder {
+		raw, _ := json.Marshal(body)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/author", bytes.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.Create(rec, req)
+		return rec
+	}
+
+	if rec := post(map[string]any{"foreignAuthorId": "OL-MNI-A", "authorName": "New Items", "monitored": true, "monitorNewItems": "bogus"}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid monitorNewItems: expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := post(map[string]any{"foreignAuthorId": "OL-MNI-A", "authorName": "New Items", "monitored": true, "monitorNewItems": "none"}); rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	got, err := authorRepo.GetByForeignID(ctx, "OL-MNI-A")
+	if err != nil || got == nil {
+		t.Fatalf("fetch author: %v, got=%+v", err, got)
+	}
+	if got.MonitorNewItems != models.AuthorMonitorNewItemsNone {
+		t.Fatalf("monitorNewItems = %q, want none", got.MonitorNewItems)
 	}
 }
 
@@ -5179,6 +5333,120 @@ func TestAddBook_DirectInsertHydratesMatchedHardcoverEditions(t *testing.T) {
 	}
 }
 
+// TestAddBook_MediaTypePinIsForwardedToHydration is the #2768 regression for
+// the add path. The direct insert forwards an explicit request format to
+// hydration as a pin, so an "ebook" the user named stays ebook even though the
+// work has an audio edition; a format the provider supplied (no request value)
+// is still a guess and hydration may widen it to "both" — the behaviour #1732
+// and #1802 added the pin to keep for unpinned rows.
+func TestAddBook_MediaTypePinIsForwardedToHydration(t *testing.T) {
+	cases := []struct {
+		name        string
+		requestType string
+		want        string
+		wantASIN    string
+	}{
+		{
+			name:        "explicit ebook is pinned",
+			requestType: models.MediaTypeEbook,
+			want:        models.MediaTypeEbook,
+		},
+		{
+			name:     "provider ebook with no request value still widens",
+			want:     models.MediaTypeBoth,
+			wantASIN: "B2768DIRECT",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			database, err := db.OpenMemory()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			database.SetMaxOpenConns(1)
+
+			authorRepo := db.NewAuthorRepo(database)
+			bookRepo := db.NewBookRepo(database)
+			editionRepo := db.NewEditionRepo(database)
+			settingsRepo := db.NewSettingsRepo(database)
+			profileRepo := db.NewMetadataProfileRepo(database)
+			ctx := context.Background()
+			enableHardcoverFeatureForTest(t, ctx, settingsRepo)
+
+			primaryBook := &models.Book{
+				ForeignID:          "OL-PIN-W",
+				Title:              "Pinned Book",
+				SortTitle:          "Pinned Book",
+				Language:           "eng",
+				Status:             models.BookStatusWanted,
+				Genres:             []string{},
+				MetadataProvider:   "openlibrary",
+				MediaType:          models.MediaTypeEbook,
+				HardcoverForeignID: "hc:pinned-book",
+			}
+			primary := &stubMetaProvider{
+				name: "openlibrary",
+				getBookByID: map[string]*models.Book{
+					"OL-PIN-W": primaryBook,
+				},
+			}
+			audioASIN := "B2768DIRECT"
+			hardcover := &stubMetaProvider{
+				name: "hardcover",
+				editionsByBook: map[string][]models.Edition{
+					"hc:pinned-book": {{
+						ForeignID: "hc:pinned-book-audio",
+						Title:     "Pinned Book",
+						ASIN:      &audioASIN,
+						Format:    "Audiobook",
+						Monitored: true,
+					}},
+				},
+			}
+			agg := metadata.NewAggregator(primary, hardcover).WithAudnexClient(nil)
+			h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, agg, settingsRepo, profileRepo, nil).
+				WithHardcoverFeatureSettings(settingsRepo, true).
+				WithEditionHydration(editionRepo)
+
+			body := map[string]any{
+				"foreignBookId":   "OL-PIN-W",
+				"foreignAuthorId": "OL2768A",
+				"authorName":      "Pin Author",
+			}
+			if tc.requestType != "" {
+				body["mediaType"] = tc.requestType
+			}
+			raw, _ := json.Marshal(body)
+			rec := httptest.NewRecorder()
+			h.AddBook(rec, httptest.NewRequest(http.MethodPost, "/api/v1/author/book", bytes.NewReader(raw)))
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+			}
+
+			got, err := bookRepo.GetByForeignID(ctx, "OL-PIN-W")
+			if err != nil || got == nil {
+				t.Fatalf("book not persisted: err=%v got=%v", err, got)
+			}
+			if got.MediaType != tc.want {
+				t.Fatalf("MediaType = %q, want %q", got.MediaType, tc.want)
+			}
+			if got.ASIN != tc.wantASIN {
+				t.Fatalf("ASIN = %q, want %q", got.ASIN, tc.wantASIN)
+			}
+			// Hydration still ran in both cases, so the media type holding is
+			// the pin and not a skipped hydration.
+			editions, err := editionRepo.ListByBook(ctx, got.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(editions) != 1 || editions[0].ForeignID != "hc:pinned-book-audio" {
+				t.Fatalf("expected hydrated edition, got %+v", editions)
+			}
+		})
+	}
+}
+
 // TestCanUpgradeToBoth validates the helper that decides whether two
 // complementary media types should be merged into a dual-format row.
 func TestCanUpgradeToBoth(t *testing.T) {
@@ -5312,13 +5580,18 @@ func TestFetchAuthorBooks_MajorityLanguageFallbackRescuesUnresolvedWork(t *testi
 		{ForeignID: "OL993W", Title: "Resolved English Three", SortTitle: "resolved english three", Language: "eng",
 			MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "openlibrary"},
 		// No sampled edition reported a language for this one (a real,
-		// common OpenLibrary data gap) — the stub provider doesn't
-		// implement the edition-sample backfill, so this stays blank
-		// exactly as it would when that backfill genuinely can't resolve it.
+		// common OpenLibrary data gap), so the majority fallback must rescue it
+		// even when the evidence capability also reports it as indeterminate.
 		{ForeignID: "OL994W", Title: "Unresolved Language Work", SortTitle: "unresolved language work", Language: "",
 			MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "openlibrary"},
 	}
-	agg := metadata.NewAggregator(&stubMetaProvider{works: works})
+	provider := &languageEvidenceMetaProvider{
+		stubMetaProvider: stubMetaProvider{name: "openlibrary", works: works},
+		evidence: map[string]metadata.AuthorWorkLanguageEvidence{
+			"OL994W": {State: metadata.AuthorWorkLanguageIndeterminate},
+		},
+	}
+	agg := metadata.NewAggregator(provider)
 	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, agg, settingsRepo, profileRepo, nil)
 	h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
 
@@ -5333,9 +5606,293 @@ func TestFetchAuthorBooks_MajorityLanguageFallbackRescuesUnresolvedWork(t *testi
 	if !byTitle["Unresolved Language Work"] {
 		t.Error("work with no resolved language should have been rescued by the majority-language fallback, but was skipped")
 	}
+	if provider.calls != 1 {
+		t.Errorf("language evidence calls = %d, want 1", provider.calls)
+	}
 
 	if summary := h.syncSummaries.get(author.ID); summary != nil && summary.SkippedLanguage != 0 {
 		t.Errorf("summary.SkippedLanguage = %d, want 0 (the unresolved work should have been rescued, not skipped)", summary.SkippedLanguage)
+	}
+}
+
+func TestFetchAuthorBooks_EditionSamplingSurvivesIndeterminateEvidence(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	ctx := context.Background()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	profile, err := profileRepo.GetByID(ctx, models.DefaultMetadataProfileID)
+	if err != nil || profile == nil {
+		t.Fatalf("GetByID(default profile): profile=%+v err=%v", profile, err)
+	}
+	profile.AllowedLanguages = "eng"
+	profile.UnknownLanguageBehavior = models.UnknownLanguageFail
+	if err := profileRepo.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	author := &models.Author{
+		ForeignID: "hc:sampled-author", Name: "Sampled Author", SortName: "Author, Sampled",
+		MetadataProvider: "hardcover", Monitored: false,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	provider := &languageEvidenceFillerMetaProvider{
+		languageEvidenceMetaProvider: languageEvidenceMetaProvider{
+			stubMetaProvider: stubMetaProvider{name: "hardcover", works: []models.Book{{
+				ForeignID: "hc:sampled-work", Title: "Sampled Work", SortTitle: "Sampled Work",
+				MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover",
+			}}},
+			evidence: map[string]metadata.AuthorWorkLanguageEvidence{
+				"hc:sampled-work": {State: metadata.AuthorWorkLanguageIndeterminate},
+			},
+		},
+		fillLanguage: "eng",
+	}
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(provider), nil, profileRepo, nil)
+	h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
+
+	books, err := bookRepo.ListByAuthor(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(books) != 1 || books[0].Language != "eng" {
+		t.Fatalf("books = %+v, want the edition-sampled English work", books)
+	}
+	if provider.calls != 1 || provider.fillCalls != 1 {
+		t.Fatalf("evidence calls=%d fill calls=%d, want 1/1", provider.calls, provider.fillCalls)
+	}
+	if summary := h.syncSummaries.get(author.ID); summary == nil || summary.SkippedLanguage != 0 {
+		t.Fatalf("sync summary = %+v, want no language skips", summary)
+	}
+}
+
+// TestFetchAuthorBooks_HardcoverEditionLanguageEvidence is the regression for
+// a translated default edition (for example, a Portuguese default for an
+// English work). The default remains useful evidence, but an allowed-language
+// edition found by the bounded Hardcover batch query wins for catalogue
+// filtering without rewriting the provider's preferred/display language.
+// Complete non-allowed evidence and unresolved evidence still honor a strict
+// profile.
+func TestFetchAuthorBooks_HardcoverEditionLanguageEvidence(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	ctx := context.Background()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	profile, err := profileRepo.GetByID(ctx, models.DefaultMetadataProfileID)
+	if err != nil || profile == nil {
+		t.Fatalf("GetByID(default profile): profile=%+v err=%v", profile, err)
+	}
+	profile.AllowedLanguages = "eng"
+	profile.UnknownLanguageBehavior = models.UnknownLanguageFail
+	if err := profileRepo.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	author := &models.Author{
+		ForeignID: "hc:test-author", Name: "Test Author", SortName: "Author, Test",
+		MetadataProvider: "hardcover", Monitored: false,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	provider := &languageEvidenceMetaProvider{
+		stubMetaProvider: stubMetaProvider{name: "hardcover", works: []models.Book{
+			{ForeignID: "hc:translated-default", Title: "Translated Default", SortTitle: "Translated Default", Language: "por", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+			{ForeignID: "hc:english-default", Title: "English Default", SortTitle: "English Default", Language: "eng", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+			{ForeignID: "hc:foreign-only", Title: "Foreign Only", SortTitle: "Foreign Only", Language: "spa", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+			{ForeignID: "hc:unresolved", Title: "Unresolved", SortTitle: "Unresolved", Language: "por", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+		}},
+		evidence: map[string]metadata.AuthorWorkLanguageEvidence{
+			"hc:translated-default": {State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
+			"hc:english-default":    {State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
+			"hc:foreign-only":       {State: metadata.AuthorWorkLanguageNotAllowed, Language: "spa"},
+			"hc:unresolved":         {State: metadata.AuthorWorkLanguageIndeterminate},
+		},
+	}
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(provider), nil, profileRepo, nil)
+	h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
+
+	books, err := bookRepo.ListByAuthor(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byTitle := make(map[string]models.Book, len(books))
+	for _, book := range books {
+		byTitle[book.Title] = book
+	}
+	wantLanguage := map[string]string{"Translated Default": "por", "English Default": "eng"}
+	for title, language := range wantLanguage {
+		book, ok := byTitle[title]
+		if !ok {
+			t.Errorf("%q was rejected by the English-only profile", title)
+			continue
+		}
+		if book.Language != language {
+			t.Errorf("%q Language = %q, want preferred/display language %q", title, book.Language, language)
+		}
+	}
+	for _, title := range []string{"Foreign Only", "Unresolved"} {
+		if _, ok := byTitle[title]; ok {
+			t.Errorf("%q survived a strict English-only profile", title)
+		}
+	}
+	if provider.calls != 1 {
+		t.Errorf("language evidence calls = %d, want 1 batched lookup", provider.calls)
+	}
+	if summary := h.syncSummaries.get(author.ID); summary == nil || summary.SkippedLanguage != 2 {
+		t.Fatalf("sync summary = %+v, want two language skips", summary)
+	}
+}
+
+func TestFetchAuthorBooks_LanguageEvidenceFailureUsesExistingPipeline(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	ctx := context.Background()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	profile, err := profileRepo.GetByID(ctx, models.DefaultMetadataProfileID)
+	if err != nil || profile == nil {
+		t.Fatalf("GetByID(default profile): profile=%+v err=%v", profile, err)
+	}
+	profile.AllowedLanguages = "eng"
+	profile.UnknownLanguageBehavior = models.UnknownLanguageFail
+	if err := profileRepo.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	author := &models.Author{
+		ForeignID: "hc:evidence-error-author", Name: "Evidence Error Author", SortName: "Author, Evidence Error",
+		MetadataProvider: "hardcover", Monitored: false,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	works := []models.Book{
+		{ForeignID: "hc:english-one", Title: "English One", SortTitle: "English One", Language: "eng", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+		{ForeignID: "hc:english-two", Title: "English Two", SortTitle: "English Two", Language: "eng", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+		{ForeignID: "hc:english-three", Title: "English Three", SortTitle: "English Three", Language: "eng", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+		{ForeignID: "hc:unresolved", Title: "Unresolved", SortTitle: "Unresolved", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+	}
+	evidence := make(map[string]metadata.AuthorWorkLanguageEvidence, len(works))
+	for _, work := range works {
+		evidence[work.ForeignID] = metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageIndeterminate}
+	}
+	provider := &languageEvidenceMetaProvider{
+		stubMetaProvider: stubMetaProvider{name: "hardcover", works: works},
+		evidence:         evidence,
+		err:              errors.New("language evidence unavailable"),
+	}
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(provider), nil, profileRepo, nil)
+	h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
+
+	books, err := bookRepo.ListByAuthor(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(books) != len(works) {
+		t.Fatalf("books = %+v, want all %d works retained by scalar/majority fallbacks", books, len(works))
+	}
+	for _, book := range books {
+		if book.Language != "eng" {
+			t.Errorf("%q language = %q, want eng", book.Title, book.Language)
+		}
+	}
+	if provider.calls != 1 {
+		t.Errorf("language evidence calls = %d, want 1", provider.calls)
+	}
+	if summary := h.syncSummaries.get(author.ID); summary == nil || summary.SkippedLanguage != 0 || summary.Total != len(works) {
+		t.Fatalf("sync summary = %+v, want total=%d and no language skips", summary, len(works))
+	}
+}
+
+func TestAuthorWorkPassesLanguageFilter_UnrestrictedProfileIgnoresEvidence(t *testing.T) {
+	book := models.Book{ForeignID: "hc:work", Language: "por"}
+	evidence := map[string]metadata.AuthorWorkLanguageEvidence{
+		"hc:work": {State: metadata.AuthorWorkLanguageNotAllowed, Language: "por"},
+	}
+
+	allowed, indeterminate := authorWorkPassesLanguageFilter(&book, nil, true, evidence)
+	if !allowed || indeterminate {
+		t.Fatalf("allowed=%v indeterminate=%v, want true/false for an unrestricted profile", allowed, indeterminate)
+	}
+	if book.Language != "por" {
+		t.Fatalf("language = %q, want original display language preserved", book.Language)
+	}
+}
+
+func TestAuthorWorkPassesLanguageFilter_EvidenceFallsBackWithoutMutatingDisplayLanguage(t *testing.T) {
+	tests := []struct {
+		name              string
+		scalarLanguage    string
+		evidence          metadata.AuthorWorkLanguageEvidence
+		unknownFail       bool
+		locked            bool
+		wantAllowed       bool
+		wantIndeterminate bool
+	}{
+		{
+			name: "allowed evidence accepts translated display language", scalarLanguage: "por",
+			evidence: metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
+			locked:   true, wantAllowed: true,
+		},
+		{
+			name: "definitive non-allowed evidence rejects allowed scalar", scalarLanguage: "eng",
+			evidence: metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageNotAllowed, Language: "spa"},
+		},
+		{
+			name: "indeterminate blank strict", evidence: metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageIndeterminate},
+			unknownFail: true, wantIndeterminate: true,
+		},
+		{
+			name: "indeterminate blank permissive", evidence: metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageIndeterminate},
+			wantAllowed: true, wantIndeterminate: true,
+		},
+		{
+			name: "indeterminate allowed scalar", scalarLanguage: "eng",
+			evidence:    metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageIndeterminate},
+			unknownFail: true, wantAllowed: true,
+		},
+		{
+			name: "indeterminate non-allowed scalar", scalarLanguage: "spa",
+			evidence:    metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageIndeterminate},
+			unknownFail: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			book := models.Book{ForeignID: "hc:work", Language: tt.scalarLanguage}
+			if tt.locked {
+				book.LockField(models.BookFieldLanguage)
+			}
+			evidence := map[string]metadata.AuthorWorkLanguageEvidence{"hc:work": tt.evidence}
+
+			allowed, indeterminate := authorWorkPassesLanguageFilter(&book, []string{"eng"}, tt.unknownFail, evidence)
+			if allowed != tt.wantAllowed || indeterminate != tt.wantIndeterminate {
+				t.Fatalf("allowed=%v indeterminate=%v, want %v/%v", allowed, indeterminate, tt.wantAllowed, tt.wantIndeterminate)
+			}
+			if book.Language != tt.scalarLanguage {
+				t.Fatalf("language = %q, want display language unchanged at %q", book.Language, tt.scalarLanguage)
+			}
+			if tt.locked && !book.IsFieldLocked(models.BookFieldLanguage) {
+				t.Fatal("language field lock was lost")
+			}
+		})
 	}
 }
 
@@ -7301,6 +7858,274 @@ func TestFetchAuthorBooks_SkipMissingISBNExemptsAlreadyTrackedBook(t *testing.T)
 	}
 }
 
+// thinClusterTestWorks is the catalogue for the MinEditionCount tests (#2235).
+// "Thin Novel" sits below a floor of 3 and is the work the filter drops.
+// "Fat Novel" clears it. "Unknown Novel" reports no edition count at all —
+// the Hardcover-primary shape — and must pass. "Clustered Novel" appears as
+// two works under one title, one thin (1) and one well-editioned (5): the
+// filter judges the cluster's best-known count, so both survive.
+func thinClusterTestWorks() []models.Book {
+	return []models.Book{
+		{ForeignID: "OL990W", Title: "Thin Novel", SortTitle: "thin novel", Language: "eng",
+			MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "openlibrary",
+			EditionCount: 1},
+		{ForeignID: "OL991W", Title: "Fat Novel", SortTitle: "fat novel", Language: "eng",
+			MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "openlibrary",
+			EditionCount: 5},
+		{ForeignID: "OL992W", Title: "Unknown Novel", SortTitle: "unknown novel", Language: "eng",
+			MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "openlibrary"},
+		{ForeignID: "OL993W", Title: "Clustered Novel", SortTitle: "clustered novel", Language: "eng",
+			MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "openlibrary",
+			EditionCount: 1},
+		{ForeignID: "OL994W", Title: "Clustered Novel", SortTitle: "clustered novel", Language: "eng",
+			MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "openlibrary",
+			EditionCount: 5},
+	}
+}
+
+// TestFetchAuthorBooks_SkipsThinCluster verifies that once a metadata
+// profile's MinEditionCount is set, works whose title cluster reports fewer
+// editions than the floor are dropped, while works clearing the floor, works
+// with no known edition count (unknown, not zero), and a title cluster that
+// carries at least one well-editioned work all come through.
+func TestFetchAuthorBooks_SkipsThinCluster(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	settingsRepo := db.NewSettingsRepo(database)
+	ctx := context.Background()
+
+	profile, err := profileRepo.GetByID(ctx, models.DefaultMetadataProfileID)
+	if err != nil || profile == nil {
+		t.Fatalf("GetByID(default profile) failed: %v", err)
+	}
+	profile.MinEditionCount = 3
+	if err := profileRepo.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+
+	author := &models.Author{
+		ForeignID: "OL990A", Name: "Editions Author", SortName: "Author, Editions",
+		MetadataProvider: "openlibrary", Monitored: false,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+
+	works := thinClusterTestWorks()
+	agg := metadata.NewAggregator(&stubMetaProvider{works: works})
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, agg, settingsRepo, profileRepo, nil)
+	h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
+
+	got, err := bookRepo.ListByAuthor(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byTitle := make(map[string]bool, len(got))
+	for _, b := range got {
+		byTitle[b.Title] = true
+	}
+
+	if byTitle["Thin Novel"] {
+		t.Error("work below the edition-count floor should have been skipped, but was created")
+	}
+	for _, want := range []string{"Fat Novel", "Unknown Novel", "Clustered Novel"} {
+		if !byTitle[want] {
+			t.Errorf("work %q should have been created, but was skipped", want)
+		}
+	}
+
+	summary := h.syncSummaries.get(author.ID)
+	if summary == nil {
+		t.Fatal("expected a recorded sync summary, got nil")
+	}
+	if want := 1; summary.SkippedThinCluster != want {
+		t.Errorf("summary.SkippedThinCluster = %d, want %d", summary.SkippedThinCluster, want)
+	}
+	if summary.SkippedTotal() < summary.SkippedThinCluster {
+		t.Errorf("summary.SkippedTotal() = %d should include SkippedThinCluster = %d", summary.SkippedTotal(), summary.SkippedThinCluster)
+	}
+	sampleTitles := make(map[string]bool, len(summary.SkippedThinClusterSample))
+	for _, b := range summary.SkippedThinClusterSample {
+		sampleTitles[b.Title] = true
+	}
+	if !sampleTitles["Thin Novel"] {
+		t.Errorf("expected %q in summary.SkippedThinClusterSample, got %+v", "Thin Novel", summary.SkippedThinClusterSample)
+	}
+}
+
+// TestFetchAuthorBooks_ThinClusterKeptWhenZero verifies the inverse of
+// TestFetchAuthorBooks_SkipsThinCluster: with MinEditionCount left at its
+// default (0), no work is dropped by the edition-count filter — it is
+// opt-in, and a profile without it pays nothing.
+func TestFetchAuthorBooks_ThinClusterKeptWhenZero(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	settingsRepo := db.NewSettingsRepo(database)
+	ctx := context.Background()
+
+	author := &models.Author{
+		ForeignID: "OL991A", Name: "Editions Author Two", SortName: "Author, Editions Two",
+		MetadataProvider: "openlibrary", Monitored: false,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+
+	works := thinClusterTestWorks()
+	agg := metadata.NewAggregator(&stubMetaProvider{works: works})
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, agg, settingsRepo, profileRepo, nil)
+	h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
+
+	got, err := bookRepo.ListByAuthor(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Four books, not five: the two "Clustered Novel" works share a title,
+	// and the sync's pre-existing title dedup folds the second into the
+	// first (matched, not created). That merge is independent of the
+	// edition-count filter — the point here is that nothing is DROPPED.
+	if len(got) != 4 {
+		t.Errorf("got %d books, want 4 (MinEditionCount defaults to 0, nothing should be dropped; the twin Clustered Novel works merge via title dedup)", len(got))
+	}
+	if summary := h.syncSummaries.get(author.ID); summary != nil && summary.SkippedThinCluster != 0 {
+		t.Errorf("summary.SkippedThinCluster = %d, want 0 (filter is opt-in)", summary.SkippedThinCluster)
+	}
+}
+
+// TestFetchAuthorBooks_ThinClusterExemptsAlreadyTrackedBook verifies that the
+// edition-count filter screens works out of discovery without stopping the
+// maintenance of a book the user already owns: a thin work that resolves to
+// an existing row is refreshed, not dropped, and not counted as skipped.
+func TestFetchAuthorBooks_ThinClusterExemptsAlreadyTrackedBook(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	settingsRepo := db.NewSettingsRepo(database)
+	ctx := context.Background()
+
+	profile, err := profileRepo.GetByID(ctx, models.DefaultMetadataProfileID)
+	if err != nil || profile == nil {
+		t.Fatalf("GetByID(default profile) failed: %v", err)
+	}
+	profile.MinEditionCount = 3
+	if err := profileRepo.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+
+	author := &models.Author{
+		ForeignID: "OL992A", Name: "Editions Author Three", SortName: "Author, Editions Three",
+		MetadataProvider: "openlibrary", Monitored: false,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+
+	owned := &models.Book{
+		ForeignID: "OL990W", Title: "Thin Novel", SortTitle: "thin novel",
+		AuthorID: author.ID, Language: "eng", Status: models.BookStatusWanted,
+		MediaType: models.MediaTypeEbook, MetadataProvider: "openlibrary",
+	}
+	if err := bookRepo.Create(ctx, owned); err != nil {
+		t.Fatal(err)
+	}
+
+	works := []models.Book{
+		{ForeignID: "OL990W", Title: "Thin Novel", SortTitle: "thin novel", Language: "eng",
+			MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "openlibrary",
+			EditionCount: 1, AverageRating: 4.2, RatingsCount: 250},
+	}
+	agg := metadata.NewAggregator(&stubMetaProvider{works: works})
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, agg, settingsRepo, profileRepo, nil)
+	h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
+
+	updated, err := bookRepo.GetByForeignID(ctx, "OL990W")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated == nil {
+		t.Fatal("already-tracked thin work was deleted, want it kept")
+	}
+	if updated.RatingsCount != 250 {
+		t.Errorf("RatingsCount = %d, want 250 (already-tracked book should still receive updates)", updated.RatingsCount)
+	}
+
+	if summary := h.syncSummaries.get(author.ID); summary != nil && summary.SkippedThinCluster != 0 {
+		t.Errorf("summary.SkippedThinCluster = %d, want 0 (already-tracked book must not be counted as skipped)", summary.SkippedThinCluster)
+	}
+}
+
+// TestFetchAuthorBooks_ThinClusterSingleWorkExempt verifies the #1612
+// exemption on the edition-count filter: an explicit add of one specific
+// work must not be vetoed by catalogue-sync heuristics, so a single-work run
+// creates the requested work even when it sits below the profile's floor.
+func TestFetchAuthorBooks_ThinClusterSingleWorkExempt(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	settingsRepo := db.NewSettingsRepo(database)
+	ctx := context.Background()
+
+	profile, err := profileRepo.GetByID(ctx, models.DefaultMetadataProfileID)
+	if err != nil || profile == nil {
+		t.Fatalf("GetByID(default profile) failed: %v", err)
+	}
+	profile.MinEditionCount = 3
+	if err := profileRepo.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+
+	author := &models.Author{
+		ForeignID: "OL993A", Name: "Editions Author Four", SortName: "Author, Editions Four",
+		MetadataProvider: "openlibrary", Monitored: false,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+
+	works := []models.Book{
+		{ForeignID: "OL990W", Title: "Thin Novel", SortTitle: "thin novel", Language: "eng",
+			MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "openlibrary",
+			EditionCount: 1},
+	}
+	agg := metadata.NewAggregator(&stubMetaProvider{works: works})
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, agg, settingsRepo, profileRepo, nil)
+	h.fetchAuthorBooks(ctx, author, catalogueSyncOptions{mediaType: models.MediaTypeEbook, onlyForeignID: "OL990W"})
+
+	created, err := bookRepo.GetByForeignID(ctx, "OL990W")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created == nil {
+		t.Fatal("explicitly added single work was vetoed by the edition-count filter, want it created (#1612)")
+	}
+}
+
 // TestIsPartBookTitle is a fast, DB-free check of partBookTitleRe against
 // every noise pattern denoise_author.py was built to catch (confirmed
 // against real OpenLibrary titles pulled during development) plus the
@@ -7972,5 +8797,521 @@ func TestSaveAlternateNames_SharedLatinRule(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Name != "Haruki Murakamø" {
 		t.Fatalf("mixed-script author aliases = %+v, want exactly [Haruki Murakamø]", got)
+	}
+}
+
+// TestAddBook_RefusesBookAlreadyOwned covers #1227. Re-adding a book the
+// requesting user already owns used to reuse the row and force it back to
+// monitored. Now it answers 409 with the existing row, before any author
+// creation or upstream fetch, and leaves the row untouched (monitored stays
+// false). Another user's copy of the same foreign id is not a library
+// conflict for this user, but the guard after the poll still refuses to touch
+// or expose it.
+func TestAddBook_RefusesBookAlreadyOwned(t *testing.T) {
+	// Tenancy on: the conflict gate is scoped to the caller, so bob's request
+	// gets past it and exercises the post poll guard instead.
+	auth.SetEnforceTenancyForTests(t, true)
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	database.SetMaxOpenConns(1)
+
+	ctx := context.Background()
+	users := db.NewUserRepo(database)
+	alice, err := users.Create(ctx, "alice", "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := users.Create(ctx, "bob", "h2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+
+	author := &models.Author{
+		ForeignID: "OL-ALICE", Name: "Alice Author", SortName: "Author, Alice",
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := authorRepo.CreateForUser(ctx, author, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+	owned := &models.Book{
+		ForeignID: "OL-BOOK-OWNED", Title: "Owned", SortTitle: "Owned", AuthorID: author.ID,
+		Status: models.BookStatusImported, Monitored: false, Genres: []string{},
+		MetadataProvider: "openlibrary", OwnerUserID: alice.ID,
+	}
+	if err := bookRepo.Create(ctx, owned); err != nil {
+		t.Fatal(err)
+	}
+
+	// Buffered so the stub's non-blocking send lands when GetBook is entered;
+	// an empty channel after the request proves no upstream fetch happened.
+	entered := make(chan struct{}, 1)
+	provider := &stubMetaProvider{getBookEntered: entered}
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(provider), nil, profileRepo, nil)
+
+	// No foreignAuthorId: the pre-#1227 handler would have gone straight to
+	// the provider to resolve the author. The conflict must come first.
+	body, _ := json.Marshal(map[string]any{"foreignBookId": "OL-BOOK-OWNED"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/author/book", bytes.NewReader(body)).
+		WithContext(auth.WithUserID(context.Background(), alice.ID))
+	rec := httptest.NewRecorder()
+	h.AddBook(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("alice re-add: expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var conflict struct {
+		Error          string       `json:"error"`
+		ExistingBookID int64        `json:"existingBookId"`
+		ExistingBook   *models.Book `json:"existingBook"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&conflict); err != nil {
+		t.Fatal(err)
+	}
+	if conflict.ExistingBookID != owned.ID || conflict.ExistingBook == nil || conflict.ExistingBook.ID != owned.ID {
+		t.Fatalf("conflict body = %+v, want existingBookId %d", conflict, owned.ID)
+	}
+	if conflict.Error == "" {
+		t.Fatalf("conflict body has no error message")
+	}
+	select {
+	case <-entered:
+		t.Fatalf("conflict path reached the metadata provider")
+	default:
+	}
+	after, err := bookRepo.GetByID(ctx, owned.ID)
+	if err != nil || after == nil {
+		t.Fatalf("owned book after conflict = %+v err=%v", after, err)
+	}
+	if after.Monitored {
+		t.Fatalf("conflict flipped the owned book to monitored")
+	}
+	if after.Status != models.BookStatusImported {
+		t.Fatalf("conflict changed status to %q", after.Status)
+	}
+	if n, _ := authorRepo.ListByUser(ctx, alice.ID); len(n) != 1 {
+		t.Fatalf("conflict created an author row: %d authors", len(n))
+	}
+
+	// Bob does not own that book, so the library scoped gate does not fire
+	// for him. books.foreign_id is UNIQUE across users though, so the poll
+	// finds alice's row; the guard after it must refuse without touching or
+	// exposing that row.
+	body, _ = json.Marshal(map[string]any{
+		"foreignBookId": "OL-BOOK-OWNED", "foreignAuthorId": "OL-BOB-AUTHOR", "authorName": "Bob Author",
+	})
+	parent, cancel := context.WithTimeout(auth.WithUserID(context.Background(), bob.ID), 200*time.Millisecond)
+	defer cancel()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/author/book", bytes.NewReader(body)).WithContext(parent)
+	rec = httptest.NewRecorder()
+	h.AddBook(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("bob adding alice's book: expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var held map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&held); err != nil {
+		t.Fatal(err)
+	}
+	if held["error"] != "book is held by another user" {
+		t.Fatalf("bob conflict error = %v", held["error"])
+	}
+	if _, leaked := held["existingBook"]; leaked {
+		t.Fatalf("bob's 409 carries alice's row: %v", held)
+	}
+	if _, leaked := held["existingBookId"]; leaked {
+		t.Fatalf("bob's 409 carries alice's book id: %v", held)
+	}
+	// Compare against the row as read back before bob's request, not the
+	// fixture struct: Create fills defaults (media type) the struct lacks.
+	beforeBob := *after
+	after, err = bookRepo.GetByID(ctx, owned.ID)
+	if err != nil || after == nil {
+		t.Fatalf("alice's book after bob's add = %+v err=%v", after, err)
+	}
+	if after.Monitored || after.Status != beforeBob.Status || after.MediaType != beforeBob.MediaType || after.OwnerUserID != alice.ID || !after.UpdatedAt.Equal(beforeBob.UpdatedAt) {
+		t.Fatalf("bob's add changed alice's row: monitored=%v status=%q mediaType=%q owner=%d updatedAt=%v (before %v)", after.Monitored, after.Status, after.MediaType, after.OwnerUserID, after.UpdatedAt, beforeBob.UpdatedAt)
+	}
+	// The author row bob's request created is rolled back by the orphan
+	// cleanup defer, since no book was created for it.
+	if bobAuthors, _ := authorRepo.ListByUser(ctx, bob.ID); len(bobAuthors) != 0 {
+		t.Fatalf("bob's refused add left %d author row(s) behind: %+v", len(bobAuthors), bobAuthors)
+	}
+}
+
+// TestAddBook_RefusesNullOwnedBookForLoggedInUser: with tenancy off, a logged
+// in user re-adding a row with no owner (what any local only or API key
+// request creates) must hit the same conflict. The gate is scoped like the
+// library list, where that row is visible, not by strict owner equality.
+func TestAddBook_RefusesNullOwnedBookForLoggedInUser(t *testing.T) {
+	auth.SetEnforceTenancyForTests(t, false)
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	database.SetMaxOpenConns(1)
+
+	ctx := context.Background()
+	users := db.NewUserRepo(database)
+	alice, err := users.Create(ctx, "alice", "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	author := &models.Author{
+		ForeignID: "OL-NOBODY", Name: "Nobody Author", SortName: "Author, Nobody",
+		MetadataProvider: "openlibrary",
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	unowned := &models.Book{
+		ForeignID: "OL-BOOK-NULL", Title: "Unowned", SortTitle: "Unowned", AuthorID: author.ID,
+		Status: models.BookStatusImported, Monitored: false, Genres: []string{},
+		MetadataProvider: "openlibrary",
+	}
+	if err := bookRepo.Create(ctx, unowned); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := bookRepo.GetByID(ctx, unowned.ID); got == nil || got.OwnerUserID != 0 {
+		t.Fatalf("fixture book should have no owner, got %+v", got)
+	}
+
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(&stubMetaProvider{}), nil, profileRepo, nil)
+	body, _ := json.Marshal(map[string]any{
+		"foreignBookId": "OL-BOOK-NULL", "foreignAuthorId": "OL-NOBODY", "authorName": "Nobody Author",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/author/book", bytes.NewReader(body)).
+		WithContext(auth.WithUserID(context.Background(), alice.ID))
+	rec := httptest.NewRecorder()
+	h.AddBook(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var conflict struct {
+		ExistingBookID int64 `json:"existingBookId"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&conflict); err != nil {
+		t.Fatal(err)
+	}
+	if conflict.ExistingBookID != unowned.ID {
+		t.Fatalf("existingBookId = %d, want %d", conflict.ExistingBookID, unowned.ID)
+	}
+	after, err := bookRepo.GetByID(ctx, unowned.ID)
+	if err != nil || after == nil {
+		t.Fatalf("book after conflict = %+v err=%v", after, err)
+	}
+	if after.Monitored {
+		t.Fatalf("conflict flipped the unowned book to monitored")
+	}
+}
+
+// TestAddBook_AdminGetsConflictForOtherUsersBook: with tenancy on, an admin
+// sees every row in the library list, so re-adding another user's book is a
+// library conflict (409 with the row), not a silent 201 that re monitors it.
+func TestAddBook_AdminGetsConflictForOtherUsersBook(t *testing.T) {
+	auth.SetEnforceTenancyForTests(t, true)
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	database.SetMaxOpenConns(1)
+
+	ctx := context.Background()
+	users := db.NewUserRepo(database)
+	alice, err := users.Create(ctx, "alice", "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := users.Create(ctx, "admin", "h2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	author := &models.Author{
+		ForeignID: "OL-ALICE", Name: "Alice Author", SortName: "Author, Alice",
+		MetadataProvider: "openlibrary",
+	}
+	if err := authorRepo.CreateForUser(ctx, author, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+	owned := &models.Book{
+		ForeignID: "OL-BOOK-OWNED", Title: "Owned", SortTitle: "Owned", AuthorID: author.ID,
+		Status: models.BookStatusImported, Monitored: false, Genres: []string{},
+		MetadataProvider: "openlibrary", OwnerUserID: alice.ID,
+	}
+	if err := bookRepo.Create(ctx, owned); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(&stubMetaProvider{}), nil, profileRepo, nil)
+	body, _ := json.Marshal(map[string]any{
+		"foreignBookId": "OL-BOOK-OWNED", "foreignAuthorId": "OL-ALICE", "authorName": "Alice Author",
+	})
+	adminCtx := auth.WithUserRole(auth.WithUserID(context.Background(), admin.ID), "admin")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/author/book", bytes.NewReader(body)).WithContext(adminCtx)
+	rec := httptest.NewRecorder()
+	h.AddBook(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("admin re-add: expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var conflict struct {
+		ExistingBookID int64 `json:"existingBookId"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&conflict); err != nil {
+		t.Fatal(err)
+	}
+	if conflict.ExistingBookID != owned.ID {
+		t.Fatalf("existingBookId = %d, want %d", conflict.ExistingBookID, owned.ID)
+	}
+	after, err := bookRepo.GetByID(ctx, owned.ID)
+	if err != nil || after == nil {
+		t.Fatalf("book after conflict = %+v err=%v", after, err)
+	}
+	if after.Monitored {
+		t.Fatalf("admin re-add flipped alice's book to monitored")
+	}
+}
+
+// TestAuthorRefresh_ManualRefreshBypassesMetadataCache pins #2601. The metadata
+// aggregator caches author profiles and catalogues for 24 hours, and the manual
+// Refresh Metadata action used to read through that cache, so a bio, photo or
+// new book that appeared upstream stayed invisible for up to a day after the
+// user explicitly asked for it. The bulk paths (selection refresh and Refresh
+// all, both RefreshAuthorBooks) deliberately keep the cache: they fan out over
+// many authors, and the cache is what stops a repeat run refetching them all.
+func TestAuthorRefresh_ManualRefreshBypassesMetadataCache(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	ctx := context.Background()
+
+	author := &models.Author{
+		ForeignID: "OL2601A", Name: "Ann Leckie", SortName: "Leckie, Ann",
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	work := func(id, title string) models.Book {
+		return models.Book{ForeignID: id, Title: title, SortTitle: strings.ToLower(title), Language: "eng",
+			Status: models.BookStatusWanted, Genres: []string{}, MetadataProvider: "openlibrary"}
+	}
+	stub := &stubMetaProvider{
+		works:  []models.Book{work("OL2601W1", "Ancillary Justice")},
+		author: &models.Author{ForeignID: "OL2601A", Name: "Ann Leckie", Description: "old bio", MetadataProvider: "openlibrary"},
+	}
+	agg := metadata.NewAggregator(stub)
+	group := jobs.NewGroup(context.Background())
+	defer group.Shutdown(5 * time.Second) // runs before database.Close
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, agg, nil, profileRepo, nil).WithJobs(group)
+
+	profileAndBooks := func() (string, int) {
+		t.Helper()
+		got, err := authorRepo.GetByID(ctx, author.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		books, err := bookRepo.ListByAuthor(ctx, author.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.Description, len(books)
+	}
+
+	// Warm the aggregator cache the way a bulk refresh does.
+	h.RefreshAuthorBooks(author, false, "")
+	if desc, n := profileAndBooks(); desc != "old bio" || n != 1 {
+		t.Fatalf("after warm refresh: description %q, %d books; want %q and 1", desc, n, "old bio")
+	}
+
+	// Upstream changes: a new bio and a new book.
+	stub.author = &models.Author{ForeignID: "OL2601A", Name: "Ann Leckie", Description: "new bio", MetadataProvider: "openlibrary"}
+	stub.works = []models.Book{work("OL2601W1", "Ancillary Justice"), work("OL2601W2", "Translation State")}
+	stub.getAuthorBypass = make(chan bool, 8)
+
+	// The bulk path keeps reading through the cache.
+	reloaded, err := authorRepo.GetByID(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.RefreshAuthorBooks(reloaded, false, "")
+	if n := len(stub.getAuthorBypass); n != 0 {
+		t.Fatalf("bulk refresh reached the provider %d times; it should be answered by the cache", n)
+	}
+	if desc, n := profileAndBooks(); desc != "old bio" || n != 1 {
+		t.Fatalf("after bulk refresh: description %q, %d books; want the cached %q and 1", desc, n, "old bio")
+	}
+
+	// The manual Refresh Metadata action must go to the provider.
+	id := strconv.FormatInt(author.ID, 10)
+	req := withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/author/"+id+"/refresh", nil), "id", id)
+	rec := httptest.NewRecorder()
+	h.Refresh(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("Refresh status = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case bypassed := <-stub.getAuthorBypass:
+		if !bypassed {
+			t.Fatal("manual refresh reached the provider without metadata.WithCacheBypass")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("manual refresh never reached the provider: the 24 hour metadata cache answered it (#2601)")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		desc, n := profileAndBooks()
+		if desc == "new bio" && n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after manual refresh: description %q, %d books; want %q and 2", desc, n, "new bio")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The fresh profile was written back: an ordinary read serves it from the
+	// cache without another provider call.
+	cached, err := agg.GetAuthor(ctx, author.ForeignID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached == nil || cached.Description != "new bio" {
+		t.Fatalf("ordinary GetAuthor after refresh = %+v, want the refreshed %q from the cache", cached, "new bio")
+	}
+	if n := len(stub.getAuthorBypass); n != 0 {
+		t.Fatalf("ordinary GetAuthor after refresh reached the provider (%d extra calls)", n)
+	}
+}
+
+// TestAuthorRefresh_RefusesSecondRefreshWhileSyncRuns: five clicks on Refresh
+// used to start five concurrent full syncs, each one bypassing the metadata
+// cache (#2601 review). A click while a sync for that author is running is
+// refused with 409, the author payload says a sync is running so the page can
+// wait for it, and a click after it finishes starts a new one.
+func TestAuthorRefresh_RefusesSecondRefreshWhileSyncRuns(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	ctx := context.Background()
+
+	author := &models.Author{
+		ForeignID: "OL2601A", Name: "Ann Leckie", SortName: "Leckie, Ann",
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate) }) }
+	stub := &stubMetaProvider{
+		works: []models.Book{{ForeignID: "OL2601W1", Title: "Ancillary Justice", SortTitle: "ancillary justice", Language: "eng",
+			Status: models.BookStatusWanted, Genres: []string{}, MetadataProvider: "openlibrary"}},
+		author:          &models.Author{ForeignID: "OL2601A", Name: "Ann Leckie", Description: "bio", MetadataProvider: "openlibrary"},
+		getAuthorBypass: make(chan bool, 8),
+		getAuthorGate:   gate,
+	}
+	group := jobs.NewGroup(context.Background())
+	defer group.Shutdown(5 * time.Second) // runs before database.Close
+	defer release()                       // runs before Shutdown, so a held sync can drain
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(stub), nil, profileRepo, nil).WithJobs(group)
+
+	id := strconv.FormatInt(author.ID, 10)
+	click := func() *httptest.ResponseRecorder {
+		t.Helper()
+		req := withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/author/"+id+"/refresh", nil), "id", id)
+		rec := httptest.NewRecorder()
+		h.Refresh(rec, req)
+		return rec
+	}
+	syncing := func() bool {
+		t.Helper()
+		req := withURLParam(httptest.NewRequest(http.MethodGet, "/api/v1/author/"+id, nil), "id", id)
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET author = %d: %s", rec.Code, rec.Body.String())
+		}
+		var got models.Author
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode author: %v", err)
+		}
+		return got.SyncInProgress
+	}
+	waitForProvider := func() {
+		t.Helper()
+		select {
+		case <-stub.getAuthorBypass:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the refresh sync never reached the provider")
+		}
+	}
+
+	if rec := click(); rec.Code != http.StatusAccepted {
+		t.Fatalf("first Refresh = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	waitForProvider() // the first sync is now held inside GetAuthor
+
+	rec := click()
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("second Refresh while the first sync runs = %d, want 409: a second concurrent sync was started", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "already running") {
+		t.Fatalf("409 body = %s, want a message saying a refresh is already running", rec.Body.String())
+	}
+	select {
+	case <-stub.getAuthorBypass:
+		t.Fatal("the refused Refresh still reached the provider")
+	default:
+	}
+	if !syncing() {
+		t.Fatal("author payload does not report the running sync; the page cannot tell when it finishes")
+	}
+
+	release()
+	deadline := time.Now().Add(5 * time.Second)
+	for syncing() {
+		if time.Now().After(deadline) {
+			t.Fatal("author payload still reports a running sync after it finished")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if rec := click(); rec.Code != http.StatusAccepted {
+		t.Fatalf("Refresh after the first sync finished = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	waitForProvider()
+	deadline = time.Now().Add(5 * time.Second)
+	for syncing() {
+		if time.Now().After(deadline) {
+			t.Fatal("the third sync never finished")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

@@ -2,19 +2,13 @@ package importer
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
-	"time"
 
-	"github.com/vavallee/bindery/internal/calibre"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/models"
 )
@@ -83,6 +77,26 @@ func TestTitleMatch(t *testing.T) {
 		// Noise titles with no overlap
 		{"Project Hail Mary", "The Lord of the Rings", false},
 		{"Dune", "Foundation Asimov", false},
+
+		// Volumes of one series are different works however many words they
+		// share (#2810): a bare trailing number and an explicit marker alike.
+		{"Defiance of the Fall 17", "Defiance of the Fall 01", false},
+		{"Defiance of the Fall 7", "Defiance of the Fall 17", false},
+		{"Overlord, Vol. 1", "Overlord, Vol. 9", false},
+		// The same volume still matches across zero padding, and an unnumbered
+		// first volume still matches its numbered folder.
+		{"Defiance of the Fall 1", "Defiance of the Fall 01", true},
+		{"Defiance of the Fall", "Defiance of the Fall 01", true},
+		// A number that is part of the title is not a volume.
+		{"Fahrenheit 451", "Ray Bradbury Fahrenheit 451", true},
+		{"Catch-22", "Catch 22", true},
+		{"11/22/63", "11-22-63", true},
+		// A multi-file audiobook's "Part N" counts files, not books, so it
+		// cannot veto a series position spelled another way. Two Part
+		// markers are still two halves of a split edition.
+		{"Rhythm of War (The Stormlight Archive, Book 4)", "Rhythm of War Part 1", true},
+		{"Rhythm of War (The Stormlight Archive #4)", "Rhythm of War Pt. 2 of 3", true},
+		{"The Way of Kings, Part 1", "The Way of Kings, Part 2", false},
 	}
 
 	for _, tt := range tests {
@@ -92,24 +106,6 @@ func TestTitleMatch(t *testing.T) {
 		}
 	}
 }
-
-// fakeCalibreAdder is a stub calibreAdder recording every Add invocation.
-// Tests check both the call path and the book-id persistence so a broken
-// wiring change surfaces here rather than in a live import.
-type fakeCalibreAdder struct {
-	calls  []string
-	metas  []calibre.Metadata
-	nextID int64
-	err    error
-}
-
-func (f *fakeCalibreAdder) Add(_ context.Context, path string, meta calibre.Metadata) (int64, error) {
-	f.calls = append(f.calls, path)
-	f.metas = append(f.metas, meta)
-	return f.nextID, f.err
-}
-
-func modeFn(m calibre.Mode) func() calibre.Mode { return func() calibre.Mode { return m } }
 
 func importScannerFixture(t *testing.T) (*Scanner, *db.BookRepo, *models.Book, *models.Author, context.Context) {
 	t.Helper()
@@ -142,228 +138,6 @@ func importScannerFixture(t *testing.T) (*Scanner, *db.BookRepo, *models.Book, *
 		t.TempDir(), "", "", "", "",
 	)
 	return s, bookRepo, b, a, ctx
-}
-
-// TestPushToCalibre_ModeOff: regression guard for "integration off" —
-// mode=off must mean zero client calls and no calibre_id mutation.
-func TestPushToCalibre_ModeOff(t *testing.T) {
-	s, bookRepo, book, author, ctx := importScannerFixture(t)
-	fc := &fakeCalibreAdder{nextID: 99}
-	s.WithCalibre(modeFn(calibre.ModeOff), fc)
-
-	s.pushToCalibre(ctx, book, author, nil, "", "", "/library/book.epub")
-
-	if len(fc.calls) != 0 {
-		t.Errorf("Add must not be called when mode=off, got %v", fc.calls)
-	}
-	got, _ := bookRepo.GetByID(ctx, book.ID)
-	if got.CalibreID != nil {
-		t.Errorf("calibre_id must stay nil when mode=off, got %v", got.CalibreID)
-	}
-}
-
-func TestPushToCalibre_ModeCalibredbHappyPath(t *testing.T) {
-	s, bookRepo, book, author, ctx := importScannerFixture(t)
-	fc := &fakeCalibreAdder{nextID: 1234}
-	s.WithCalibre(modeFn(calibre.ModeCalibredb), fc)
-
-	s.pushToCalibre(ctx, book, author, nil, "", "", "/library/book.epub")
-
-	if len(fc.calls) != 1 || fc.calls[0] != "/library/book.epub" {
-		t.Errorf("Add calls = %v", fc.calls)
-	}
-	if len(fc.metas) != 1 || fc.metas[0].Title != "Title T" || len(fc.metas[0].Authors) != 1 || fc.metas[0].Authors[0] != "Author A" {
-		t.Errorf("metadata = %+v, want book title and author", fc.metas)
-	}
-	got, _ := bookRepo.GetByID(ctx, book.ID)
-	if got.CalibreID == nil || *got.CalibreID != 1234 {
-		t.Errorf("calibre_id = %v, want 1234", got.CalibreID)
-	}
-}
-
-// TestPushToCalibre_CalibredbFailDoesNotPoison: a failed calibredb call
-// must leave calibre_id at nil (best-effort mirror semantics).
-func TestPushToCalibre_CalibredbFailDoesNotPoison(t *testing.T) {
-	s, bookRepo, book, author, ctx := importScannerFixture(t)
-	fc := &fakeCalibreAdder{err: errors.New("exec: calibredb: not found")}
-	s.WithCalibre(modeFn(calibre.ModeCalibredb), fc)
-
-	s.pushToCalibre(ctx, book, author, nil, "", "", "/library/book.epub")
-
-	got, _ := bookRepo.GetByID(ctx, book.ID)
-	if got.CalibreID != nil {
-		t.Errorf("calibre_id must remain nil on add failure, got %v", got.CalibreID)
-	}
-}
-
-// TestPushToCalibre_ErrDisabledSilent — the adder may return ErrDisabled
-// when the client's own config is off; we treat it the same as mode=off.
-func TestPushToCalibre_ErrDisabledSilent(t *testing.T) {
-	s, bookRepo, book, author, ctx := importScannerFixture(t)
-	fc := &fakeCalibreAdder{err: calibre.ErrDisabled}
-	s.WithCalibre(modeFn(calibre.ModeCalibredb), fc)
-
-	s.pushToCalibre(ctx, book, author, nil, "", "", "/library/book.epub")
-
-	got, _ := bookRepo.GetByID(ctx, book.ID)
-	if got.CalibreID != nil {
-		t.Errorf("calibre_id must stay nil on ErrDisabled, got %v", got.CalibreID)
-	}
-}
-
-// TestPushToCalibre_ModePluginHappyPath: mode=plugin routes through the
-// plugin HTTP client. A fake server returning {"id":5678} must produce a
-// persisted calibre_id of 5678.
-func TestPushToCalibre_ModePluginHappyPath(t *testing.T) {
-	s, bookRepo, book, author, ctx := importScannerFixture(t)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"id":5678,"duplicate":false}`))
-	}))
-	defer srv.Close()
-
-	client := calibre.NewPluginClient(srv.URL, "test-key")
-	s.WithCalibre(modeFn(calibre.ModePlugin), client)
-
-	s.pushToCalibre(ctx, book, author, nil, "", "", "/library/book.epub")
-
-	got, _ := bookRepo.GetByID(ctx, book.ID)
-	if got.CalibreID == nil || *got.CalibreID != 5678 {
-		t.Errorf("calibre_id = %v, want 5678", got.CalibreID)
-	}
-}
-
-// TestPushToCalibre_NilResolver covers the default path — a scanner built
-// without WithCalibre() (i.e. calibre not configured at all) must not
-// panic on a nil interface dereference.
-func TestPushToCalibre_NilResolver(t *testing.T) {
-	s, _, book, author, ctx := importScannerFixture(t)
-	// No WithCalibre call.
-	s.pushToCalibre(ctx, book, author, nil, "", "", "/library/book.epub") // must not panic
-}
-
-func TestCalibreMetadata_PrefersEditionFieldsAndMapsSeries(t *testing.T) {
-	ctx := context.Background()
-	published := time.Date(2020, 3, 4, 0, 0, 0, 0, time.UTC)
-	release := time.Date(2019, 1, 1, 0, 0, 0, 0, time.UTC)
-	asin := "B000FC1BN8"
-	book := &models.Book{
-		ID:               42,
-		ForeignID:        "OL123W",
-		Title:            "Dune",
-		Description:      "Desert planet.",
-		ReleaseDate:      &release,
-		Genres:           []string{"Science Fiction", "Classics"},
-		AverageRating:    4.6,
-		Language:         "eng",
-		ASIN:             "BOOKASIN",
-		MetadataProvider: "openlibrary",
-	}
-	author := &models.Author{Name: "Frank Herbert", SortName: "Herbert, Frank"}
-	edition := &models.Edition{
-		ForeignID:   "OL999M",
-		ISBN13:      strPtr("9780441172719"),
-		ASIN:        &asin,
-		Publisher:   "Ace",
-		PublishDate: &published,
-		Language:    "ger",
-		ImageURL:    "",
-	}
-
-	s := NewScanner(nil, nil, nil, nil, nil, t.TempDir(), "", "", "", "")
-	meta := s.calibreMetadata(ctx, book, author, edition, "Dune Chronicles", "1", calibre.ModeCalibredb)
-
-	if meta.Title != "Dune" || len(meta.Authors) != 1 || meta.Authors[0] != "Frank Herbert" {
-		t.Fatalf("basic metadata = %+v", meta)
-	}
-	if meta.AuthorSort != "Herbert, Frank" || meta.Description != "Desert planet." {
-		t.Fatalf("author/description metadata = %+v", meta)
-	}
-	if meta.Language != "de" {
-		t.Fatalf("Language = %q, want de from edition language", meta.Language)
-	}
-	if meta.PublishedDate != "2020-03-04" {
-		t.Fatalf("PublishedDate = %q, want edition date", meta.PublishedDate)
-	}
-	if meta.Publisher != "Ace" || meta.Series != "Dune Chronicles" || meta.SeriesIndex != "1" {
-		t.Fatalf("publisher/series metadata = %+v", meta)
-	}
-	if meta.Identifiers["isbn"] != "9780441172719" {
-		t.Fatalf("isbn identifier = %q", meta.Identifiers["isbn"])
-	}
-	if meta.Identifiers["asin"] != "B000FC1BN8" {
-		t.Fatalf("asin identifier = %q, want edition ASIN", meta.Identifiers["asin"])
-	}
-	if meta.Identifiers["bindery"] != "42" || meta.Identifiers["openlibrary"] != "OL123W" {
-		t.Fatalf("provider identifiers = %+v", meta.Identifiers)
-	}
-	if meta.Identifiers["openlibrary_edition"] != "OL999M" {
-		t.Fatalf("openlibrary edition identifier = %q, want OL999M", meta.Identifiers["openlibrary_edition"])
-	}
-}
-
-func TestCalibreMetadata_NormalizesPresentProviderIdentifiers(t *testing.T) {
-	ctx := context.Background()
-	tests := []struct {
-		name      string
-		provider  string
-		foreignID string
-		wantType  string
-		wantValue string
-	}{
-		{"openlibrary", "openlibrary", "/works/OL123W", "openlibrary", "OL123W"},
-		{"hardcover", "hardcover", "hc:dune", "hardcover", "dune"},
-		{"googlebooks", "googlebooks", "gb:zyTCAlFPjgYC", "google", "zyTCAlFPjgYC"},
-		{"dnb", "dnb", "dnb:123456789", "dnb", "123456789"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			book := &models.Book{
-				ID:               42,
-				ForeignID:        tt.foreignID,
-				Title:            "Dune",
-				MetadataProvider: tt.provider,
-			}
-			s := NewScanner(nil, nil, nil, nil, nil, t.TempDir(), "", "", "", "")
-			meta := s.calibreMetadata(ctx, book, nil, nil, "", "", calibre.ModePlugin)
-			if meta.Identifiers[tt.wantType] != tt.wantValue {
-				t.Fatalf("identifier %q = %q, want %q in %+v", tt.wantType, meta.Identifiers[tt.wantType], tt.wantValue, meta.Identifiers)
-			}
-			if meta.Identifiers["bindery"] != "42" {
-				t.Fatalf("bindery identifier = %q, want 42", meta.Identifiers["bindery"])
-			}
-		})
-	}
-}
-
-func TestCalibreMetadata_CoverPathOnlyForCalibredb(t *testing.T) {
-	ctx := context.Background()
-	cacheDir := t.TempDir()
-	imageURL := "https://93.184.216.34/cover.jpg"
-	sum := sha256.Sum256([]byte(imageURL))
-	coverPath := filepath.Join(cacheDir, fmt.Sprintf("%x.jpg", sum))
-	if err := os.WriteFile(coverPath, []byte("cached cover"), 0o640); err != nil {
-		t.Fatal(err)
-	}
-
-	book := &models.Book{
-		ID:       42,
-		Title:    "Dune",
-		ImageURL: imageURL,
-		Genres:   []string{},
-	}
-	s := NewScanner(nil, nil, nil, nil, nil, t.TempDir(), "", "", "", "").WithCalibreCoverCache(cacheDir)
-
-	calibredbMeta := s.calibreMetadata(ctx, book, nil, nil, "", "", calibre.ModeCalibredb)
-	if calibredbMeta.CoverPath != coverPath {
-		t.Fatalf("calibredb CoverPath = %q, want %q", calibredbMeta.CoverPath, coverPath)
-	}
-
-	pluginMeta := s.calibreMetadata(ctx, book, nil, nil, "", "", calibre.ModePlugin)
-	if pluginMeta.CoverPath != "" {
-		t.Fatalf("plugin CoverPath = %q, want empty", pluginMeta.CoverPath)
-	}
 }
 
 func TestResolveCalibreEdition_PrefersDownloadThenSelected(t *testing.T) {
@@ -465,6 +239,99 @@ func TestImportInternal_ThreeFileBundle_TracksAllInBookFiles(t *testing.T) {
 	}
 	if len(files) != 3 {
 		t.Errorf("want 3 book_files rows for epub+mobi+pdf bundle, got %d", len(files))
+	}
+}
+
+// TestImportInternal_OPFSidecarSeesBackfilledLanguage regression-tests the
+// ordering fix: the OPF sidecar is written after applyEmbeddedLanguage's
+// #1160 backfill, not before it, so a first-time import of a book with no
+// catalogue language produces a sidecar that already carries the language
+// read from the EPUB rather than a blank dc:language moments before the DB
+// catches up.
+func TestImportInternal_OPFSidecarSeesBackfilledLanguage(t *testing.T) {
+	dlDir := t.TempDir()
+
+	opf := `<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Cien Años de Soledad</dc:title>
+    <dc:creator opf:role="aut">Gabriel García Márquez</dc:creator>
+    <dc:language>es</dc:language>
+  </metadata>
+</package>`
+	epubSrc := writeTestEpub(t, "OEBPS/content.opf", opf)
+	epubBytes, err := os.ReadFile(epubSrc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dlDir, "book.epub"), epubBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	libDir := t.TempDir()
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	ctx := context.Background()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	dlRepo := db.NewDownloadRepo(database)
+	clientRepo := db.NewDownloadClientRepo(database)
+	settingsRepo := db.NewSettingsRepo(database)
+	if err := settingsRepo.Set(ctx, "import.write_opf_sidecar", "true"); err != nil {
+		t.Fatal(err)
+	}
+
+	author := &models.Author{ForeignID: "OLA-LANG", Name: "Author", SortName: "Author", Monitored: true, MetadataProvider: "openlibrary"}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	book := &models.Book{
+		ForeignID: "OLB-LANG", AuthorID: author.ID, Title: "Cien Años de Soledad",
+		SortTitle: "Cien Años de Soledad", Status: models.BookStatusWanted,
+		Monitored: true, AnyEditionOK: true, MetadataProvider: "openlibrary",
+		Language: "", // no catalogue language — triggers the #1160 backfill path
+	}
+	if err := bookRepo.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+
+	dl := &models.Download{
+		GUID: "lang-guid", Title: "Cien Años de Soledad", BookID: &book.ID,
+		Status: models.StateCompleted,
+	}
+	if err := dlRepo.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewScanner(dlRepo, clientRepo, bookRepo, authorRepo, db.NewHistoryRepo(database), libDir, "", "", "", "").WithSettings(settingsRepo)
+	s.tryImportInternal(ctx, dl, dlDir, "", "", "", nil, nil)
+
+	updated, err := bookRepo.GetByID(ctx, book.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if updated.Language != "spa" {
+		t.Fatalf("book language after import = %q, want backfilled %q", updated.Language, "spa")
+	}
+
+	bookFiles, err := bookRepo.ListFiles(ctx, book.ID)
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(bookFiles) != 1 {
+		t.Fatalf("want 1 book_files row, got %d", len(bookFiles))
+	}
+	sidecarPath := filepath.Join(filepath.Dir(bookFiles[0].Path), "metadata.opf")
+	sidecar, err := os.ReadFile(sidecarPath)
+	if err != nil {
+		t.Fatalf("reading metadata.opf: %v", err)
+	}
+	if !strings.Contains(string(sidecar), "<dc:language>es</dc:language>") {
+		t.Errorf("metadata.opf missing backfilled language (want normalized <dc:language>es</dc:language>), got:\n%s", sidecar)
 	}
 }
 

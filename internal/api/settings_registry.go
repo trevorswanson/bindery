@@ -135,6 +135,11 @@ var settingDescriptors = []SettingDescriptor{
 		State:       SettingStateActive,
 	},
 	{
+		Key: SettingRequestsMaxPendingPerUser, Type: SettingTypeInt, Default: "25", Min: "1", Max: "10000",
+		Description: "How many requests one requester may have waiting for an admin's decision. Further requests answer 429 until some are decided.",
+		State:       SettingStateActive,
+	},
+	{
 		Key: SettingDefaultLibraryRootFolderID, Type: SettingTypeInt, Default: "", Min: "1",
 		Description: "root_folder.id used as the library path for authors with no root folder of their own. Empty falls back to BINDERY_LIBRARY_DIR.",
 		State:       SettingStateActive,
@@ -164,6 +169,11 @@ var settingDescriptors = []SettingDescriptor{
 		Description:     "How often Hardcover import lists are synced.",
 		RestartRequired: true,
 		State:           SettingStateActive,
+	},
+	{
+		Key: SettingAuthorDiscoveryInterval, Type: SettingTypeDuration, Default: "off", Min: "24h", Max: "720h",
+		Description: "How often each monitored author's catalogue is checked for new books. Unset and \"off\" both mean no scheduled discovery; store a duration to turn it on.",
+		State:       SettingStateActive,
 	},
 	{
 		Key: "stall.timeout_minutes", Type: SettingTypeInt, Default: "120", Min: "1",
@@ -236,6 +246,11 @@ var settingDescriptors = []SettingDescriptor{
 		State:       SettingStateActive,
 	},
 	{
+		Key: SettingImportWriteOPFSidecar, Type: SettingTypeBool, Default: "false",
+		Description: "Write a Calibre style metadata.opf next to each imported book (and refresh it on Reorganize), carrying Bindery's own canonical metadata regardless of what the source file's embedded tags say.",
+		State:       SettingStateActive,
+	},
+	{
 		Key: "naming.bookTemplate", Type: SettingTypeString, Default: "",
 		Description: "Path template for imported ebooks. Empty uses the built in default.",
 		State:       SettingStateActive,
@@ -257,7 +272,7 @@ var settingDescriptors = []SettingDescriptor{
 	},
 	{
 		Key: SettingCWAIngestPath, Type: SettingTypeString, Default: "",
-		Description: "Calibre Web Automated ingest directory that every successful import is mirrored into. Empty disables the mirror.",
+		Description: "Calibre Web Automated ingest directory that every successful ebook import is copied into. Audiobooks are not mirrored. Empty disables the mirror.",
 		State:       SettingStateActive,
 	},
 
@@ -291,6 +306,12 @@ var settingDescriptors = []SettingDescriptor{
 	{
 		Key: SettingCalibrePluginAPIKey, Type: SettingTypeString, Default: "",
 		Description: "API key the Calibre plugin expects. Stored but never read back over the settings API.",
+		State:       SettingStateActive,
+	},
+	{
+		Key: SettingCalibrePluginTransport, Type: SettingTypeEnum, Default: "push",
+		Values:      []string{"push", "pull"},
+		Description: "In plugin mode, which side connects: push has Bindery send books to the plugin, pull has the plugin fetch them from Bindery's /bridge/v1 routes using the plugin API key.",
 		State:       SettingStateActive,
 	},
 	{

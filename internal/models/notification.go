@@ -12,13 +12,21 @@ type Notification struct {
 	// Topic, when set, makes the webhook POST to the server root with a "topic"
 	// field instead of POSTing to URL directly. This is what ntfy needs to render
 	// a JSON payload natively instead of printing it verbatim (#1323).
-	Topic     string    `json:"topic"`
-	OnGrab    bool      `json:"onGrab"`
-	OnImport  bool      `json:"onImport"`
-	OnUpgrade bool      `json:"onUpgrade"`
-	OnFailure bool      `json:"onFailure"`
-	OnHealth  bool      `json:"onHealth"`
-	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	Topic     string `json:"topic"`
+	OnGrab    bool   `json:"onGrab"`
+	OnImport  bool   `json:"onImport"`
+	OnUpgrade bool   `json:"onUpgrade"`
+	OnFailure bool   `json:"onFailure"`
+	OnHealth  bool   `json:"onHealth"`
+	// OnBookAnnounced fires when a refresh or scheduled discovery run adds
+	// books to an author whose catalogue was already populated (#2236). Off
+	// by default, like OnUpgrade and OnHealth.
+	OnBookAnnounced bool      `json:"onBookAnnounced"`
+	Enabled         bool      `json:"enabled"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
+
+	// OnRequestCreated fires when a requester asks for a book or an author
+	// (migration 089). Off by default, like OnHealth.
+	OnRequestCreated bool `json:"onRequestCreated"`
 }

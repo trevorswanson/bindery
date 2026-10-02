@@ -17,6 +17,7 @@ import (
 	"github.com/vavallee/bindery/internal/calibre"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/httpsec"
+	"github.com/vavallee/bindery/internal/importer"
 	"github.com/vavallee/bindery/internal/metadata/hardcover"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/pathmap"
@@ -131,6 +132,15 @@ const (
 	// never-arriving second format would wedge the first forever. The importer
 	// reads this key as a string literal; keep the literal in sync.
 	SettingImportDropPairGatingTimeoutHours = "import.drop_pair_gating_timeout_hours"
+	// SettingImportWriteOPFSidecar opts imports (and Reorganize moves) into
+	// writing a Calibre-style metadata.opf sidecar next to each book, using
+	// Bindery's own canonical DB metadata rather than whatever the source
+	// file happened to carry. "true" enables it; unset/"false" (default)
+	// keeps the prior behaviour — Bindery only ever renames files, it never
+	// writes a new one into the library. The importer reads this key as a
+	// string literal to avoid an import cycle; keep the literal in sync with
+	// this constant.
+	SettingImportWriteOPFSidecar = "import.write_opf_sidecar"
 )
 
 // SettingLibraryLastScan is the KV key holding the JSON summary of the most
@@ -153,6 +163,14 @@ const SettingSearchInterval = "search.interval"
 // unset falls back to the scheduler's defaultHardcoverSyncInterval (24h, the
 // literal the job used before the setting existed). Takes effect on restart.
 const SettingHardcoverSyncInterval = "hardcover.sync_interval"
+
+// SettingAuthorDiscoveryInterval is the KV key for how often each monitored
+// author's catalogue is checked for new books by the scheduled discovery job
+// (#2236). Value is "off" or a Go duration string bounded to [24h, 720h].
+// Empty or unset means off, like the literal "off": discovery creates library
+// rows on its own, so it runs only once someone stores an interval. Read on
+// every hourly tick, so a change applies without a restart.
+const SettingAuthorDiscoveryInterval = "authors.discovery.interval"
 
 // SettingImportAudiobookFlattenMultiDisc (#886) is "true" to flatten multi-disc
 // audiobook downloads into a single "Part 001.ext", … sequence on import, or
@@ -327,10 +345,10 @@ func isAdminOnlySetting(key string) bool {
 	// disclosure in a different shape and are included rather than left for
 	// the next audit to find.
 	//
-	// SettingLibraryLastScan is closed here only as far as this endpoint
-	// reaches: GET /api/v1/library/scan/status serves the same blob and is
-	// not admin gated. That is a separate endpoint with its own callers, so
-	// it is reported on #2361 rather than changed here.
+	// SettingLibraryLastScan has a second door: GET
+	// /api/v1/library/scan/status serves the same blob verbatim. That route is
+	// mounted behind auth.RequireAdmin by registerLibraryScanStatusRoute in
+	// cmd/bindery (#2361), so both ways to the value are admin only.
 	switch key {
 	case SettingCalibreLibraryPath,
 		SettingCalibreBinaryPath,
@@ -652,11 +670,14 @@ func validateSettingValue(key, value string) error {
 	case SettingNamingAudiobookFileTemplate:
 		// Empty disables per-file audiobook renaming (#1126). A non-empty
 		// template MUST carry a {Part} token, otherwise every track flattens to
-		// the same filename and all but the last are dropped.
+		// the same filename and all but the last are dropped. The token may
+		// sit in a conditional group ("{Title}{ - Pt. Part:3}.{ext}"), which a
+		// single-file audiobook drops entirely (#2900), so this asks the
+		// renderer rather than looking for the substring "{Part".
 		if value == "" {
 			return nil
 		}
-		if !strings.Contains(value, "{Part") {
+		if !importer.AudiobookTemplateHasPart(value) {
 			return fmt.Errorf("naming.audiobook_file_template must include a {Part} token so each track gets a unique name")
 		}
 	case SettingImportDropLinkMode:
@@ -673,6 +694,13 @@ func validateSettingValue(key, value string) error {
 			return nil
 		}
 		return fmt.Errorf("import.drop_pair_gating %q is not one of: true, false", value)
+	case SettingImportWriteOPFSidecar:
+		// Boolean flag; empty or "false" = off (default). Only accept the two
+		// canonical values so a typo can't be silently misread as truthy.
+		if value == "" || value == "true" || value == "false" {
+			return nil
+		}
+		return fmt.Errorf("import.write_opf_sidecar %q is not one of: true, false", value)
 	case SettingImportDropPairGatingTimeoutHours:
 		// Empty falls back to the 72h default; a non-empty value must be a
 		// positive integer number of hours so a typo fails loudly here rather
@@ -707,6 +735,15 @@ func validateSettingValue(key, value string) error {
 		}
 		if !calibre.Mode(value).Valid() {
 			return fmt.Errorf("calibre.mode %q is not one of: off, calibredb, plugin", value)
+		}
+	case SettingCalibrePluginTransport:
+		// Empty reads as push. Anything else must be canonical, so a typo
+		// cannot quietly leave both the push worker and the bridge idle.
+		if value == "" {
+			return nil
+		}
+		if !calibre.Transport(value).Valid() {
+			return fmt.Errorf("calibre.plugin_transport %q is not one of: push, pull", value)
 		}
 	case SettingDefaultMediaType:
 		// Empty falls back to ebook at read time; only validate non-empty
@@ -744,6 +781,14 @@ func validateSettingValue(key, value string) error {
 		n, err := strconv.Atoi(value)
 		if err != nil || n <= 0 {
 			return fmt.Errorf("author.default_monitor_latest_count %q must be a positive integer", value)
+		}
+	case SettingRequestsMaxPendingPerUser:
+		if value == "" {
+			return nil
+		}
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 || n > 10000 {
+			return fmt.Errorf("requests.max_pending_per_user %q must be an integer from 1 to 10000", value)
 		}
 	case SettingDefaultLibraryRootFolderID:
 		// Empty = unset (fall back to env-var default); non-empty must be a
@@ -838,6 +883,23 @@ func validateSettingValue(key, value string) error {
 		}
 		if d > 168*time.Hour {
 			return fmt.Errorf("hardcover.sync_interval %q exceeds the maximum of 168h (7 days)", value)
+		}
+	case SettingAuthorDiscoveryInterval:
+		// Empty = unset, which means off, as does "off" itself. Below a day
+		// every author would be re-checked faster than a provider's cache
+		// turns over, above 30 days it stops being a cadence.
+		if value == "" || value == "off" {
+			return nil
+		}
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("authors.discovery.interval %q is not off or a valid duration (e.g. 24h, 168h, 720h)", value)
+		}
+		if d < 24*time.Hour {
+			return fmt.Errorf("authors.discovery.interval %q is too short, the minimum is 24h", value)
+		}
+		if d > 720*time.Hour {
+			return fmt.Errorf("authors.discovery.interval %q exceeds the maximum of 720h (30 days)", value)
 		}
 	}
 	return nil

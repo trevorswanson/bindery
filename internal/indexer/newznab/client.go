@@ -192,6 +192,23 @@ func SignDownloadURLFor(rawURL, indexerURL, apiKey string) string {
 	return signDownloadURL(rawURL, baseHost, apiKey)
 }
 
+// HasAPIKey reports whether a download URL already carries an apikey.
+//
+// It exists so callers can tell "this URL is already signed" apart from "this
+// URL could not be signed": signDownloadURL returns its input unchanged for
+// both, and a caller that treats the second as the first ships an unsigned URL
+// the indexer answers with 401 (#2505).
+func HasAPIKey(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return u.Query().Get("apikey") != ""
+}
+
 // RedactDownloadURL removes the apikey query parameter from a download URL so it
 // can be returned to API clients without leaking the indexer credential. The
 // grab handler restores it server-side via SignDownloadURLFor before dialing the
@@ -625,14 +642,39 @@ func authorSurname(author string) string {
 //
 // Single-sig-word titles (e.g. "Dune") remain inherently ambiguous: there is
 // no second word to disambiguate a coincidental canned-feed match.
+// titleHasRelevantResult is the query-side gate: it decides whether an
+// indexer's response is worth keeping at all, before the cascade advances.
+// See wordsPresentInAll for the empty-word-list contract.
 func titleHasRelevantResult(queryTitle string, results []SearchResult) bool {
-	words := SigWords(queryTitle)
-	if len(words) == 0 {
-		return true // query has no checkable words; assume results are valid
-	}
 	combined := make([]string, len(results))
 	for i, r := range results {
 		combined[i] = foldForSigWordMatch(r.Title + " " + r.BookTitle)
+	}
+	if wordsPresentInAll(SigWords(queryTitle), combined) {
+		return true
+	}
+	// Elision fallback, the same second pass as the indexer filters. An elided
+	// title folds to the single token "loutsider", which foldForSigWordMatch
+	// never produces from "L.Outsider.2018": note that this fold deliberately
+	// does NOT split on punctuation, so the release's separators survive and
+	// the token is absent. The whole response was judged irrelevant on that
+	// basis and discarded before any result could reach filterRelevant.
+	//
+	// Gated on a non-empty word list: SigWordsElided returns nil for a title
+	// with no apostrophe, and an empty list means "nothing checkable" (true)
+	// upstream — letting it through here would accept junk for every title.
+	if elided := SigWordsElided(queryTitle); len(elided) > 0 {
+		return wordsPresentInAll(elided, combined)
+	}
+	return false
+}
+
+// wordsPresentInAll reports whether every word appears in at least one of the
+// haystacks. An empty word list carries no evidence either way and is treated
+// as satisfied, matching titleHasRelevantResult's original contract.
+func wordsPresentInAll(words, combined []string) bool {
+	if len(words) == 0 {
+		return true
 	}
 	for _, w := range words {
 		found := false
@@ -882,7 +924,15 @@ func (c *Client) fetchXML(ctx context.Context, rawURL string) ([]byte, error) {
 		if len(snippet) > 512 {
 			snippet = snippet[:512]
 		}
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet)
+		// Typed rather than fmt.Errorf so a rate limit applied at the HTTP
+		// layer (Cloudflare 429, error code 1015) reaches IsRateLimitError
+		// and the searcher's cooldown the same way a Newznab <error
+		// code="500"> does (#2635).
+		return nil, &HTTPStatusError{
+			Status:     resp.StatusCode,
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+			Snippet:    snippet,
+		}
 	}
 
 	return body, nil

@@ -31,6 +31,12 @@ type mockIndexerSearcher struct {
 	// read back is whichever leg happened to finish last.
 	mu       sync.Mutex
 	lastCrit indexer.MatchCriteria
+	// critByMedia keeps each leg's criteria for a dual-format book, keyed by
+	// the MediaType the leg was called with.
+	critByMedia map[string]indexer.MatchCriteria
+
+	cooldownUntil  time.Time
+	cooldownReason string
 }
 
 // criteria returns the criteria from the most recent call, safe to read after
@@ -41,9 +47,28 @@ func (m *mockIndexerSearcher) criteria() indexer.MatchCriteria {
 	return m.lastCrit
 }
 
+// cooldown, when set, is what Cooldown reports for every indexer.
+func (m *mockIndexerSearcher) Cooldown(models.Indexer) (time.Time, string, bool) {
+	if m.cooldownUntil.IsZero() {
+		return time.Time{}, "", false
+	}
+	return m.cooldownUntil, m.cooldownReason, true
+}
+
+// criteriaFor returns the criteria the leg for mediaType was called with.
+func (m *mockIndexerSearcher) criteriaFor(mediaType string) indexer.MatchCriteria {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.critByMedia[mediaType]
+}
+
 func (m *mockIndexerSearcher) SearchBookWithDebug(_ context.Context, _ []models.Indexer, c indexer.MatchCriteria) ([]newznab.SearchResult, *indexer.SearchDebug) {
 	m.mu.Lock()
 	m.lastCrit = c
+	if m.critByMedia == nil {
+		m.critByMedia = map[string]indexer.MatchCriteria{}
+	}
+	m.critByMedia[c.MediaType] = c
 	m.mu.Unlock()
 	switch c.MediaType {
 	case models.MediaTypeEbook:
@@ -514,6 +539,10 @@ func (s *slowSearcher) SearchBookWithDebug(_ context.Context, _ []models.Indexer
 	}
 }
 
+func (s *slowSearcher) Cooldown(models.Indexer) (time.Time, string, bool) {
+	return time.Time{}, "", false
+}
+
 func (s *slowSearcher) SearchQuery(_ context.Context, _ []models.Indexer, _ string) []newznab.SearchResult {
 	return nil
 }
@@ -602,6 +631,10 @@ func (debugSearcher) SearchBookWithDebug(_ context.Context, _ []models.Indexer, 
 			Categories:  cats,
 		}},
 	}
+}
+
+func (debugSearcher) Cooldown(models.Indexer) (time.Time, string, bool) {
+	return time.Time{}, "", false
 }
 
 func (debugSearcher) SearchQuery(_ context.Context, _ []models.Indexer, _ string) []newznab.SearchResult {
@@ -1219,5 +1252,172 @@ func TestIndexerDailyQueryUsage_SurvivesASave(t *testing.T) {
 	}
 	if updated.DailyQueriesUsed == nil || *updated.DailyQueriesUsed != 950 {
 		t.Errorf("update response DailyQueriesUsed = %v, want 950", updated.DailyQueriesUsed)
+	}
+}
+
+// TestIndexerList_ReportsCooldown: an indexer the searcher is holding off on
+// says so in the list, so the Indexers tab can show when searches resume
+// without anyone opening a search's details panel.
+func TestIndexerList_ReportsCooldown(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	until := time.Now().Add(3 * time.Hour).UTC().Truncate(time.Second)
+	mock := &mockIndexerSearcher{cooldownUntil: until, cooldownReason: "HTTP 429: error code: 1015"}
+	h := NewIndexerHandler(db.NewIndexerRepo(database), db.NewBookRepo(database), db.NewAuthorRepo(database),
+		db.NewMetadataProfileRepo(database), mock, db.NewSettingsRepo(database), db.NewBlocklistRepo(database))
+
+	idx := &models.Indexer{Name: "NZB.life", URL: "https://nzb.life", Type: "newznab", Enabled: true}
+	if err := db.NewIndexerRepo(database).Create(context.Background(), idx); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.List(rec, httptest.NewRequest(http.MethodGet, "/indexer", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var out []models.Indexer
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || out[0].CooldownUntil == nil || out[0].CooldownReason == nil {
+		t.Fatalf("cooldown missing from the list: %+v", out)
+	}
+	if !out[0].CooldownUntil.Equal(until) || *out[0].CooldownReason != "HTTP 429: error code: 1015" {
+		t.Errorf("cooldown = %s %q, want %s", out[0].CooldownUntil, *out[0].CooldownReason, until)
+	}
+}
+
+// TestSearchBook_SearchesTheLocalizedHalfOfABilingualTitle: interactive search
+// builds its criteria the same way auto-grab does, so a book stored as
+// "localized / original" is searched under the half a release is named with
+// (#211, #2391).
+func TestSearchBook_SearchesTheLocalizedHalfOfABilingualTitle(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	ctx := context.Background()
+
+	authorRepo := db.NewAuthorRepo(database)
+	author := &models.Author{
+		ForeignID: "OL1A", Name: "Brandon Sanderson", SortName: "Sanderson, Brandon",
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	bookRepo := db.NewBookRepo(database)
+	book := &models.Book{
+		Title: "El imperio final / The Final Empire", Language: "spa",
+		ForeignID: "OL1M", AuthorID: author.ID, MediaType: models.MediaTypeEbook, Monitored: true,
+	}
+	if err := bookRepo.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+
+	mock := &mockIndexerSearcher{}
+	h := NewIndexerHandler(db.NewIndexerRepo(database), bookRepo, authorRepo,
+		db.NewMetadataProfileRepo(database), mock, db.NewSettingsRepo(database), db.NewBlocklistRepo(database))
+
+	rec := httptest.NewRecorder()
+	req := withURLParam(httptest.NewRequest(http.MethodGet, "/indexer/book/1/search", nil),
+		"id", strconv.FormatInt(book.ID, 10))
+	h.SearchBook(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got, want := mock.criteria().Title, "El imperio final"; got != want {
+		t.Errorf("search title = %q, want %q", got, want)
+	}
+}
+
+// profiledSearchFixture builds a handler whose author carries a quality
+// profile, for asserting what SearchBook hands the searcher (#2733).
+func profiledSearchFixture(t *testing.T, mediaType string) (*IndexerHandler, *mockIndexerSearcher, *models.Book, *models.QualityProfile) {
+	t.Helper()
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	ctx := context.Background()
+	qualityRepo := db.NewQualityProfileRepo(database)
+	profile := &models.QualityProfile{Name: "pdf first", Items: []models.QualityItem{
+		{Quality: "pdf", Allowed: true},
+		{Quality: "epub", Allowed: true},
+		{Quality: "mp3", Allowed: true},
+	}}
+	if err := qualityRepo.Create(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	authorRepo := db.NewAuthorRepo(database)
+	author := &models.Author{
+		ForeignID: "OL-QP-A", Name: "Jane Doe", SortName: "Doe, Jane",
+		MetadataProvider: "openlibrary", Monitored: true, QualityProfileID: &profile.ID,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	bookRepo := db.NewBookRepo(database)
+	book := &models.Book{
+		Title: "Test Book", ForeignID: "OL-QP-M", AuthorID: author.ID,
+		MediaType: mediaType, Monitored: true,
+	}
+	if err := bookRepo.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+	mock := &mockIndexerSearcher{
+		ebookResults: []newznab.SearchResult{{GUID: "eb1", Title: "Jane Doe - Test Book.epub"}},
+		audioResults: []newznab.SearchResult{{GUID: "au1", Title: "Jane Doe - Test Book.mp3"}},
+	}
+	h := NewIndexerHandler(
+		db.NewIndexerRepo(database), bookRepo, authorRepo,
+		db.NewMetadataProfileRepo(database), mock,
+		db.NewSettingsRepo(database), db.NewBlocklistRepo(database),
+	).WithQualityProfiles(qualityRepo)
+	return h, mock, book, profile
+}
+
+func searchBookOK(t *testing.T, h *IndexerHandler, bookID int64) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.SearchBook(rec, withURLParam(
+		httptest.NewRequest(http.MethodGet, "/indexer/book/1/search", nil),
+		"id", strconv.FormatInt(bookID, 10),
+	))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSearchBook_PassesQualityProfileToSearcher: the searcher ranks by the
+// profile on MatchCriteria, so the handler must put the author's profile
+// there. Without it the book page ranks by QualityRank while the sweep ranks
+// by the profile, and the two disagree about the best release.
+func TestSearchBook_PassesQualityProfileToSearcher(t *testing.T) {
+	h, mock, book, profile := profiledSearchFixture(t, models.MediaTypeEbook)
+	searchBookOK(t, h, book.ID)
+	got := mock.criteria().Profile
+	if got == nil || got.ID != profile.ID {
+		t.Fatalf("MatchCriteria.Profile = %v, want the author's profile %d", got, profile.ID)
+	}
+}
+
+// TestSearchBook_PassesQualityProfileToBothLegs: a dual-format book runs one
+// leg per media type and each copies the criteria, so both must carry it.
+func TestSearchBook_PassesQualityProfileToBothLegs(t *testing.T) {
+	h, mock, book, profile := profiledSearchFixture(t, models.MediaTypeBoth)
+	searchBookOK(t, h, book.ID)
+	for _, mt := range []string{models.MediaTypeEbook, models.MediaTypeAudiobook} {
+		got := mock.criteriaFor(mt).Profile
+		if got == nil || got.ID != profile.ID {
+			t.Errorf("%s leg: MatchCriteria.Profile = %v, want the author's profile %d", mt, got, profile.ID)
+		}
 	}
 }

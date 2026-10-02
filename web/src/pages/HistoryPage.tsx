@@ -51,6 +51,12 @@ function eventDetail(type: string, parsed: ReturnType<typeof parseEventData>): s
     const to = typeof parsed.to === 'string' ? parsed.to : ''
     if (from && to) return `${from} → ${to}`
   }
+  // An import is one row per download (#2764), so the formats it delivered are
+  // the part worth reading. `formats` is absent on rows written before that,
+  // which fall through to the path they always showed.
+  if (type === 'bookImported' && typeof parsed.formats === 'string' && parsed.formats) {
+    return parsed.path ? `${parsed.formats} · ${parsed.path}` : parsed.formats
+  }
   return parsed.message || parsed.path || ''
 }
 
@@ -167,6 +173,7 @@ export default function HistoryPage() {
       ) : events.length === 0 ? (
         <div className="text-center py-16 text-slate-600 dark:text-zinc-500">
           <p>{t('history.empty')}</p>
+          <p className="mt-1 text-sm">{t('history.emptyHint')}</p>
         </div>
       ) : (
         <>

@@ -19,7 +19,25 @@ const downloadSelectColumns = `
 	id, guid, book_id, edition_id, indexer_id, download_client_id,
 	title, nzb_url, size, sabnzbd_nzo_id, torrent_id, status, protocol,
 	quality, indexer_flags, error_message, added_at, grabbed_at, completed_at, imported_at,
-	import_retry_count, COALESCE(owner_user_id, 0), import_path`
+	dead_at, import_retry_count, COALESCE(owner_user_id, 0), import_path`
+
+// deadAtSQL is the moment a dead download's attempt ended, as the scheduler's
+// re-grab cooldown measures it. dead_at is the stamp written at the moment of
+// death (migration 091); the rest of the chain only covers a row that died
+// before that column existed and escaped the backfill, and can only report a
+// death as older than it was. Keep it in step with models.Download.DeadSince.
+const deadAtSQL = `COALESCE(dead_at, completed_at, grabbed_at, added_at)`
+
+// deadStamp is the value to write into dead_at for a row moving to next: the
+// moment of death for a state the row cannot leave on its own, and NULL for
+// every other state, which is what clears the stamp when a blocked row is
+// re-armed. Keep the condition in step with models.DownloadState.IsDeadForRegrab.
+func deadStamp(next models.DownloadState, now time.Time) any {
+	if next.IsDeadForRegrab() {
+		return now
+	}
+	return nil
+}
 
 func NewDownloadRepo(db *sql.DB) *DownloadRepo {
 	return &DownloadRepo{db: db}
@@ -138,11 +156,64 @@ func (r *DownloadRepo) Create(ctx context.Context, d *models.Download) error {
 // Two states qualify. StateFailed is the download-side failure. StateImportBlocked
 // (#1955) is the import-side one: terminal to every automatic path, so without
 // this the row pins the GUID forever and every later Grab of that release
-// answers "already grabbed". Keep the set in sync with api.regrabbableState,
-// which gates the caller.
+// answers "already grabbed".
+//
+// So does one further kind of row: an imported download whose book has been
+// deleted (#2289). book_id is ON DELETE SET NULL, so the row outlives its book
+// and would otherwise pin the GUID for good. The book_id IS NULL condition sits
+// in the WHERE clause rather than only in the caller, so an imported row that
+// still has its book can never be claimed, whatever the caller decided.
+//
+// Every per grab column is rewritten or reset, so the claimed row carries
+// nothing of the grab it replaces. Two of them were missed until #2289:
+// owner_user_id takes d's owner, because the row is now that user's download
+// (keeping the old owner showed it in their queue instead, 404ed the new
+// grabber's own actions on it, and let the old owner delete it and the torrent
+// with it); and import_path is cleared, because Match to book imports straight
+// from it and would pick up the previous grab's files. guid is the reuse key;
+// edition_id and indexer_flags are the caller's to pass.
+//
+// Keep this in sync with api.regrabbable, which gates the caller.
 func (r *DownloadRepo) RetryFailed(ctx context.Context, d *models.Download) (bool, error) {
-	now := time.Now().UTC()
-	result, err := r.db.ExecContext(ctx, `
+	return r.claimForRegrab(ctx, d,
+		regrabClaimSQL+`(status IN (?, ?) OR (status=? AND book_id IS NULL))`,
+		models.StateFailed, models.StateImportBlocked, models.StateImported)
+}
+
+// RetryDeadForAutoGrab is RetryFailed for the scheduler's auto grab: the same
+// reset, over a narrower set of rows, with one extra condition of its own.
+//
+// A failed row is claimed only when it died at or before deadBefore. That
+// cooldown is what keeps the auto grab from looping: without it the scheduler
+// would re-grab a release that fails at the client on every sweep, and the
+// sweep can run as often as hourly. A manual grab has no such bound because a
+// person asked for it. An orphaned import (imported, book deleted) is claimed
+// whatever its age, exactly as before (#2289): nothing about it will change
+// with time.
+//
+// StateImportBlocked is claimable by RetryFailed and NOT here, for the reasons
+// models.Download.BlocksAutoRegrab gives. The accepted states are exactly the
+// ones models.Download.BlocksAutoRegrab lets through, and
+// TestRetryDeadForAutoGrabMatchesThePredicate fails if they diverge.
+//
+// deadAtSQL is when the attempt ended; times are stored as RFC3339 UTC, so the
+// bound time.Time compares correctly against them.
+//
+// The cooldown lives in SQL rather than only in the caller for the same reason
+// the states do: between the scheduler reading the row and claiming it, a
+// manual grab can claim it and fail, leaving a row that died seconds ago where
+// the scheduler saw one that died months ago.
+func (r *DownloadRepo) RetryDeadForAutoGrab(ctx context.Context, d *models.Download, deadBefore time.Time) (bool, error) {
+	return r.claimForRegrab(ctx, d,
+		regrabClaimSQL+`((status=? AND `+deadAtSQL+` <= ?)
+		       OR (status=? AND book_id IS NULL))`,
+		models.StateFailed, deadBefore.UTC(), models.StateImported)
+}
+
+// regrabClaimSQL is the UPDATE shared by RetryFailed and RetryDeadForAutoGrab.
+// It rewrites or resets every per grab column; each claim appends the states
+// it accepts after the trailing AND.
+const regrabClaimSQL = `
 		UPDATE downloads
 		SET book_id=?,
 		    edition_id=?,
@@ -157,16 +228,28 @@ func (r *DownloadRepo) RetryFailed(ctx context.Context, d *models.Download) (boo
 		    protocol=?,
 		    quality=?,
 		    indexer_flags=?,
+		    owner_user_id=?,
 		    error_message='',
+		    import_path='',
 		    added_at=?,
 		    grabbed_at=NULL,
 		    completed_at=NULL,
 		    imported_at=NULL,
+		    dead_at=NULL,
 		    import_retry_count=0
-		WHERE id=? AND status IN (?, ?)`,
+		WHERE id=? AND `
+
+// claimForRegrab runs one of the regrabClaimSQL claims and, when it took the
+// row, mirrors the reset onto d.
+func (r *DownloadRepo) claimForRegrab(ctx context.Context, d *models.Download, query string, states ...any) (bool, error) {
+	now := time.Now().UTC()
+	args := []any{
 		d.BookID, d.EditionID, d.IndexerID, d.DownloadClientID,
 		d.Title, d.NZBURL, d.Size, models.StateGrabbed, d.Protocol,
-		d.Quality, d.IndexerFlags, now, d.ID, models.StateFailed, models.StateImportBlocked)
+		d.Quality, d.IndexerFlags, downloadOwnerArg(d.OwnerUserID), now, d.ID,
+	}
+	args = append(args, states...)
+	result, err := r.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return false, fmt.Errorf("retry failed download: %w", err)
 	}
@@ -185,7 +268,9 @@ func (r *DownloadRepo) RetryFailed(ctx context.Context, d *models.Download) (boo
 	d.GrabbedAt = nil
 	d.CompletedAt = nil
 	d.ImportedAt = nil
+	d.DeadAt = nil
 	d.ImportRetryCount = 0
+	d.ImportPath = ""
 	return true, nil
 }
 
@@ -203,8 +288,11 @@ func (r *DownloadRepo) RetryFailed(ctx context.Context, d *models.Download) (boo
 // in StateImportExternal instead, where the row lives in the queue permanently
 // and would display the stale error next to an import that demonstrably worked.
 func (r *DownloadRepo) ResetImportRetry(ctx context.Context, id int64) (accepted bool, found bool, err error) {
+	// dead_at is cleared with the rest: a re-armed row is no longer dead, and
+	// leaving the stamp would have it describe an attempt that is being
+	// retried (#2710).
 	result, err := r.db.ExecContext(ctx,
-		"UPDATE downloads SET import_retry_count=0, error_message='', status=? WHERE id=? AND status IN (?, ?)",
+		"UPDATE downloads SET import_retry_count=0, error_message='', dead_at=NULL, status=? WHERE id=? AND status IN (?, ?)",
 		models.StateImportFailed, id, models.StateImportFailed, models.StateImportBlocked)
 	if err != nil {
 		return false, false, fmt.Errorf("reset import retry: %w", err)
@@ -302,8 +390,13 @@ func (r *DownloadRepo) UpdateStatus(ctx context.Context, id int64, next models.D
 		// transitions stay in the import lifecycle, which is gated by the
 		// validTransitions table and only reachable after StateCompleted has
 		// already backfilled grabbed_at above.
+		//
+		// This is also the branch a row dies on (grabbed/downloading ->
+		// failed, importing -> importBlocked) and the one a blocked row is
+		// re-armed on, so dead_at is stamped or cleared here (#2710).
 		result, err = r.db.ExecContext(ctx,
-			"UPDATE downloads SET status=? WHERE id=? AND status=?", next, id, current)
+			"UPDATE downloads SET status=?, dead_at=? WHERE id=? AND status=?",
+			next, deadStamp(next, now), id, current)
 	}
 	if err != nil {
 		return err
@@ -360,10 +453,14 @@ func (r *DownloadRepo) SetImportPath(ctx context.Context, id int64, path string)
 	return err
 }
 
+// SetError marks the download failed with the message that killed it, and
+// stamps dead_at: this is the moment the attempt ended, and the scheduler's
+// re-grab cooldown measures from it (#2710). Nothing else on the row moves
+// here, which is why the cooldown cannot be read off added_at or grabbed_at.
 func (r *DownloadRepo) SetError(ctx context.Context, id int64, errMsg string) error {
 	_, err := r.db.ExecContext(ctx,
-		"UPDATE downloads SET status=?, error_message=? WHERE id=?",
-		models.StateFailed, errMsg, id)
+		"UPDATE downloads SET status=?, error_message=?, dead_at=? WHERE id=?",
+		models.StateFailed, errMsg, time.Now().UTC(), id)
 	return err
 }
 
@@ -382,9 +479,12 @@ func (r *DownloadRepo) SetErrorWithStatus(ctx context.Context, id int64, status 
 	// atomically: a concurrent writer that moved the row on between our read
 	// and write matches zero rows and we report the transition as invalid
 	// rather than stamping a failure onto whatever state it landed in.
+	// dead_at is stamped when status is one the row cannot leave on its own
+	// (importBlocked), and cleared when it is not (importFailed), so the stamp
+	// always describes the attempt the row currently holds (#2710).
 	result, err := r.db.ExecContext(ctx,
-		"UPDATE downloads SET status=?, error_message=? WHERE id=? AND status=?",
-		status, errMsg, id, current)
+		"UPDATE downloads SET status=?, error_message=?, dead_at=? WHERE id=? AND status=?",
+		status, errMsg, deadStamp(status, time.Now().UTC()), id, current)
 	if err != nil {
 		return err
 	}
@@ -636,7 +736,7 @@ func (r *DownloadRepo) query(ctx context.Context, q string, args ...interface{})
 			&d.ID, &d.GUID, &d.BookID, &d.EditionID, &d.IndexerID, &d.DownloadClientID,
 			&d.Title, &d.NZBURL, &d.Size, &d.SABnzbdNzoID, &d.TorrentID, &d.Status, &d.Protocol,
 			&d.Quality, &d.IndexerFlags, &d.ErrorMessage,
-			&d.AddedAt, &d.GrabbedAt, &d.CompletedAt, &d.ImportedAt,
+			&d.AddedAt, &d.GrabbedAt, &d.CompletedAt, &d.ImportedAt, &d.DeadAt,
 			&d.ImportRetryCount, &d.OwnerUserID, &d.ImportPath,
 		); err != nil {
 			return nil, fmt.Errorf("scan download: %w", err)

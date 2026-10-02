@@ -128,7 +128,7 @@ export default function MetadataTab() {
               {t('settings.general.defaultMediaTypeLabel', 'Default media type')}
             </label>
             <p className="text-xs text-slate-600 dark:text-zinc-500 mb-2">
-              {t('settings.general.defaultMediaTypeHint', 'Applied to new authors when no explicit choice is made. Existing authors are unaffected — use the Authors page bulk action to migrate them.')}
+              {t('settings.general.defaultMediaTypeHint', 'Applied to new authors, and to books you add on their own, when no explicit choice is made. Existing rows are unaffected: change authors with the Authors page bulk action, and books from the Books page with Set ebook, Set audiobook or Set both, which also covers your wanted list once Books is filtered to Wanted.')}
             </p>
             <select
               value={settings['default.media_type'] ?? 'ebook'}
@@ -181,7 +181,7 @@ export default function MetadataTab() {
               className="bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
             >
               <option value="all">{t('monitorMode.all', 'All books')}</option>
-              <option value="future">{t('monitorMode.future', 'Future books only')}</option>
+              <option value="future">{t('monitorMode.future', 'Future books only (grows on refresh)')}</option>
               <option value="latest">{t('monitorMode.latest', 'Latest only')}</option>
               <option value="none">{t('monitorMode.none', 'None')}</option>
             </select>
@@ -285,6 +285,7 @@ export default function MetadataTab() {
                       <h4 className="font-medium text-sm">{p.name}</h4>
                       <div className="flex flex-wrap gap-3 mt-2 text-xs text-slate-600 dark:text-zinc-400">
                         <span>{t('settings.metadata.minPages')} <span className="text-slate-800 dark:text-zinc-200">{p.minPages === 0 ? 'none' : p.minPages}</span></span>
+                        <span>{t('settings.metadata.minEditionCount')} <span className="text-slate-800 dark:text-zinc-200">{p.minEditionCount === 0 ? 'none' : p.minEditionCount}</span></span>
                         <span>{t('settings.metadata.languages')} <span className="text-slate-800 dark:text-zinc-200">{formatLanguageList(p.allowedLanguages)}</span></span>
                       </div>
                       <div className="flex flex-wrap gap-1.5 mt-2">
@@ -331,6 +332,7 @@ function MetadataProfileForm({ profile, onClose, onSaved }: { profile?: Metadata
   // shape as #2373, which kept quality_profiles.cutoff for the same reason.
   const minPopularity = profile?.minPopularity ?? 0
   const [minPages, setMinPages] = useState(profile?.minPages ?? 0)
+  const [minEditionCount, setMinEditionCount] = useState(profile?.minEditionCount ?? 0)
   const [skipMissingDate, setSkipMissingDate] = useState(profile?.skipMissingDate ?? false)
   const [skipMissingIsbn, setSkipMissingIsbn] = useState(profile?.skipMissingIsbn ?? false)
   const [skipPartBooks, setSkipPartBooks] = useState(profile?.skipPartBooks ?? false)
@@ -355,6 +357,7 @@ function MetadataProfileForm({ profile, onClose, onSaved }: { profile?: Metadata
         name: name.trim(),
         minPopularity,
         minPages,
+        minEditionCount,
         skipMissingDate,
         skipMissingIsbn,
         skipPartBooks,
@@ -422,7 +425,16 @@ function MetadataProfileForm({ profile, onClose, onSaved }: { profile?: Metadata
           <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">{t('settings.metadata.formMinPages')}</label>
           <input type="number" min={0} value={minPages} onChange={e => setMinPages(Number(e.target.value))} className={inputCls} />
         </div>
+        <div>
+          <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">{t('settings.metadata.formMinEditionCount')}</label>
+          <input type="number" min={0} value={minEditionCount} onChange={e => setMinEditionCount(Number(e.target.value))} className={inputCls} />
+        </div>
       </div>
+      {minEditionCount > 0 && (
+        <p className="text-[11px] text-slate-500 dark:text-zinc-500">
+          {t('settings.metadata.formMinEditionCountHint')}
+        </p>
+      )}
       <div className="flex flex-wrap gap-4 text-xs">
         <label className="flex items-center gap-2 cursor-pointer">
           <input type="checkbox" checked={skipMissingDate} onChange={e => setSkipMissingDate(e.target.checked)} />

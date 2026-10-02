@@ -30,11 +30,11 @@ Exactly one provider is *primary* — it defines what an author's catalogue is.
 | Layer | Stack | Notes |
 |-------|-------|-------|
 | **HTTP router** | [chi](https://github.com/go-chi/chi) v5 | Sub-routers per resource, middleware-driven auth/CSRF/rate-limit. |
-| **Backend language** | Go 1.26 (built with `golang:1.26.4`) | Standard library HTTP server, structured logging via `slog`. |
+| **Backend language** | Go 1.26 (built with `golang:1.27.1-alpine`) | Standard library HTTP server, structured logging via `slog`. |
 | **Database** | SQLite, WAL mode | [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) — pure Go, no CGO. Single `bindery.db` file. Connection pragmas (`foreign_keys`, `busy_timeout`, `synchronous`, `temp_store`, `cache_size`) are carried in the DSN so the driver reapplies them to every connection it opens; see [Database durability](DEPLOYMENT.md#database-durability). |
 | **Schema migrations** | Embedded SQL files in `internal/db/migrations/` | Linearly-numbered, additive-only, applied at startup. |
 | **Frontend** | React 19 + TypeScript + Tailwind CSS 4 | Built with [Vite](https://vite.dev), output baked into the binary via `go:embed`. |
-| **Container** | Multi-stage build on [distroless/static-debian12:nonroot](https://github.com/GoogleContainerTools/distroless) | No shell, no package manager, runs as UID `65532`. |
+| **Container** | Multi-stage build on [distroless/static-debian13:nonroot](https://github.com/GoogleContainerTools/distroless) | No shell, no package manager, runs as UID `65532`. |
 | **Helm chart** | `charts/bindery/` | ArgoCD- and Flux-friendly; supports `existingSecret`, NFS volumes, ingress. |
 
 ## Internal packages
@@ -53,10 +53,12 @@ The `internal/` tree is organised by domain, not by layer:
 | `decision` | Quality profiles, language filter, custom formats, delay profiles, blocklist consultation. |
 | `downloader` | SABnzbd, NZBGet, qBittorrent, Transmission, Deluge, rTorrent clients (queue/history polling, submission, deletion). |
 | `importer` | NZO-ID matching, Move/Copy/Hardlink semantics, naming-token expansion, cross-FS-safe moves. |
-| `scheduler` | Cron loops for auto-grab, refresh, recommendations, cleanup. |
+| `scheduler` | Cron loops for auto-grab, refresh, release discovery, recommendations, cleanup. See [Scheduled jobs](#scheduled-jobs). |
 | `recommender` | Discover engine — taste profile, candidate filters, multi-source signals. |
-| `seriesmatch` | Four-tier reconciliation (ASIN → title+author → series+position → fuzzy). |
-| `textutil` | The character-level folds every string comparison shares, and the reasons they differ — see [search-design.md](search-design.md). |
+| `seriesmatch` | Series title and position matching shared by Audiobookshelf import and manual series linking: name normalisation, a first-party WRatio-style title score, and volume-number comparison. |
+| `textutil` | The character-level folds every string comparison shares and the reasons they differ (see [search-design.md](search-design.md)), plus author-name, alias and description cleanup and Jaro-Winkler similarity. |
+| `covers` | On-disk store for cover images Bindery owns rather than fetches, addressed as `bindery-cover:<sha256>` and served through the image proxy. |
+| `jobs` | Tracker for detached background goroutines so the process drains them on shutdown before closing the database. |
 | `normdrift` | No production code: property tests asserting the folds above agree where they must and differ where they should. |
 | `calibre` | `calibredb` CLI integration, plugin-bridge HTTP client, `metadata.db` direct ingest. |
 | `abs` | Audiobookshelf import — runs, provenance, conflicts, review queue. |
@@ -75,7 +77,6 @@ The `internal/` tree is organised by domain, not by layer:
 | `isbnutil` | Normalizes ISBN inputs for metadata-provider lookups. |
 | `metrics` | Prometheus exposition-format runtime metrics (registry, instances, HTTP handler). |
 | `pathmap` | Rewrites paths between external-service mount points and Bindery-visible mount points. |
-| `textutil` | Normalization and cleanup helpers (author names, descriptions, Jaro-Winkler fuzzy matching). |
 | `useragent` | Produces the canonical `User-Agent` string sent on every outbound HTTP request. |
 
 ## Storage layout
@@ -84,7 +85,7 @@ A typical container has three logical mounts:
 
 | Mount | Purpose | Default |
 |-------|---------|---------|
-| `/config` | SQLite database, backups, image cache, cookie/CSRF secrets | `BINDERY_DATA_DIR`, `BINDERY_DB_PATH` |
+| `/config` | SQLite database, backups, image cache, owned cover store (`covers/`), Calibre cover cache (`calibre-covers/`), cookie/CSRF secrets | `BINDERY_DATA_DIR`, `BINDERY_DB_PATH` |
 | `/books` | Imported ebook library (and audiobooks unless split out) | `BINDERY_LIBRARY_DIR` |
 | `/downloads` | Where the download client deposits completed jobs | `BINDERY_DOWNLOAD_DIR` |
 
@@ -96,6 +97,26 @@ If audiobooks live on a different volume, set `BINDERY_AUDIOBOOK_DIR` (and optio
 - Background workers (auto-grab sweep, recommendations refresh, indexer probes, ABS import) are scheduled by the `scheduler` package as long-lived goroutines guarded by context cancellation on shutdown.
 - SQLite runs in WAL mode, but the connection pool is pinned to a single connection (`SetMaxOpenConns(1)`), so **reads serialize alongside writes** rather than running concurrently. WAL's concurrent-reader property is not currently being used. This is sufficient for the workload in practice, and [#2147](https://github.com/vavallee/bindery/issues/2147) tracks lifting it, including the reason it is not a one-line change: migrations run a connection-scoped `PRAGMA foreign_keys=OFF`, which a pool would break.
 - All outbound HTTP calls go through a shared client with timeouts, SSRF guards, and User-Agent stamping (`bindery/<version>`).
+
+## Scheduled jobs
+
+Registered by `internal/scheduler`. Every job runs under `SkipIfStillRunning`, so a run that overruns its interval skips the next one rather than queueing behind it, and each run is recorded through `metrics.ObserveSchedulerRun`.
+
+| Job | Interval | What it does |
+|-----|----------|--------------|
+| `check-downloads` | 15s | Polls download clients and imports finished jobs. |
+| `check-stalled` | 5m | Fails, blocklists and re-searches downloads stuck past the stall timeout. |
+| `download-client-health` | 15m | Re-probes download client reachability and paths. |
+| `search-wanted` | `search.interval`, default 12h, read at startup | Searches indexers for wanted books and auto-grabs when enabled. |
+| `refresh-metadata` | 24h | Refreshes four profile fields on monitored authors. Creates no books. |
+| `author-discovery` | hourly tick, cadence from `authors.discovery.interval` (unset and `off` both disable it, which is how it ships; a stored 24h to 720h duration turns it on), read every tick | Runs the author catalogue sync for a batch of monitored authors whose `last_discovery_at` is older than the interval, never checked first. Batch is `ceil(eligible / hours in interval)`, clamped to 1..25, read with 3 spare authors so one whose sync is already running is skipped without costing the slot, with 3 seconds between authors and a 10 minute budget per author (an author over budget is stamped). Checks before every author whether Refresh all or refresh selected is running and stops if so. Stops on a rate limit from any provider (`metadata.ErrRateLimited`, the refused author unstamped), and after 3 consecutive authors failing with the provider unavailable (`metadata.IsProviderUnavailable`: rate limit, 5xx, network error, timeout); the authors of that streak are stamped to be due again in 6 hours (capped at the interval) so they cannot hold the head of the queue. Any other error is about the author, is stamped and resets the streak. Re-reads each author and skips one deleted, unmonitored or set to add no new items, before any provider call. Enriches covers only for works the author does not have, so existing coverless books get covers from a manual refresh only. Same author catalogue syncs serialise from reading the author's books to hydrating the created ones; the lock is released before indexer searches and the announcement, waiting for it ends with the context, and the AddBook single work fallback does not take it. Never grabs; new monitored books reach indexers through `search-wanted`. Publishes `bookAnnounced` ([#2236](https://github.com/vavallee/bindery/issues/2236)). |
+| `scan-library` | 6h | Reconciles files under the library roots against the catalogue. |
+| `calibre-sync` | 24h | Imports from a Calibre library, when configured. |
+| `calibre-deliver` | 1m | Delivers queued ebook files to Calibre (`calibre_deliveries`). Does nothing with Calibre off or the queue empty; stops without counting an attempt when the bridge does not answer a 5 second health probe. Retries failures with backoff (1m, 5m, 15m, 1h, 6h, then 24h) and gives up after 8 attempts. Imports kick an extra pass; passes never overlap. |
+| `recommendations` | 24h | Rebuilds Discover recommendations, when enabled. |
+| `hardcover-sync` | `hardcover.sync_interval`, default 24h, read at startup | Syncs Hardcover import lists, when configured. |
+| `telemetry-ping` | 24h | Anonymous install ping, unless opted out. |
+| `log-trim` | 24h | Trims the persistent log store to its retention. |
 
 ## Why these choices
 

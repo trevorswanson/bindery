@@ -127,7 +127,10 @@ func (h *BookHandler) WithEditionFetcher(fetcher bookhydrate.EditionFetcher) *Bo
 	return h
 }
 
-func (h *BookHandler) hydrateHardcoverEditions(ctx context.Context, book *models.Book, provider string) {
+// hydrateHardcoverEditions fills the book's editions from Hardcover.
+// mediaTypePinned forwards the caller's "this format was chosen, not guessed"
+// signal so hydration leaves the media type alone (#2768).
+func (h *BookHandler) hydrateHardcoverEditions(ctx context.Context, book *models.Book, provider string, mediaTypePinned bool) {
 	if book == nil || h.editions == nil {
 		return
 	}
@@ -142,12 +145,13 @@ func (h *BookHandler) hydrateHardcoverEditions(ctx context.Context, book *models
 		}
 	}
 	bookhydrate.HydrateHardcoverEditions(ctx, bookhydrate.Options{
-		Book:          book,
-		Provider:      providerName,
-		Editions:      h.editions,
-		Books:         h.books,
-		FetchEditions: fetcher,
-		Enricher:      h.meta,
+		Book:            book,
+		Provider:        providerName,
+		Editions:        h.editions,
+		Books:           h.books,
+		FetchEditions:   fetcher,
+		Enricher:        h.meta,
+		MediaTypePinned: mediaTypePinned,
 	})
 }
 
@@ -397,6 +401,7 @@ func (h *BookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	oldStatus := book.Status
+	oldMonitored := book.Monitored
 	oldMediaType := book.MediaType
 
 	// Note: file_path is deliberately NOT accepted here. It's set by the
@@ -531,21 +536,22 @@ func (h *BookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fire an immediate indexer search when a book transitions into wanted
-	// status (e.g. "Delete file" flips imported → wanted, a manual status edit,
-	// or a media-type change that exposes a missing format — #1148). Gate on
-	// searcher to keep tests that don't wire it nil-safe. Detach the request
-	// context so the search outlives the HTTP response but keeps any
-	// request-scoped values.
+	// Fire an immediate indexer search when this write leaves the book wanted
+	// and monitored and it was not both before (e.g. "Delete file" flips
+	// imported → wanted, a manual status edit, a media-type change that exposes
+	// a missing format, or monitoring a book that was already wanted — #1148,
+	// #2722). Gate on searcher to keep tests that don't wire it nil-safe.
+	// Detach the request context so the search outlives the HTTP response but
+	// keeps any request-scoped values.
 	//
-	// Monitored is checked here because this hook is the one place a status
-	// transition grabs without the caller asking for a search. Widening a
-	// book to 'both' exposes a missing format and immediately downloads it;
-	// unmonitoring is the only way a user can say "record this, don't fetch
-	// it", and it was being ignored. The 12h wanted scan already filters on
-	// monitored (ListPageFiltered adds `AND books.monitored = 1` for the
-	// wanted status), so this closes the gap rather than opening a new one.
-	if h.searcher != nil && book.Monitored && book.Status == models.BookStatusWanted && oldStatus != models.BookStatusWanted {
+	// Monitored is part of the gate because this hook is the one place a
+	// status transition grabs without the caller asking for a search.
+	// Widening a book to 'both' exposes a missing format and immediately
+	// downloads it; unmonitoring is the only way a user can say "record this,
+	// don't fetch it", and it was being ignored. The 12h wanted scan already
+	// filters on monitored (ListPageFiltered adds `AND books.monitored = 1` for
+	// the wanted status), so this closes the gap rather than opening a new one.
+	if h.searcher != nil && book.BecameSearchable(oldStatus, oldMonitored) {
 		b := *book
 		bgCtx := h.bgCtx()
 		// Respect the global auto-grab kill-switch.
@@ -955,6 +961,12 @@ func removeBookPathScoped(p, format string, ownedByOther func(string) bool) erro
 		}
 	}
 
+	// A book file's metadata.opf sidecar (import.write_opf_sidecar) is not a
+	// book file itself, so it survives the sweep above and would otherwise
+	// strand this folder the same way it used to strand a Reorganize move —
+	// reclaim it first so the empty check below actually sees empty.
+	importer.RemoveOrphanedSidecar(parent)
+
 	// Clean up parent directory if it is now empty.
 	remaining, err := os.ReadDir(parent)
 	if err == nil && len(remaining) == 0 {
@@ -1085,7 +1097,30 @@ func (h *BookHandler) ListWanted(w http.ResponseWriter, r *http.Request) {
 	for i := range books {
 		cleanBookDescription(&books[i])
 	}
+	h.markUnmonitoredAuthors(r.Context(), books)
 	writeJSON(w, http.StatusOK, books)
+}
+
+// markUnmonitoredAuthors flags the rows whose author is not monitored, so the
+// Wanted page can say why they are sitting there (#2742). One query for the
+// whole page, not one per row.
+//
+// Best effort: with no authors repo, or a read that fails, the rows are left
+// alone. Claiming "the author is not monitored" on a page that could not check
+// would be worse than saying nothing, because it accuses the setting the user
+// is most likely to go and change.
+func (h *BookHandler) markUnmonitoredAuthors(ctx context.Context, books []models.Book) {
+	if h.authors == nil || len(books) == 0 {
+		return
+	}
+	unmonitored, err := h.authors.UnmonitoredAuthorIDs(ctx)
+	if err != nil {
+		slog.Warn("wanted list: failed to load unmonitored authors", "error", err)
+		return
+	}
+	for i := range books {
+		books[i].AuthorUnmonitored = unmonitored[books[i].AuthorID]
+	}
 }
 
 // Rebind updates a book's foreign_id and metadata_provider, then re-fetches
@@ -1216,7 +1251,10 @@ func (h *BookHandler) Rebind(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	}
-	h.hydrateHardcoverEditions(r.Context(), book, req.Provider)
+	// MediaType is in the preserved-fields list above because it belongs to the
+	// user, so a rebind is exactly the case the pin exists for: hydration must
+	// not widen the format the user keeps (#2768).
+	h.hydrateHardcoverEditions(r.Context(), book, req.Provider, true)
 
 	// Re-link series membership: remove all existing links for this book, then
 	// attach whatever the upstream record declares.

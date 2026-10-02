@@ -1,14 +1,16 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { useEffect } from 'react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { http, HttpResponse } from 'msw'
-import { MemoryRouter } from 'react-router'
+import { MemoryRouter, useLocation } from 'react-router'
 import BooksPage from './BooksPage'
 import { apiUrl, server } from '../test/msw'
-import type { Book } from '../api/client'
+import { api, type Book } from '../api/client'
 
-// BooksPage talks to the API through the real `api` client; we mock at the
-// network layer with MSW (the same setup api/client.test.ts uses) rather than
-// stubbing the client module, so the fetch/parse path is exercised end to end.
+// BooksPage talks to the API through the real `api` client. Most tests mock at
+// the network layer with MSW so the fetch/parse path is exercised end to end;
+// the stale-response regression spies on listBooks only to control completion
+// order precisely.
 //
 // i18n and Pagination are stubbed exactly like the other list-page tests
 // (WantedPage/QueuePage/AuthorsPage) so the assertions can target stable,
@@ -28,7 +30,7 @@ vi.mock('react-i18next', () => ({
         'books.typeLabel': 'Type:',
         'books.empty': 'No books in your library yet',
         'books.emptyHint':
-          'Add an author first — books are imported automatically when an author is monitored',
+          'Add a book directly, or add an author to monitor their catalogue.',
         'books.noMatch': 'No books match your search.',
         'books.statusWanted': 'Wanted',
         'books.statusImported': 'Imported',
@@ -38,10 +40,31 @@ vi.mock('react-i18next', () => ({
         'books.colYear': 'Year',
         'books.colType': 'Type',
         'books.colStatus': 'Status',
+        'addToLibrary.title': 'Add to library',
+        'addToLibrary.addBook': 'Add Book',
+        'addToLibrary.description': 'Search by author, title, ISBN, or ASIN.',
+        'addToLibrary.searchPlaceholderBook': 'Title, ISBN, or ASIN',
+        'addToLibrary.searching': 'Searching...',
+        'addToLibrary.select': 'Select',
+        'addToLibrary.selectBook': `Select ${(options as Record<string, unknown> | undefined)?.title ?? ''}`,
+        'addToLibrary.book.confirmAdd': 'Add book',
+        'addToLibrary.backToResults': 'Back to results',
+        'addToLibrary.book.noCover': 'No cover',
+        'addToLibrary.book.format': 'Format',
+        'addToLibrary.book.formatLabel': 'Format to add',
+        'addToLibrary.book.formatHint': 'Choose which format to add',
+        'addToLibrary.book.defaultFormat': 'Default',
+        'addToLibrary.book.autoSearchLabel': 'Search indexers after adding',
+        'addToLibrary.book.autoSearchHint': 'Try to grab the book automatically after adding it to wanted.',
+        'addToLibrary.adding': 'Adding...',
         'common.all': 'All',
         'common.loading': 'Loading...',
         'common.ebook': 'Ebook',
         'common.audiobook': 'Audiobook',
+        'common.both': 'Both',
+        'common.search': 'Search',
+        'common.cancel': 'Cancel',
+        'search.autoGrabDisabled': 'No search was run. Automatic grabbing is off.',
       }
       if (labels[key]) return labels[key]
       if (typeof options === 'string') return options
@@ -83,12 +106,27 @@ function stubSetupEndpoints() {
   server.use(
     http.get(apiUrl('/indexer'), () => HttpResponse.json([])),
     http.get(apiUrl('/downloadclient'), () => HttpResponse.json([])),
+    // The unified Add dialog (#1227) fans out to the author search alongside
+    // the book search and reads the primary-provider setting on open.
+    http.get(apiUrl('/search/author'), () => HttpResponse.json([])),
+    http.get(apiUrl('/setting/metadata.primary_provider'), () => new HttpResponse(null, { status: 404 })),
   )
 }
 
-function renderBooksPage() {
+type Located = { pathname: string; state: unknown }
+
+function LocationProbe({ onLocation }: { onLocation: (location: Located) => void }) {
+  const location = useLocation()
+  useEffect(() => {
+    onLocation({ pathname: location.pathname, state: location.state })
+  }, [location, onLocation])
+  return null
+}
+
+function renderBooksPage(onLocation?: (location: Located) => void) {
   return render(
     <MemoryRouter>
+      {onLocation && <LocationProbe onLocation={onLocation} />}
       <BooksPage />
     </MemoryRouter>,
   )
@@ -100,10 +138,46 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  vi.clearAllMocks()
+  vi.restoreAllMocks()
 })
 
 describe('BooksPage', () => {
+  // #2669: with automatic grabbing off the server refuses a bulk search
+  // instead of queueing it. This page ignored the response envelope entirely,
+  // so it cleared the selection and reloaded as if the search had run.
+  it('says nothing was searched when automatic grabbing is off, and keeps the selection', async () => {
+    let listCalls = 0
+    server.use(
+      http.get(apiUrl('/book'), () => {
+        listCalls++
+        return HttpResponse.json({
+          items: [makeBook({ id: 1, title: 'Dune', status: 'wanted' })],
+          total: 1,
+          limit: 50,
+          offset: 0,
+        })
+      }),
+      http.post(apiUrl('/book/bulk'), () =>
+        HttpResponse.json({
+          results: { 1: { ok: false, code: 'auto_grab_disabled', error: 'automatic grabbing is disabled' } },
+        }),
+      ),
+    )
+
+    renderBooksPage()
+
+    fireEvent.click(await screen.findByTitle('Select Dune'))
+    const callsBefore = listCalls
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('No search was run. Automatic grabbing is off.')
+    // The selection survives, so a retry after flipping the switch does not
+    // mean re-picking every book, and the list is not reloaded because
+    // nothing changed.
+    expect(screen.getByTitle('Select Dune')).toBeChecked()
+    await waitFor(() => expect(listCalls).toBe(callsBefore))
+  })
+
   it('renders book titles returned by the server', async () => {
     server.use(
       http.get(apiUrl('/book'), () =>
@@ -147,7 +221,7 @@ describe('BooksPage', () => {
     ).toBeInTheDocument()
     expect(
       screen.getByText(
-        'Add an author first — books are imported automatically when an author is monitored',
+        'Add a book directly, or add an author to monitor their catalogue.',
       ),
     ).toBeInTheDocument()
     // The "no match" copy is for a filtered empty result, not a truly empty library.
@@ -176,6 +250,88 @@ describe('BooksPage', () => {
     expect(consoleError).toHaveBeenCalled()
 
     consoleError.mockRestore()
+  })
+
+  it('opens Add Book from the page and reloads after a successful add', async () => {
+    let listCalls = 0
+    server.use(
+      http.get(apiUrl('/book'), () => {
+        listCalls++
+        return HttpResponse.json({ items: [], total: 0, limit: 50, offset: 0 })
+      }),
+      http.get(apiUrl('/search/book'), () => HttpResponse.json([
+        makeBook({ id: 0, title: 'Dune', foreignBookId: 'OL1W' }),
+      ])),
+      http.post(apiUrl('/author/book'), () => HttpResponse.json(
+        makeBook({ id: 1, title: 'Dune', foreignBookId: 'OL1W' }),
+      )),
+    )
+
+    renderBooksPage()
+    await screen.findByText('No books in your library yet')
+
+    const addBookButton = screen.getByRole('button', { name: 'Add Book' })
+    fireEvent.click(addBookButton)
+    expect(screen.getByRole('dialog', { name: 'Add to library' })).toBeInTheDocument()
+
+    fireEvent.change(screen.getByPlaceholderText('Title, ISBN, or ASIN'), { target: { value: 'Dune' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findByText('Dune')
+    fireEvent.click(screen.getByRole('button', { name: 'Select Dune' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add book' }))
+
+    await waitFor(() => expect(listCalls).toBeGreaterThanOrEqual(2))
+    expect(screen.queryByRole('dialog', { name: 'Add to library' })).not.toBeInTheDocument()
+    await waitFor(() => expect(addBookButton).toHaveFocus())
+  })
+
+  it('ignores an older list response while the post-add refresh is pending', async () => {
+    let resolveInitial!: (page: Awaited<ReturnType<typeof api.listBooks>>) => void
+    let resolveRefresh!: (page: Awaited<ReturnType<typeof api.listBooks>>) => void
+    const initial = new Promise<Awaited<ReturnType<typeof api.listBooks>>>(resolve => {
+      resolveInitial = resolve
+    })
+    const refresh = new Promise<Awaited<ReturnType<typeof api.listBooks>>>(resolve => {
+      resolveRefresh = resolve
+    })
+    const addedBook = makeBook({ id: 1, title: 'Dune', foreignBookId: 'OL1W' })
+    const listBooks = vi.spyOn(api, 'listBooks')
+      .mockReturnValueOnce(initial)
+      .mockReturnValueOnce(refresh)
+    server.use(
+      http.get(apiUrl('/search/book'), () => HttpResponse.json([
+        makeBook({ id: 0, title: 'Dune', foreignBookId: 'OL1W' }),
+      ])),
+      http.post(apiUrl('/author/book'), () => HttpResponse.json(addedBook)),
+    )
+
+    renderBooksPage()
+    fireEvent.click(screen.getByRole('button', { name: 'Add Book' }))
+    fireEvent.change(screen.getByPlaceholderText('Title, ISBN, or ASIN'), { target: { value: 'Dune' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findByText('Dune')
+    fireEvent.click(screen.getByRole('button', { name: 'Select Dune' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add book' }))
+
+    await waitFor(() => expect(listBooks).toHaveBeenCalledTimes(2))
+    expect(screen.getByText('Loading...')).toBeInTheDocument()
+
+    await act(async () => {
+      resolveInitial({
+        items: [makeBook({ id: 99, title: 'Stale result' })],
+        total: 1,
+        limit: 50,
+        offset: 0,
+      })
+    })
+    expect(screen.queryByRole('heading', { name: 'Stale result' })).not.toBeInTheDocument()
+    expect(screen.getByText('Loading...')).toBeInTheDocument()
+
+    await act(async () => {
+      resolveRefresh({ items: [addedBook], total: 1, limit: 50, offset: 0 })
+    })
+    expect(screen.getByRole('heading', { name: 'Dune' })).toBeInTheDocument()
+    expect(screen.queryByText('Loading...')).not.toBeInTheDocument()
   })
 })
 
@@ -252,5 +408,62 @@ describe('BooksPage — sortable column headers', () => {
       expect(header.className).toContain('cursor-pointer')
       expect(header).toHaveAttribute('title')
     }
+  })
+})
+
+// Previous/Next navigation (#2548, book side): BookDetailPage reads this
+// page's currently loaded ids/order back as router state to step between
+// books without a round trip to this list.
+describe('BooksPage — book link nav state (#2548)', () => {
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('carries {ids, index} on the grid card link, matching page order', async () => {
+    server.use(
+      http.get(apiUrl('/book'), () =>
+        HttpResponse.json({
+          items: [makeBook({ id: 1, title: 'Dune' }), makeBook({ id: 2, title: 'Hyperion' })],
+          total: 2,
+          limit: 50,
+          offset: 0,
+        }),
+      ),
+    )
+    let located: Located | undefined
+    renderBooksPage(loc => { located = loc })
+
+    await screen.findByRole('heading', { name: 'Hyperion' })
+    const card = screen.getByRole('heading', { name: 'Hyperion' }).closest('div[class*="border"]')!
+    fireEvent.click(card.querySelector('a')!)
+
+    await waitFor(() => expect(located?.pathname).toBe('/book/2'))
+    expect(located?.state).toEqual({ ids: [1, 2], index: 1, hopDepth: 1 })
+  })
+
+  it('navigates client-side from anywhere in a table row (not a full page reload) and carries the same nav state as the title link', async () => {
+    localStorage.setItem('bindery.view.books', 'table')
+    server.use(
+      http.get(apiUrl('/book'), () =>
+        HttpResponse.json({
+          items: [makeBook({ id: 1, title: 'Dune' }), makeBook({ id: 2, title: 'Hyperion' })],
+          total: 2,
+          limit: 50,
+          offset: 0,
+        }),
+      ),
+    )
+    let located: Located | undefined
+    renderBooksPage(loc => { located = loc })
+
+    // Click a cell that is part of the row but not the title <Link> itself —
+    // this only reaches BookDetailPage's router state if the row click is a
+    // client-side navigate(), not the window.location.href hard reload it
+    // used to be.
+    const row = (await screen.findByText('Hyperion')).closest('tr')!
+    fireEvent.click(row.querySelector('td:last-child')!)
+
+    await waitFor(() => expect(located?.pathname).toBe('/book/2'))
+    expect(located?.state).toEqual({ ids: [1, 2], index: 1, hopDepth: 1 })
   })
 })

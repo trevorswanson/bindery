@@ -2,7 +2,6 @@ package importer
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -162,6 +161,29 @@ func (s *Scanner) audiobookFileTemplate(ctx context.Context) string {
 		return ""
 	}
 	return strings.TrimSpace(setting.Value)
+}
+
+// singleAudiobookFileName is the name a single-file audiobook takes inside its
+// folder: the source file's own name, or, when naming.audiobook_file_template
+// is set, that template rendered the way the folder branch renders a track,
+// with {Part} left out as AudiobookSingleFileName describes (#2900). The
+// import's single-file branch and Rename files both call it, so a reorganized
+// file lands where a fresh import would put it. The extension is lowercased
+// for the template, the same as flattenAudiobookDirNamed does for each track.
+// A template that renders to nothing usable keeps the source name rather than
+// placing a file called "." or with no name at all.
+func (s *Scanner) singleAudiobookFileName(ctx context.Context, author *models.Author, book *models.Book, seriesTitle, seriesNum, src string) string {
+	name := filepath.Base(src)
+	tmpl := s.audiobookFileTemplate(ctx)
+	if tmpl == "" {
+		return name
+	}
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(src)), ".")
+	rendered := s.renamer.AudiobookSingleFileName(tmpl, author, book, seriesTitle, seriesNum, ext)
+	if rendered == "" || rendered == "." || rendered == ".." || rendered == string(filepath.Separator) {
+		return name
+	}
+	return rendered
 }
 
 // pushToCWA copies the just-imported file into the directory watched by a
@@ -531,93 +553,59 @@ func (s *Scanner) dropPlaceAudiobook(ctx context.Context, downloadPath string, b
 	return dropPlaceFile(ctx, source, filepath.Join(destDir, filepath.Base(source)), linkMode)
 }
 
-// pushToCalibre mirrors a just-imported book into Calibre via calibredb add.
-// Failures are logged and swallowed — Calibre sync is best-effort and must
-// never roll back an otherwise-good Bindery import.
-func (s *Scanner) pushToCalibre(ctx context.Context, book *models.Book, author *models.Author, edition *models.Edition, seriesTitle, seriesNum, path string) {
-	if s.calibreMode == nil || book == nil {
-		return
+// enqueueCalibreDelivery queues one just-imported ebook file for the Calibre
+// delivery worker (#2832). It used to push inline, per file, inside the
+// import: a closed Calibre cost up to thirty seconds per file and the book
+// was then missed for good, with one WARN line as the only record. Now the
+// import only writes a ledger row and the worker delivers it, retrying with
+// backoff until Calibre is reachable. It reports whether a row was queued,
+// so the caller knows to kick the worker once the loop is done.
+//
+// Only ebook files are queued. The Calibre hand off takes one ebook file:
+// the plugin derives the format from the extension and rejects a folder, and
+// calibredb scans a folder against Calibre's BOOK_EXTENSIONS, which carry no
+// audio format.
+func (s *Scanner) enqueueCalibreDelivery(ctx context.Context, book *models.Book, dl *models.Download, edition *models.Edition, path string) bool {
+	if s.calibreQueue == nil || s.calibreMode == nil || book == nil {
+		return false
 	}
 	mode := s.calibreMode()
-	if mode == calibre.ModeCalibredb || mode == calibre.ModePlugin {
-		s.pushCalibreAdd(ctx, book, s.calibreMetadata(ctx, book, author, edition, seriesTitle, seriesNum, mode), path, mode)
+	if mode != calibre.ModeCalibredb && mode != calibre.ModePlugin {
+		return false
 	}
-}
-
-// pushCalibreAdd invokes the configured adder (calibredb CLI or plugin HTTP
-// client) and persists the resulting calibre_id. Failures are best-effort —
-// logged and swallowed so Bindery's own import stays good.
-func (s *Scanner) pushCalibreAdd(ctx context.Context, book *models.Book, meta calibre.Metadata, path string, mode calibre.Mode) {
-	if s.calibreAdder == nil {
-		slog.Debug("calibre: adder is nil, skipping", "mode", mode, "bookId", book.ID)
-		return
-	}
-	id, err := s.calibreAdder.Add(ctx, path, meta)
+	files, err := s.books.ListFiles(ctx, book.ID)
 	if err != nil {
-		if errors.Is(err, calibre.ErrDisabled) {
-			return
-		}
-		if errors.Is(err, calibre.ErrAlreadyInCalibre) {
-			slog.Info("calibre: book already in library", "mode", mode, "bookId", book.ID, "path", path, "calibreId", id)
-			if id > 0 {
-				if perr := s.books.SetCalibreID(ctx, book.ID, id); perr != nil {
-					slog.Warn("calibre: persist calibre_id failed", "bookId", book.ID, "calibreId", id, "error", perr)
-				}
-			}
-			return
-		}
-		slog.Warn("calibre: add failed, continuing", "mode", mode, "bookId", book.ID, "path", path, "error", err)
-		return
+		slog.Warn("calibre: could not queue the delivery, listing the book's files failed", "bookId", book.ID, "path", path, "error", err)
+		return false
 	}
-	if err := s.books.SetCalibreID(ctx, book.ID, id); err != nil {
-		slog.Warn("calibre: persist calibre_id failed", "bookId", book.ID, "calibreId", id, "error", err)
-		return
-	}
-	slog.Info("calibre: book mirrored", "mode", mode, "bookId", book.ID, "calibreId", id, "path", path)
-}
-
-func (s *Scanner) calibreMetadata(ctx context.Context, book *models.Book, author *models.Author, edition *models.Edition, seriesTitle, seriesNum string, mode calibre.Mode) calibre.Metadata {
-	if book == nil {
-		return calibre.Metadata{}
-	}
-	meta := calibre.Metadata{
-		Title:         book.Title,
-		Description:   book.Description,
-		Genres:        book.Genres,
-		Language:      calibre.NormalizeLanguageForCalibre(book.Language),
-		Series:        seriesTitle,
-		SeriesIndex:   seriesNum,
-		PublishedDate: calibre.FormatPublishedDate(book.ReleaseDate),
-		Rating:        book.AverageRating,
-		Identifiers:   calibre.IdentifiersForBook(book, edition),
-	}
-	if author != nil {
-		meta.Authors = []string{author.Name}
-		meta.AuthorSort = author.SortName
-	}
-	imageURL := book.ImageURL
-	if edition != nil {
-		if strings.TrimSpace(edition.Publisher) != "" {
-			meta.Publisher = edition.Publisher
-		}
-		if edition.PublishDate != nil {
-			meta.PublishedDate = calibre.FormatPublishedDate(edition.PublishDate)
-		}
-		if strings.TrimSpace(edition.Language) != "" {
-			meta.Language = calibre.NormalizeLanguageForCalibre(edition.Language)
-		}
-		if strings.TrimSpace(edition.ImageURL) != "" {
-			imageURL = edition.ImageURL
+	clean := filepath.Clean(path)
+	var fileID int64
+	for _, f := range files {
+		if f.Format == models.MediaTypeEbook && filepath.Clean(f.Path) == clean {
+			fileID = f.ID
+			break
 		}
 	}
-	if mode == calibre.ModeCalibredb {
-		if coverPath, err := calibre.MaterializeCover(ctx, s.calibreCoverCacheDir, imageURL); err != nil {
-			slog.Debug("calibre: cover materialization skipped", "bookId", book.ID, "error", err)
-		} else if coverPath != "" {
-			meta.CoverPath = coverPath
-		}
+	if fileID == 0 {
+		slog.Warn("calibre: could not queue the delivery, the file is not tracked under this book", "bookId", book.ID, "path", path)
+		return false
 	}
-	return meta
+	// The edition the download was grabbed for, when there was one. Without
+	// it the worker matches an edition by format at delivery time.
+	var editionID *int64
+	if dl != nil && dl.EditionID != nil && edition != nil && edition.ID == *dl.EditionID {
+		id := edition.ID
+		editionID = &id
+	}
+	queued, err := s.calibreQueue.Enqueue(ctx, book.ID, fileID, editionID, path)
+	if err != nil {
+		slog.Warn("calibre: could not queue the delivery", "bookId", book.ID, "path", path, "error", err)
+		return false
+	}
+	if queued {
+		slog.Debug("calibre: delivery queued", "mode", mode, "bookId", book.ID, "path", path)
+	}
+	return queued
 }
 
 func firstString(values ...*string) string {

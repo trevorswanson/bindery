@@ -15,6 +15,12 @@ export interface NotificationConfig {
   onUpgrade: boolean
   onFailure: boolean
   onHealth: boolean
+  // onBookAnnounced fires when a refresh or scheduled discovery adds books to
+  // an author already in the library (#2236). Off unless turned on.
+  onBookAnnounced: boolean
+  // Fires when a requester asks for a book or an author. Optional so an
+  // older backend's response still type checks.
+  onRequestCreated?: boolean
   enabled: boolean
 }
 

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/metadata"
 	"github.com/vavallee/bindery/internal/models"
 )
 
@@ -36,6 +37,19 @@ func (f *fakeGoodreadsResolver) SearchBooks(_ context.Context, query string) ([]
 		}
 	}
 	return nil, nil
+}
+
+// ResolveBookByISBNWithOutcome and SearchBooksWithOutcome are the lookups the
+// importer calls. The fake never loses a provider, so every outcome is clean;
+// the guard itself is exercised against a real aggregator further down.
+func (f *fakeGoodreadsResolver) ResolveBookByISBNWithOutcome(ctx context.Context, isbn string) (*models.Book, metadata.SearchOutcome, error) {
+	b, err := f.ResolveBookByISBN(ctx, isbn)
+	return b, metadata.SearchOutcome{}, err
+}
+
+func (f *fakeGoodreadsResolver) SearchBooksWithOutcome(ctx context.Context, query string) ([]models.Book, metadata.SearchOutcome, error) {
+	b, err := f.SearchBooks(ctx, query)
+	return b, metadata.SearchOutcome{}, err
 }
 
 // bookWithAuthor builds a metadata-provider book carrying a resolvable author.
@@ -427,5 +441,128 @@ func TestGoodreadsImporter_PreviewAndCommit(t *testing.T) {
 	// A second commit with the same token must fail — the token is consumed.
 	if _, err := imp.Commit(ctx, preview.Token); err == nil {
 		t.Error("expected an error committing a consumed token")
+	}
+}
+
+// goodreadsGuardRow is a row both lookups can resolve: the ISBN walk and,
+// with the ISBN left out, the title and author search.
+func goodreadsGuardRow(withISBN bool) GoodreadsRow {
+	row := GoodreadsRow{RowNumber: 1, Title: "Project Hail Mary", Author: guardAuthorName, ExclusiveShelf: GoodreadsShelfToRead}
+	if withISBN {
+		row.ISBN13 = "9780593135204"
+	}
+	return row
+}
+
+// TestGoodreadsImport_PrimaryTimeoutDoesNotBindFallback is the Goodreads side
+// of #2332, run through a real aggregator on both resolution paths. With
+// OpenLibrary timing out, the DNB match must come back unresolved with the
+// reason, and committing the preview must not create the DNB author.
+func TestGoodreadsImport_PrimaryTimeoutDoesNotBindFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  GoodreadsRow
+	}{
+		{"isbn lookup", goodreadsGuardRow(true)},
+		{"title and author search", goodreadsGuardRow(false)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database := newTestDB(t)
+			authors := db.NewAuthorRepo(database)
+			books := db.NewBookRepo(database)
+			ctx := context.Background()
+
+			rows := ResolveGoodreadsRows(ctx, []GoodreadsRow{tc.row}, GoodreadsImportOptions{}, olTimesOutDNBAnswers(), books, 0)
+			if len(rows) != 1 {
+				t.Fatalf("rows = %d, want 1", len(rows))
+			}
+			if rows[0].Outcome != outcomeUnresolved {
+				t.Errorf("outcome = %q, want %q", rows[0].Outcome, outcomeUnresolved)
+			}
+			if !strings.Contains(rows[0].Reason, "openlibrary did not answer") {
+				t.Errorf("reason = %q, want it to name the provider that did not answer", rows[0].Reason)
+			}
+
+			commit := CommitGoodreadsImport(ctx, rows, authors, nil, books)
+			if commit.Added != 0 {
+				t.Errorf("committed %d books, want 0", commit.Added)
+			}
+			assertNoAuthorBound(t, authors, dnbAuthorID)
+		})
+	}
+}
+
+// TestGoodreadsImport_StoresResolvedProvider: a committed author carries the
+// provider its foreign id belongs to. The stubs leave the record's own
+// MetadataProvider empty, which is the case the old "openlibrary" fallback
+// filled in (#2332).
+func TestGoodreadsImport_StoresResolvedProvider(t *testing.T) {
+	for _, tc := range allowedBindCases {
+		t.Run(tc.name, func(t *testing.T) {
+			database := newTestDB(t)
+			authors := db.NewAuthorRepo(database)
+			books := db.NewBookRepo(database)
+			ctx := context.Background()
+
+			rows := ResolveGoodreadsRows(ctx, []GoodreadsRow{goodreadsGuardRow(true)}, GoodreadsImportOptions{}, tc.agg(), books, 0)
+			if len(rows) != 1 || rows[0].Outcome != outcomeResolved {
+				t.Fatalf("rows = %+v, want one resolved", rows)
+			}
+			commit := CommitGoodreadsImport(ctx, rows, authors, nil, books)
+			if commit.Added != 1 {
+				t.Fatalf("commit = %+v, want one added", commit)
+			}
+			assertAuthorBound(t, authors, tc.wantID, tc.wantProvider)
+		})
+	}
+}
+
+// TestGoodreadsImport_PrimaryDownNoMatchSaysRetry: with the primary down and
+// nothing else matching, the reason must not read as a bad ISBN. The wiki
+// tells users to fix the failed rows and upload them again, so a wrong reason
+// here has them editing correct data.
+func TestGoodreadsImport_PrimaryDownNoMatchSaysRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  GoodreadsRow
+	}{
+		{"row with isbn", goodreadsGuardRow(true)},
+		{"row without isbn", goodreadsGuardRow(false)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agg := metadata.NewAggregator(failingProvider("openlibrary", errOpenLibraryTimeout), failingProvider("dnb", nil))
+			rows := ResolveGoodreadsRows(context.Background(), []GoodreadsRow{tc.row}, GoodreadsImportOptions{}, agg, nil, 0)
+			if len(rows) != 1 || rows[0].Outcome != outcomeUnresolved {
+				t.Fatalf("rows = %+v, want one unresolved", rows)
+			}
+			if rows[0].Reason != wantPrimaryDownReason {
+				t.Errorf("reason = %q, want %q", rows[0].Reason, wantPrimaryDownReason)
+			}
+		})
+	}
+}
+
+// TestGoodreadsImport_NoMatchNamesProviders: a genuine miss names the
+// providers that answered, so a Hardcover primary's miss does not read as
+// OpenLibrary's or as a generic one.
+func TestGoodreadsImport_NoMatchNamesProviders(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  GoodreadsRow
+		want string
+	}{
+		{"row with isbn", goodreadsGuardRow(true), "no match on hardcover, dnb for ISBN or title+author"},
+		{"row without isbn", goodreadsGuardRow(false), "no match on hardcover, dnb (row has no ISBN; title+author search found nothing)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agg := metadata.NewAggregator(failingProvider("hardcover", nil), failingProvider("dnb", nil))
+			rows := ResolveGoodreadsRows(context.Background(), []GoodreadsRow{tc.row}, GoodreadsImportOptions{}, agg, nil, 0)
+			if len(rows) != 1 || rows[0].Outcome != outcomeUnresolved {
+				t.Fatalf("rows = %+v, want one unresolved", rows)
+			}
+			if rows[0].Reason != tc.want {
+				t.Errorf("reason = %q, want %q", rows[0].Reason, tc.want)
+			}
+		})
 	}
 }

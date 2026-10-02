@@ -29,6 +29,7 @@ vi.mock('react-i18next', () => ({
         'history.title': 'History',
         'history.allEventTypes': 'All event types',
         'history.empty': 'No history events found',
+        'history.emptyHint': 'Grabs, imports and failures land here as they happen.',
         'history.colEvent': 'Event',
         'history.colSourceTitle': 'Source Title',
         'history.colType': 'Type',
@@ -250,6 +251,8 @@ describe('HistoryPage', () => {
     renderHistoryPage()
 
     expect(await screen.findByText('No history events found')).toBeInTheDocument()
+    // The bare line got a hint, so History reads like Queue, Discover and Import.
+    expect(screen.getByText('Grabs, imports and failures land here as they happen.')).toBeInTheDocument()
     expect(api.listHistory).toHaveBeenCalledWith({ eventType: undefined, limit: 100, offset: 0 })
   })
 
@@ -294,5 +297,46 @@ describe('HistoryPage', () => {
     // still be offered so filtering can surface older events.
     expect(within(filter).getByRole('option', { name: 'Download Requeued' })).toBeInTheDocument()
     expect(within(filter).getByRole('option', { name: 'Book Rebound' })).toBeInTheDocument()
+  })
+
+  it('shows the formats a multi format import delivered, and falls back to the path on older rows (#2764)', async () => {
+    vi.mocked(api.listHistory).mockResolvedValue({
+      items: [
+        makeHistory({
+          id: 1,
+          eventType: 'bookImported',
+          sourceTitle: 'Multi Format Release',
+          data: JSON.stringify({
+            path: '/library/Author/Multi Format Book',
+            format: 'ebook',
+            formats: 'azw3, epub, mobi',
+            fileCount: '3',
+          }),
+        }),
+        makeHistory({
+          id: 2,
+          eventType: 'bookImported',
+          sourceTitle: 'Legacy Release',
+          data: JSON.stringify({ path: '/library/Author/Legacy.epub', format: 'ebook' }),
+        }),
+      ],
+      total: 2,
+      limit: 100,
+      offset: 0,
+    })
+
+    renderHistoryPage()
+    const table = await findDesktopTable()
+    expect(await within(table).findByText('Multi Format Release')).toBeInTheDocument()
+
+    const multiRow = rowFor('Multi Format Release')
+    expect(
+      within(multiRow).getByText('azw3, epub, mobi \u00b7 /library/Author/Multi Format Book'),
+    ).toBeInTheDocument()
+
+    // A row written before #2764 has no formats key and must still render the
+    // path it has always shown.
+    const legacyRow = rowFor('Legacy Release')
+    expect(within(legacyRow).getByText('/library/Author/Legacy.epub')).toBeInTheDocument()
   })
 })

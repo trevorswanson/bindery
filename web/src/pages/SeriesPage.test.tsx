@@ -61,6 +61,39 @@ describe('SeriesPage', () => {
     vi.mocked(api.searchHardcoverSeries).mockResolvedValue([])
   })
 
+  it('filters series by title and restores the list when search is cleared', async () => {
+    renderSeriesPage([
+      { id: 1, foreignSeriesId: 'series-1', title: 'The Stormlight Archive', description: '', monitored: true, books: [] },
+      { id: 2, foreignSeriesId: 'series-2', title: 'Café Chronicles', description: '', monitored: false, books: [] },
+    ])
+
+    expect(await screen.findByRole('heading', { name: 'The Stormlight Archive' })).toBeInTheDocument()
+    const search = screen.getByRole('searchbox', { name: 'Search series...' })
+    fireEvent.change(search, { target: { value: '  CAFE  ' } })
+    expect(screen.getByRole('heading', { name: 'Café Chronicles' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'The Stormlight Archive' })).not.toBeInTheDocument()
+
+    fireEvent.change(search, { target: { value: 'missing series' } })
+    expect(screen.getByRole('status')).toHaveTextContent('No series match "missing series"')
+    expect(screen.queryByRole('heading', { level: 3 })).not.toBeInTheDocument()
+    expect(screen.queryByText(/Series are populated automatically/)).not.toBeInTheDocument()
+
+    fireEvent.change(search, { target: { value: '' } })
+    expect(screen.getByRole('heading', { name: 'The Stormlight Archive' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Café Chronicles' })).toBeInTheDocument()
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect(api.listSeries).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the empty-library guidance when there are no series to search', async () => {
+    renderSeriesPage([])
+
+    expect(await screen.findByText('No series found')).toBeInTheDocument()
+    fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'Stormlight' } })
+    expect(screen.getByText(/Series are populated automatically/)).toBeInTheDocument()
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+
   it('hides Hardcover controls when enhanced Hardcover API is disabled', async () => {
     renderSeriesPage([
       {
@@ -93,6 +126,29 @@ describe('SeriesPage', () => {
     fireEvent.click(screen.getByRole('heading', { name: 'The Stormlight Archive' }))
     expect(screen.queryByText(/Hardcover:/)).not.toBeInTheDocument()
     expect(api.getSeriesHardcoverDiff).not.toHaveBeenCalled()
+  })
+
+  it('does not promise automatic checks the code never runs', async () => {
+    // series.monitored is written by this toggle and read back for display,
+    // and nothing else consumes it: no scheduled job checks a series for new
+    // books and Fill gaps ignores the flag. The label used to say "Monitor
+    // series" / "Monitored", which is what led to #2523. It must not claim
+    // recurring attention until something actually schedules it.
+    renderSeriesPage([{
+      id: 13,
+      foreignSeriesId: 'series-13',
+      title: 'Mistborn',
+      description: '',
+      monitored: true,
+      books: [],
+    }])
+
+    await screen.findByRole('heading', { name: 'Mistborn' })
+    expect(screen.getByText('Shortlisted')).toBeInTheDocument()
+    expect(screen.queryByText('Monitored')).toBeNull()
+    expect(screen.queryByRole('switch', { name: /monitor/i })).toBeNull()
+    const toggle = screen.getByRole('switch', { name: /shortlist/i })
+    expect(toggle).toHaveAttribute('title', expect.stringContaining('does not yet check'))
   })
 
   it('offers a genre override before a series has books', async () => {
@@ -188,6 +244,76 @@ describe('SeriesPage', () => {
 
     const bookLink = screen.getByRole('link', { name: /Defiance of the Fall 2/ })
     expect(bookLink).toHaveAttribute('href', '/book/102')
+  })
+
+  it('does not count an excluded book as missing and marks it excluded (#2324)', async () => {
+    renderSeriesPage(
+      [
+        {
+          id: 30,
+          foreignSeriesId: 'series-30',
+          title: 'Foundation',
+          description: '',
+          monitored: true,
+          books: [
+            {
+              seriesId: 30,
+              bookId: 201,
+              positionInSeries: '1',
+              book: {
+                id: 201,
+                foreignBookId: 'book-201',
+                authorId: 5,
+                title: 'Foundation',
+                description: '',
+                imageUrl: '',
+                releaseDate: '1951-01-01',
+                genres: [],
+                monitored: true,
+                status: 'imported',
+                filePath: '',
+                mediaType: 'ebook',
+                ebookFilePath: '',
+                audiobookFilePath: '',
+                excluded: false,
+              },
+            },
+            {
+              seriesId: 30,
+              bookId: 202,
+              positionInSeries: '2',
+              book: {
+                id: 202,
+                foreignBookId: 'book-202',
+                authorId: 5,
+                title: 'Second Foundation',
+                description: '',
+                imageUrl: '',
+                releaseDate: '1953-01-01',
+                genres: [],
+                monitored: true,
+                status: 'wanted',
+                filePath: '',
+                mediaType: 'ebook',
+                ebookFilePath: '',
+                audiobookFilePath: '',
+                excluded: true,
+              },
+            },
+          ],
+        },
+      ],
+      { version: 'dev', commit: 'unknown', buildDate: '', enhancedHardcoverApi: false, hardcoverTokenConfigured: true },
+    )
+
+    // The only outstanding book is one the user excluded, so the series is not
+    // missing anything and the amber "missing" pill must not show.
+    const heading = await screen.findByRole('heading', { name: 'Foundation' })
+    expect(screen.queryByText('1 missing')).not.toBeInTheDocument()
+
+    // The excluded book carries an "Excluded" marker, not shown as a plain wanted book.
+    fireEvent.click(heading)
+    expect(await screen.findByText('Excluded')).toBeInTheDocument()
   })
 
   it('opens the Hardcover series link modal from the Search control', async () => {

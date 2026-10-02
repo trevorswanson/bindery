@@ -162,8 +162,22 @@ func (r *EditionRepo) UpsertMetadata(ctx context.Context, e *models.Edition) (bo
 	if e == nil || strings.TrimSpace(e.ForeignID) == "" || e.BookID == 0 {
 		return false, nil
 	}
-	if strings.TrimSpace(e.Title) == "" {
+	for _, value := range []*string{&e.Title, &e.Publisher, &e.Format, &e.Language, &e.ImageURL, &e.EditionInfo} {
+		*value = strings.TrimSpace(*value)
+	}
+	if e.Title == "" {
 		e.Title = "Unknown Edition"
+	}
+	for _, value := range []**string{&e.ISBN13, &e.ISBN10, &e.ASIN} {
+		if *value == nil {
+			continue
+		}
+		trimmed := strings.TrimSpace(**value)
+		if trimmed == "" {
+			*value = nil
+		} else {
+			*value = &trimmed
+		}
 	}
 
 	now := time.Now().UTC()
@@ -172,31 +186,44 @@ func (r *EditionRepo) UpsertMetadata(ctx context.Context, e *models.Edition) (bo
 		isEbook = 1
 	}
 	monitored := 1
+	// SQLite TRIM defaults to ASCII space; include Go's Unicode White_Space set
+	// so legacy blank text uses the same rule as incoming strings.TrimSpace.
+	const metadataWhitespace = " \t\n\v\f\r\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+	// Column names below are constants, never provider input. Preserve meaningful
+	// stored values verbatim, including any surrounding whitespace.
+	fillMissingText := func(column string) string {
+		return fmt.Sprintf("CASE WHEN TRIM(COALESCE(editions.%[1]s, ''), @whitespace) = '' THEN excluded.%[1]s ELSE editions.%[1]s END", column)
+	}
 
-	res, err := r.db.ExecContext(ctx, `
+	//nolint:gosec // G201: expressions contain only fixed column names; all metadata is bound below.
+	query := fmt.Sprintf(`
 		INSERT INTO editions (foreign_id, book_id, title, isbn_13, isbn_10, asin,
 		                      publisher, publish_date, format, num_pages, language,
 		                      image_url, is_ebook, edition_info, monitored,
 		                      created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(foreign_id) DO UPDATE SET
-		    title       = COALESCE(NULLIF(editions.title, ''), excluded.title),
-		    isbn_13     = COALESCE(NULLIF(editions.isbn_13, ''), excluded.isbn_13),
-		    isbn_10     = COALESCE(NULLIF(editions.isbn_10, ''), excluded.isbn_10),
-		    asin        = COALESCE(NULLIF(editions.asin, ''), excluded.asin),
-		    publisher   = COALESCE(NULLIF(editions.publisher, ''), excluded.publisher),
+		    title       = %s,
+		    isbn_13     = %s,
+		    isbn_10     = %s,
+		    asin        = %s,
+		    publisher   = %s,
 		    publish_date= COALESCE(editions.publish_date, excluded.publish_date),
-		    format      = COALESCE(NULLIF(editions.format, ''), excluded.format),
+		    format      = %s,
 		    num_pages   = COALESCE(editions.num_pages, excluded.num_pages),
-		    language    = COALESCE(NULLIF(editions.language, ''), excluded.language),
-		    image_url   = COALESCE(NULLIF(editions.image_url, ''), excluded.image_url),
+		    language    = %s,
+		    image_url   = %s,
 		    is_ebook    = CASE WHEN editions.is_ebook = 1 THEN 1 ELSE excluded.is_ebook END,
-		    edition_info= COALESCE(NULLIF(editions.edition_info, ''), excluded.edition_info),
+		    edition_info= %s,
 		    updated_at  = excluded.updated_at
 		WHERE editions.book_id = excluded.book_id`,
+		fillMissingText("title"), fillMissingText("isbn_13"), fillMissingText("isbn_10"), fillMissingText("asin"),
+		fillMissingText("publisher"), fillMissingText("format"), fillMissingText("language"), fillMissingText("image_url"), fillMissingText("edition_info"))
+	res, err := r.db.ExecContext(ctx, query,
 		e.ForeignID, e.BookID, e.Title, e.ISBN13, e.ISBN10, e.ASIN,
 		e.Publisher, timeArg(e.PublishDate), e.Format, e.NumPages, e.Language,
-		e.ImageURL, isEbook, e.EditionInfo, monitored, timeValueArg(now), timeValueArg(now))
+		e.ImageURL, isEbook, e.EditionInfo, monitored, timeValueArg(now), timeValueArg(now),
+		sql.Named("whitespace", metadataWhitespace))
 	if err != nil {
 		return false, fmt.Errorf("upsert metadata edition %s: %w", e.ForeignID, err)
 	}
@@ -254,6 +281,45 @@ func (r *EditionRepo) Delete(ctx context.Context, id int64) error {
 	_, err := r.exec.ExecContext(ctx, `DELETE FROM editions WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete edition %d: %w", id, err)
+	}
+	return nil
+}
+
+// ListWithLocalImagePath returns the editions whose image_url is an absolute
+// filesystem path rather than a URL. Before #2564 the Calibre importer stored
+// the library's cover.jpg path there verbatim; the startup repair rewrites
+// those rows into servable references.
+func (r *EditionRepo) ListWithLocalImagePath(ctx context.Context) ([]models.Edition, error) {
+	rows, err := r.exec.QueryContext(ctx, `
+		SELECT id, foreign_id, book_id, title, isbn_13, isbn_10, asin, publisher,
+		       publish_date, format, num_pages, language, image_url, is_ebook,
+		       edition_info, monitored, created_at, updated_at
+		FROM editions WHERE image_url LIKE '/%' OR image_url LIKE '_:\%' ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list editions with local image path: %w", err)
+	}
+	defer rows.Close()
+	var out []models.Edition
+	for rows.Next() {
+		e, err := scanEditionFrom(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan edition: %w", err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate editions: %w", err)
+	}
+	return out, nil
+}
+
+// SetImageURL replaces one edition's image_url without touching any other
+// column.
+func (r *EditionRepo) SetImageURL(ctx context.Context, id int64, imageURL string) error {
+	_, err := r.exec.ExecContext(ctx, `UPDATE editions SET image_url = ?, updated_at = ? WHERE id = ?`,
+		imageURL, timeValueArg(time.Now().UTC()), id)
+	if err != nil {
+		return fmt.Errorf("set edition %d image_url: %w", id, err)
 	}
 	return nil
 }

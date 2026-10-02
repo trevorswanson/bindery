@@ -6,6 +6,9 @@ import type { Page } from './common'
 export interface Author {
   id: number
   foreignAuthorId: string
+  // Set on metadata search results whose foreign id already matches a library
+  // author visible to the current user (#1227). It is the library row id.
+  libraryAuthorId?: number
   authorName: string
   sortName: string
   description: string
@@ -33,6 +36,9 @@ export interface Author {
   // What the last catalogue sync did with the provider's works (#1889).
   // Absent until the server has synced this author since it last started.
   lastSync?: AuthorSyncSummary
+  // True while a catalogue sync for this author is running on the server. Set
+  // on GET /author/{id} only; the page polls it after a manual Refresh (#2601).
+  syncInProgress?: boolean
   // Present on add-flow responses when the linked record syncs from a
   // provider other than the configured primary (#2237).
   providerMismatch?: AuthorProviderMismatch
@@ -82,9 +88,10 @@ export interface AuthorSyncSummary {
   // The first few dropped titles, capped server-side.
   skippedLanguageSample?: AuthorSyncSkippedBook[]
 
-  // The five fields below back the metadata-profile filters wired into
-  // author sync by PRs #1968, #2005, #2006, #2007, and #2008. Landed here
-  // first so those PRs rebase onto a type and notice that already exist.
+  // The six fields below back the metadata-profile filters wired into
+  // author sync by PRs #1968, #2005, #2006, #2007, #2008, and the
+  // min_edition_count filter (#2235). Landed here first so those PRs
+  // rebase onto a type and notice that already exist.
   skippedPartBooks?: number
   skippedPartBooksSample?: AuthorSyncSkippedBook[]
   skippedMissingDate?: number
@@ -95,6 +102,11 @@ export interface AuthorSyncSummary {
   skippedMinPagesSample?: AuthorSyncSkippedBook[]
   skippedMissingIsbn?: number
   skippedMissingIsbnSample?: AuthorSyncSkippedBook[]
+  // Works dropped because their title cluster reported fewer editions than
+  // the profile's minEditionCount floor. A work with no known edition count
+  // passes (unknown, not zero), matching skippedMinPages' semantics.
+  skippedThinCluster?: number
+  skippedThinClusterSample?: AuthorSyncSkippedBook[]
 }
 
 export interface AuthorSyncSkippedBook {
@@ -122,6 +134,14 @@ export interface RelinkAuthorCandidate {
   authorName?: string
 }
 
+// RelinkAuthorLinkCandidate is one row of the relink picker. previouslyLinked
+// marks a record this author used to be linked to and is no longer (#2688).
+// The server returns those rows instead of hiding them, so relinking is not a
+// one way door; the flag is a label, not a reason to skip the row.
+export interface RelinkAuthorLinkCandidate extends Author {
+  previouslyLinked?: boolean
+}
+
 export interface MergeAuthorsResult {
   BooksReparented: number
   AliasesMigrated: number
@@ -130,7 +150,6 @@ export interface MergeAuthorsResult {
 }
 
 export type CatalogueReconciliationReason =
-  | 'provider_changed'
   | 'not_in_current_catalogue'
   | 'language_not_allowed'
   | 'part_book'
@@ -171,6 +190,31 @@ export interface CatalogueReconciliation {
   applied?: { requested: number; deleted: number; skipped: number }
 }
 
+// Detection rules for the read-only duplicate-title report (#1970). These are
+// the stable identifiers the API returns and the UI translates; the modal
+// explains each one in plain language.
+export type DuplicateRule =
+  | 'alnum-equal'
+  | 'article-strip'
+  | 'edition-suffix'
+  | 'substring'
+
+export interface DuplicateCandidateMember extends Book {
+  rules: DuplicateRule[]
+}
+
+export interface DuplicateCandidateGroup {
+  key: string
+  rules: DuplicateRule[]
+  books: DuplicateCandidateMember[]
+}
+
+export interface DuplicateCandidates {
+  authorId: number
+  groups: DuplicateCandidateGroup[]
+  count: number
+}
+
 export type MediaType = 'ebook' | 'audiobook' | 'both'
 export type AuthorMonitorMode = 'all' | 'future' | 'latest' | 'none' | 'series'
 export type MonitorNewItems = 'all' | 'none'
@@ -181,6 +225,7 @@ export interface AddAuthorRequest {
   monitored: boolean
   monitorMode?: AuthorMonitorMode
   monitorLatestCount?: number
+  monitorNewItems?: MonitorNewItems
   searchOnAdd: boolean
   metadataProfileId?: number | null
   qualityProfileId?: number | null
@@ -253,8 +298,10 @@ export const authorsApi = {
       method: 'POST',
       body: JSON.stringify({ bookIds }),
     }),
+  listAuthorDuplicateCandidates: (id: number) =>
+    request<DuplicateCandidates>(`/author/${id}/duplicate-candidates`),
   searchAuthorLinkCandidates: (id: number, term: string) =>
-    request<Author[]>(`/author/${id}/relink-upstream/candidates?term=${encodeURIComponent(term)}`),
+    request<RelinkAuthorLinkCandidate[]>(`/author/${id}/relink-upstream/candidates?term=${encodeURIComponent(term)}`),
   relinkAuthorUpstream: (id: number, candidate?: RelinkAuthorCandidate) =>
     request<Author>(`/author/${id}/relink-upstream`, {
       method: 'POST',

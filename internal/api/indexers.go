@@ -50,6 +50,9 @@ func (s *lastDebugStore) get(userID int64) *indexer.SearchDebug {
 type indexerSearcher interface {
 	SearchBookWithDebug(ctx context.Context, indexers []models.Indexer, c indexer.MatchCriteria) ([]newznab.SearchResult, *indexer.SearchDebug)
 	SearchQuery(ctx context.Context, indexers []models.Indexer, query string) []newznab.SearchResult
+	// Cooldown reports whether the searcher is holding off on idx after a
+	// rate limit, and until when.
+	Cooldown(idx models.Indexer) (until time.Time, reason string, held bool)
 }
 
 type IndexerHandler struct {
@@ -127,6 +130,7 @@ const indexerQueryWindow = 24 * time.Hour
 // leaves the field nil, which renders as "no usage known" rather than failing
 // the whole list request over a decoration.
 func (h *IndexerHandler) withQueryUsage(ctx context.Context, idxs []models.Indexer) []models.Indexer {
+	idxs = h.withCooldown(idxs)
 	capped := false
 	for _, idx := range idxs {
 		if idx.DailyQueryLimit != nil && *idx.DailyQueryLimit > 0 {
@@ -148,6 +152,25 @@ func (h *IndexerHandler) withQueryUsage(ctx context.Context, idxs []models.Index
 		}
 		used := usage[idxs[i].ID]
 		idxs[i].DailyQueriesUsed = &used
+	}
+	return idxs
+}
+
+// withCooldown fills the response-only CooldownUntil and CooldownReason on
+// every indexer the searcher is holding off on, so a rate limit is visible on
+// the Indexers tab rather than only in a search's details panel. The state
+// lives in the searcher's memory, so it is exact and costs no query.
+func (h *IndexerHandler) withCooldown(idxs []models.Indexer) []models.Indexer {
+	if h.searcher == nil {
+		return idxs
+	}
+	for i := range idxs {
+		until, reason, held := h.searcher.Cooldown(idxs[i])
+		if !held {
+			continue
+		}
+		idxs[i].CooldownUntil = &until
+		idxs[i].CooldownReason = &reason
 	}
 	return idxs
 }
@@ -503,12 +526,16 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	crit := indexer.MatchCriteria{
-		Title:            book.Title,
+		Title:            indexer.SearchTitle(*book, allowedLangs),
 		Author:           authorName,
 		MediaType:        book.MediaType,
 		ASIN:             book.ASIN,
 		AllowedLanguages: allowedLangs,
 		AuthorAliases:    authorAliases,
+		// The searcher ranks by the profile's order (#2733); the same profile
+		// builds the QualityAllowed annotation below, so the book page's
+		// order and its approved flags come from one definition.
+		Profile: qualityProfile,
 	}
 	if book.ReleaseDate != nil {
 		crit.Year = book.ReleaseDate.Year()
@@ -528,6 +555,8 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	var results []newznab.SearchResult
 	var dbg *indexer.SearchDebug
 	if book.MediaType == models.MediaTypeBoth {
+		// Both legs copy crit, so each carries the profile and ranks by its
+		// own list: ebooks by the ebook list, audiobooks by the audiobook list.
 		ebookCrit := crit
 		ebookCrit.MediaType = models.MediaTypeEbook
 		audioCrit := crit
@@ -558,6 +587,11 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		audioOut := <-audioCh
 		ebookResults, ebookDbg := ebookOut.results, ebookOut.dbg
 		audioResults, audioDbg := audioOut.results, audioOut.dbg
+		// The ebook block then the audiobook block, as it has always been.
+		// What is new is that each block is ranked by its own list, and the
+		// two legs' scores are not comparable (each list ranks n down to 1
+		// over its own length), so concatenating rather than interleaving by
+		// score is now load bearing rather than incidental.
 		results = append(ebookResults, audioResults...)
 		results = indexer.DedupeResults(results)
 		// Merge debug info from both searches.
@@ -616,8 +650,11 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	specs = append(specs, decision.AlreadyImportedSpec{})
 
 	// Allowed-formats spec (#1693). Annotates only — see WithQualityProfiles.
+	// The media type decides which of the profile's two lists judges a release
+	// (#2733). For a dual-format book this is "both", which the spec ignores in
+	// favour of the per-result media type the two legs stamped above.
 	if qualityProfile != nil {
-		specs = append(specs, decision.QualityAllowed{Profile: qualityProfile})
+		specs = append(specs, decision.QualityAllowed{Profile: qualityProfile, MediaType: book.MediaType})
 	}
 
 	dm := decision.New(specs...)

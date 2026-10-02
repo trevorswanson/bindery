@@ -27,8 +27,9 @@ type ReadarrResult struct {
 }
 
 // ImportReadarr reads a Readarr SQLite database and ports its records
-// into Bindery. Authors are re-resolved via OpenLibrary (Goodreads IDs
-// are not portable since bookinfo.club is dead); indexers, download
+// into Bindery. Authors are resolved again against the metadata providers
+// (Goodreads IDs are not portable since bookinfo.club is dead), under the
+// same primary provider guard as the CSV import (#2332); indexers, download
 // clients, and blocklist entries port structurally.
 //
 // The onSearchOnAdd hook fires asynchronously for each newly-added
@@ -80,7 +81,8 @@ func ImportReadarr(
 }
 
 // importReadarrAuthors pulls each author's Name (from AuthorMetadata) and
-// Monitored flag from Readarr and re-resolves them against OpenLibrary. No
+// Monitored flag from Readarr and resolves them again against the metadata
+// providers. No
 // Goodreads IDs are trusted. Authors.Name does not exist in the Readarr
 // schema — the human-readable name lives in AuthorMetadata joined via
 // Authors.AuthorMetadataId.
@@ -96,6 +98,7 @@ func importReadarrAuthors(ctx context.Context, src *sql.DB, repo *db.AuthorRepo,
 	defer rows.Close()
 
 	var newlyAdded []*models.Author
+	outage := &primaryOutage{}
 
 	for rows.Next() {
 		var name string
@@ -109,7 +112,7 @@ func importReadarrAuthors(ctx context.Context, src *sql.DB, repo *db.AuthorRepo,
 		}
 		res.Requested++
 
-		full := resolveAndCreateAuthor(ctx, "readarr", name, monitored, repo, settings, agg, res)
+		full := resolveAndCreateAuthor(ctx, "readarr", name, monitored, repo, settings, agg, outage, res)
 		if full == nil {
 			continue
 		}

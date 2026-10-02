@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -10,6 +11,100 @@ import (
 
 	"github.com/vavallee/bindery/internal/models"
 )
+
+type mockAuthorWorkLanguageEvidenceProvider struct {
+	mockProvider
+	evidence map[string]AuthorWorkLanguageEvidence
+	err      error
+	calls    int
+	books    []models.Book
+	allowed  []string
+}
+
+func (m *mockAuthorWorkLanguageEvidenceProvider) GetAuthorWorkLanguageEvidence(_ context.Context, books []models.Book, allowed []string) (map[string]AuthorWorkLanguageEvidence, error) {
+	m.calls++
+	m.books = slices.Clone(books)
+	m.allowed = slices.Clone(allowed)
+	return m.evidence, m.err
+}
+
+func TestAggregator_GetAuthorWorkLanguageEvidence(t *testing.T) {
+	books := []models.Book{
+		{ForeignID: "hc:allowed"},
+		{ForeignID: "hc:foreign"},
+		{ForeignID: "hc:unknown"},
+	}
+	want := map[string]AuthorWorkLanguageEvidence{
+		"hc:allowed": {State: AuthorWorkLanguageAllowed, Language: "eng"},
+		"hc:foreign": {State: AuthorWorkLanguageNotAllowed, Language: "spa"},
+		"hc:unknown": {State: AuthorWorkLanguageIndeterminate},
+	}
+	provider := &mockAuthorWorkLanguageEvidenceProvider{
+		mockProvider: mockProvider{name: "hardcover"},
+		evidence:     want,
+	}
+	agg := newTestAggregator(provider)
+
+	got, err := agg.GetAuthorWorkLanguageEvidence(context.Background(), books, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("evidence = %#v, want %#v", got, want)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("provider calls = %d, want 1", provider.calls)
+	}
+	if len(provider.books) != len(books) || provider.books[1].ForeignID != books[1].ForeignID {
+		t.Fatalf("provider books = %+v, want %+v", provider.books, books)
+	}
+	if !slices.Equal(provider.allowed, []string{"eng"}) {
+		t.Fatalf("provider allowed languages = %v, want [eng]", provider.allowed)
+	}
+}
+
+func TestAggregator_GetAuthorWorkLanguageEvidence_UnsupportedOrUnrestricted(t *testing.T) {
+	t.Run("unsupported provider", func(t *testing.T) {
+		agg := newTestAggregator(&mockProvider{name: "openlibrary"})
+		got, err := agg.GetAuthorWorkLanguageEvidence(context.Background(), []models.Book{{ForeignID: "OL1W"}}, []string{"eng"})
+		if err != nil || got != nil {
+			t.Fatalf("evidence = %#v, err = %v; want nil, nil", got, err)
+		}
+	})
+
+	t.Run("unrestricted profile", func(t *testing.T) {
+		provider := &mockAuthorWorkLanguageEvidenceProvider{mockProvider: mockProvider{name: "hardcover"}}
+		agg := newTestAggregator(provider)
+		got, err := agg.GetAuthorWorkLanguageEvidence(context.Background(), []models.Book{{ForeignID: "hc:work"}}, nil)
+		if err != nil || got != nil {
+			t.Fatalf("evidence = %#v, err = %v; want nil, nil", got, err)
+		}
+		if provider.calls != 0 {
+			t.Fatalf("provider calls = %d, want 0 for an unrestricted profile", provider.calls)
+		}
+	})
+}
+
+func TestAggregator_GetAuthorWorkLanguageEvidence_DiscardsEvidenceOnError(t *testing.T) {
+	lookupErr := errors.New("language evidence unavailable")
+	want := map[string]AuthorWorkLanguageEvidence{
+		"hc:translated-default": {State: AuthorWorkLanguageIndeterminate},
+	}
+	provider := &mockAuthorWorkLanguageEvidenceProvider{
+		mockProvider: mockProvider{name: "hardcover"},
+		evidence:     want,
+		err:          lookupErr,
+	}
+	agg := newTestAggregator(provider)
+
+	got, err := agg.GetAuthorWorkLanguageEvidence(context.Background(), []models.Book{{ForeignID: "hc:translated-default", Language: "por"}}, []string{"eng"})
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("error = %v, want %v", err, lookupErr)
+	}
+	if got != nil {
+		t.Fatalf("evidence after error = %#v, want nil so scalar fallbacks remain authoritative", got)
+	}
+}
 
 func TestAggregator_GetAuthorWorks_WorksProvider(t *testing.T) {
 	books := []models.Book{{Title: "Dune"}, {Title: "Dune Messiah"}}
@@ -870,5 +965,54 @@ func TestAggregator_FillMissingAuthorWorkLanguages_NoOpWhenUnsupported(t *testin
 	}
 	if books[0].Language != "" {
 		t.Errorf("language should be untouched, got %q", books[0].Language)
+	}
+}
+
+// TestAggregator_GetAuthorWorksUnenriched_SkipsPerWorkCoverEnrichment pins the
+// contract the ABS title lookup relies on (#2578): the unenriched catalogue
+// comes back without one enricher round trip per coverless work, which is what
+// GetAuthorWorks does before answering. Once the enriched catalogue is cached
+// it is served as is, since it is a superset of what the caller needs.
+func TestAggregator_GetAuthorWorksUnenriched_SkipsPerWorkCoverEnrichment(t *testing.T) {
+	primary := &mockWorksProvider{mockProvider: mockProvider{
+		name: "openlibrary",
+		authorWorks: []models.Book{
+			{ForeignID: "OL1W", Title: "Work One"},
+			{ForeignID: "OL2W", Title: "Work Two"},
+			{ForeignID: "OL3W", Title: "Work Three"},
+		},
+	}}
+	enricher := &mockProvider{name: "hardcover"}
+	agg := NewAggregator(primary, enricher)
+	ctx := context.Background()
+
+	works, err := agg.GetAuthorWorksUnenriched(ctx, "OL1A")
+	if err != nil {
+		t.Fatalf("GetAuthorWorksUnenriched: %v", err)
+	}
+	if len(works) != 3 {
+		t.Fatalf("works = %d, want 3", len(works))
+	}
+	if n := len(enricher.searchBookQueries); n != 0 {
+		t.Fatalf("enricher SearchBooks calls = %d, want 0 for the unenriched catalogue", n)
+	}
+
+	// The enriched path does fan out, one lookup per coverless work. This is
+	// the cost the unenriched call exists to avoid.
+	if _, err := agg.GetAuthorWorks(ctx, "OL1A"); err != nil {
+		t.Fatalf("GetAuthorWorks: %v", err)
+	}
+	if n := len(enricher.searchBookQueries); n != 3 {
+		t.Fatalf("enricher SearchBooks calls after GetAuthorWorks = %d, want 3", n)
+	}
+
+	// Cached now: a failing primary is not consulted again.
+	primary.authorWorksErr = context.DeadlineExceeded
+	cached, err := agg.GetAuthorWorksUnenriched(ctx, "OL1A")
+	if err != nil {
+		t.Fatalf("GetAuthorWorksUnenriched after cache fill: %v", err)
+	}
+	if len(cached) != 3 {
+		t.Fatalf("cached works = %d, want 3", len(cached))
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/vavallee/bindery/internal/auth"
 )
 
 // Config holds the application configuration loaded from environment variables.
@@ -36,7 +38,7 @@ type Config struct {
 	// OIDC role mapping (issue #688).
 	// OIDCDefaultRole is the role assigned to a freshly auto-provisioned OIDC
 	// user. Valid values: "user", "admin"; anything else falls back to "user".
-	OIDCDefaultRole string // BINDERY_OIDC_DEFAULT_ROLE (default "user")
+	OIDCDefaultRole string // BINDERY_OIDC_DEFAULT_ROLE: admin, user (default) or requester
 	// OIDCAdminGroup, when non-empty, makes the IdP authoritative for the admin
 	// role: on every OIDC login the user is promoted to admin if this group is
 	// present in the group claim, and demoted to user if absent.
@@ -101,7 +103,7 @@ func Load() *Config {
 		DataDir:                  envOr("BINDERY_DATA_DIR", defaultDataDir(runtime.GOOS, os.UserConfigDir)),
 		LogLevel:                 envOr("BINDERY_LOG_LEVEL", "info"),
 		APIKey:                   envOr("BINDERY_API_KEY", ""),
-		DownloadDir:              envOr("BINDERY_DOWNLOAD_DIR", "/downloads"),
+		DownloadDir:              envOr("BINDERY_DOWNLOAD_DIR", defaultDownloadDir(runtime.GOOS)),
 		AudiobookDownloadDir:     envOr("BINDERY_AUDIOBOOK_DOWNLOAD_DIR", ""),
 		LibraryDir:               envOr("BINDERY_LIBRARY_DIR", "/books"),
 		AudiobookDir:             envOr("BINDERY_AUDIOBOOK_DIR", ""),
@@ -153,6 +155,21 @@ func normalizeURLBase(raw string) string {
 	return s
 }
 
+// defaultDownloadDir is the BINDERY_DOWNLOAD_DIR used when the variable is not
+// set. Linux and macOS keep the historical `/downloads`. Windows has none: a
+// path with no drive letter there resolves against whatever drive Bindery
+// started on, so `/downloads` named a folder nobody created, and the health
+// check then insisted every client save under it (#2902). Unset is a state
+// the rest of Bindery already handles: no save path is sent, the health check
+// only asks that the client's folder exist, and Manual Import still allows the
+// library and root folders.
+func defaultDownloadDir(goos string) string {
+	if goos == "windows" {
+		return ""
+	}
+	return "/downloads"
+}
+
 // defaultDBPath resolves the platform-appropriate SQLite path. Linux keeps the
 // historical `/config/bindery.db` so existing Docker / Helm / bare-metal
 // deployments that bind-mount `/config` are unchanged. Windows and macOS
@@ -181,17 +198,16 @@ func defaultDataDir(goos string, userConfigDir func() (string, error)) string {
 	return "/config"
 }
 
-// normalizeOIDCRole validates the BINDERY_OIDC_DEFAULT_ROLE value. Only
-// "user" and "admin" are accepted (case-insensitive); anything else — typos,
-// empty, "Admin ", "moderator" — falls back to "user" so a misconfigured env
-// var can never silently grant unintended privileges.
+// normalizeOIDCRole validates the BINDERY_OIDC_DEFAULT_ROLE value. The three
+// role names ("admin", "user", "requester") are accepted case-insensitively;
+// anything else (typos, empty, "moderator") falls back to "user" so a
+// misconfigured env var can never silently grant unintended privileges.
 func normalizeOIDCRole(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "admin":
-		return "admin"
-	default:
-		return "user"
+	role := strings.ToLower(strings.TrimSpace(raw))
+	if auth.ValidRole(role) {
+		return role
 	}
+	return auth.RoleUser
 }
 
 func envOr(key, fallback string) string {

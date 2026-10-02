@@ -160,7 +160,14 @@ func (s *Scanner) proposedPathFor(ctx context.Context, book *models.Book, author
 	// than a false collision (or an endless (N)→(N+1) churn). Ebooks are single
 	// files and are not uniquified at import, so they skip this.
 	if audiobook {
-		dest = uniqueDirExcluding(dest, f.Path)
+		if isSingleFile(f.Path) {
+			if flattenedOntoFolderPath(f.Path, dest) {
+				return dest, ReorgStatusError, flattenedOntoFolderMsg
+			}
+			dest = s.singleFileAudiobookDest(ctx, book, author, seriesTitle, seriesNum, dest, f.Path)
+		} else {
+			dest = uniqueDirExcluding(dest, f.Path)
+		}
 	}
 
 	if filepath.Clean(dest) == filepath.Clean(f.Path) {
@@ -198,6 +205,41 @@ func (s *Scanner) proposedPathFor(ctx context.Context, book *models.Book, author
 		return dest, ReorgStatusCollision, "another book already tracks the destination path"
 	}
 	return dest, ReorgStatusMove, ""
+}
+
+func isSingleFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+// singleFileAudiobookDest mirrors the single-file import branch: join the
+// book's own ebook folder (#2686), otherwise uniquify with the file's current
+// folder treated as available so a file already in place stays a noop. The
+// file is named the way the import names it (#2900): from the audiobook file
+// template when one is set, otherwise its own name.
+func (s *Scanner) singleFileAudiobookDest(ctx context.Context, book *models.Book, author *models.Author, seriesTitle, seriesNum, destDir, current string) string {
+	if existing, merging := s.existingEbookDir(ctx, book); !merging || filepath.Clean(destDir) != existing {
+		destDir = uniqueDirExcluding(destDir, filepath.Dir(current))
+	}
+	return filepath.Join(destDir, s.singleAudiobookFileName(ctx, author, book, seriesTitle, seriesNum, current))
+}
+
+const flattenedOntoFolderMsg = "this audiobook file sits where its folder belongs and has lost its extension (#2894). " +
+	"Move it into a folder and restore its extension, use Forget this file on the book for the old path, then run a library scan"
+
+// flattenedOntoFolderPath reports whether a tracked single audiobook file is
+// what Rename files left behind before #2894 was fixed: the file was moved onto
+// its templated folder path itself (or the " (N)" variant it uniquified to), so
+// it has the folder's name and no audio extension. Older releases read this as
+// a noop. Proposing a move from here would bury the extensionless file one
+// level down in a " (2)" folder, so it is reported instead and left for the
+// manual recovery the message describes.
+func flattenedOntoFolderPath(path, destDir string) bool {
+	if IsAudioFile(path) {
+		return false
+	}
+	p, d := filepath.Clean(path), filepath.Clean(destDir)
+	return p == d || strings.HasPrefix(p, d+" (")
 }
 
 // uniqueDirExcluding mirrors UniqueDir but treats keep as if it were absent, so
@@ -271,6 +313,7 @@ func (s *Scanner) applyOne(ctx context.Context, fileID int64) ReorganizeMove {
 		return m
 	}
 
+	singleFile := isSingleFile(file.Path)
 	if err := s.moveTrackedFile(ctx, file, proposed); err != nil {
 		m.Status = ReorgStatusFailed
 		m.Message = err.Error()
@@ -288,6 +331,14 @@ func (s *Scanner) applyOne(ctx context.Context, fileID int64) ReorganizeMove {
 		return m
 	}
 
+	// A single file (an ebook, or a lone audiobook file) leaves its
+	// metadata.opf behind when it moves out of a folder, which both strands a
+	// stale sidecar and blocks the prune below from reclaiming the now-empty
+	// folder. An audiobook folder moves whole, so its sidecar travels with it
+	// and there is nothing to clean.
+	if singleFile {
+		removeOrphanedSidecar(filepath.Dir(file.Path), filepath.Dir(proposed))
+	}
 	pruneEmptyParents(filepath.Dir(file.Path), s.rootsForFormat(ctx, author, file.Format))
 	bookID := book.ID
 	s.createHistoryEvent(ctx, models.HistoryEventBookRenamed, book.Title, &bookID, map[string]string{
@@ -295,6 +346,25 @@ func (s *Scanner) applyOne(ctx context.Context, fileID int64) ReorganizeMove {
 		"to":     proposed,
 		"format": file.Format,
 	})
+
+	// Regenerate the metadata.opf sidecar (when the feature is on) so it
+	// reflects the current metadata — this is Reorganize's normal job for
+	// folder names, and the sidecar is exactly the same kind of "derived from
+	// the DB, stale until something re-derives it" artifact (#1970-adjacent
+	// design note: nothing else in the importer auto-refreshes on a plain
+	// metadata edit either; Reorganize is the one place that already
+	// re-touches disk with current metadata, so it's the natural hook).
+	// Gated here as well as inside writeOPFSidecar so resolveCalibreEdition —
+	// a per-file editions query — is not paid on every reorganized file for a
+	// feature that is off by default.
+	if s.opfSidecarEnabled(ctx) {
+		sidecarDir := proposed
+		if singleFile {
+			sidecarDir = filepath.Dir(proposed)
+		}
+		edition := s.resolveCalibreEdition(ctx, nil, book)
+		s.writeOPFSidecar(ctx, sidecarDir, s.rootsForFormat(ctx, author, file.Format), book, author, edition, seriesTitle, seriesNum)
+	}
 
 	m.Status = ReorgStatusMoved
 	return m

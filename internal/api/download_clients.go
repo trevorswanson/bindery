@@ -70,6 +70,13 @@ type DownloadClientHandler struct {
 	// settings is used only for the setup-funnel first-client marker; nil
 	// (as in tests) skips the marker.
 	settings *db.SettingsRepo
+	// roots are the library roots Diagnose compares against; nil means none.
+	roots *LibraryRoots
+	// hardlinkProbe replaces hardlinkableReason in tests that count probes.
+	hardlinkProbe func(a, b string) (bool, string)
+	// goos and fsTimeout override runtime.GOOS and diagnoseFSTimeout in tests.
+	goos      string
+	fsTimeout time.Duration
 }
 
 func NewDownloadClientHandler(clients *db.DownloadClientRepo) *DownloadClientHandler {

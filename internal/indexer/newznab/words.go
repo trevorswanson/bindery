@@ -1,6 +1,7 @@
 package newznab
 
 import (
+	"sort"
 	"strings"
 
 	"golang.org/x/text/unicode/norm"
@@ -15,6 +16,27 @@ var stopWords = map[string]bool{
 	"of": true, "in": true, "to": true, "by": true, "for": true,
 	"with": true, "at": true, "from": true, "is": true, "it": true,
 	"as": true, "on": true, "be": true,
+}
+
+// LongStopWords returns the stop words SigWords drops that are three bytes or
+// longer, sorted, so a caller can build a pattern for "a word SigWords would
+// have removed".
+//
+// The shorter ones need no listing: every stop word under three bytes is also
+// dropped by the length rule, along with words like "my" and "up" that are not
+// stop words at all, so a caller covers the whole short class with a character
+// count instead. Exported for indexer.phraseRegex, which has to allow exactly
+// these words to sit inside a phrase (#2465). Keeping one list rather than a
+// second copy over there is the point.
+func LongStopWords() []string {
+	out := make([]string, 0, len(stopWords))
+	for w := range stopWords {
+		if len(w) >= 3 {
+			out = append(out, w)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // SigWords returns the meaningful (non-stop, long enough) words from s.
@@ -52,6 +74,42 @@ func SigWords(s string) []string {
 		}
 	}
 	return out
+}
+
+// apostropheElidedReplacer turns both apostrophe forms into a separator so the
+// tokeniser sees the two words the apostrophe was joining.
+var apostropheElidedReplacer = strings.NewReplacer("'", " ", "\u2019", " ")
+
+// SigWordsElided tokenises s the way SigWords does, except that an apostrophe
+// is treated as a word separator rather than deleted.
+//
+// SigWords deletes apostrophes so that possessives collapse to one token
+// ("Ender's" -> "enders"), which is the form most release names use. That is
+// correct for the possessive convention but wrong for ELISION, where the
+// apostrophe joins a clitic to the following word: French "L'Outsider",
+// "Sac d'os", Italian "l'isola". Release names in those languages keep the
+// separator ("Stephen.King.L.Outsider.2018.FRENCH"), so the deleted form
+// yields the single token "loutsider", which no release can ever contain, and
+// the search returns zero results with no error (the #1643 class of bug).
+//
+// This returns the words of the SEPARATED reading, for use as a fallback when
+// the strict form matches nothing. It is not a replacement: the strict form
+// must be tried first, or possessives ("Ender's Game" vs "Enders.Game") stop
+// matching. Returns nil when s carries no apostrophe, so callers can skip the
+// fallback for free.
+func SigWordsElided(s string) []string {
+	if !strings.ContainsAny(s, "'\u2019") {
+		return nil
+	}
+	return SigWords(ElideApostrophes(s))
+}
+
+// ElideApostrophes rewrites both apostrophe forms as a space. Exported so a
+// caller that needs the separated reading of a title for a comparison other
+// than tokenisation (the title-identity gate) folds it the same way, instead
+// of carrying a second copy of the alphabet.
+func ElideApostrophes(s string) string {
+	return apostropheElidedReplacer.Replace(s)
 }
 
 // foldForSigWordMatch reduces a haystack through the same CHARACTER-REWRITING

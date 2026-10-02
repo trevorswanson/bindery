@@ -26,6 +26,7 @@ import (
 	oidcauth "github.com/vavallee/bindery/internal/auth/oidc"
 	"github.com/vavallee/bindery/internal/calibre"
 	"github.com/vavallee/bindery/internal/config"
+	"github.com/vavallee/bindery/internal/covers"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/downloader"
 	"github.com/vavallee/bindery/internal/grimmory"
@@ -431,18 +432,22 @@ func main() {
 	// The boot-time reads on the next two lines use ctxBoot because appCtx
 	// isn't constructed yet.
 	modeResolver := func() calibre.Mode { return api.LoadCalibreMode(appCtx, settingsRepo) }
+	// Both the mode and the client are resolved per delivery pass. The client
+	// used to be built once here from the boot-time mode, which meant
+	// switching mode in the UI, or correcting plugin_url, plugin_api_key or
+	// push_path_remap, did nothing until a restart, and the resulting no-op
+	// push was silent (#1355). The resolver caches by the settings that define
+	// the client, so passes still reuse one connection pool.
+	calibreLoadConfig := func() calibre.Config {
+		return api.LoadCalibreConfig(appCtx, settingsRepo)
+	}
+	calibreAdders := calibre.NewAdderResolver(calibreLoadConfig)
 	calibreCfg := api.LoadCalibreConfig(ctxBoot, settingsRepo)
-	currentMode := api.LoadCalibreMode(ctxBoot, settingsRepo)
-	if currentMode == calibre.ModePlugin {
-		pluginClient := calibre.NewPluginClient(calibreCfg.PluginURL, calibreCfg.PluginAPIKey).WithPushPathRemap(calibreCfg.PushPathRemap)
-		importScanner.WithCalibre(modeResolver, pluginClient)
+	switch api.LoadCalibreMode(ctxBoot, settingsRepo) {
+	case calibre.ModePlugin:
 		slog.Info("calibre integration enabled", "mode", "plugin", "url", calibreCfg.PluginURL)
-	} else {
-		calibreClient := calibre.New(calibreCfg)
-		importScanner.WithCalibre(modeResolver, calibreClient)
-		if currentMode == calibre.ModeCalibredb {
-			slog.Info("calibre integration enabled", "mode", "calibredb")
-		}
+	case calibre.ModeCalibredb:
+		slog.Info("calibre integration enabled", "mode", "calibredb")
 	}
 
 	// Library import (read side). Importer holds live progress state in
@@ -450,9 +455,43 @@ func main() {
 	// runs. A single instance is shared between the API handler and the
 	// startup-sync branch below — both paths share the "only one import
 	// at a time" guard.
+	// Covers Bindery stores itself (#2564): a Calibre library import copies
+	// each book's cover.jpg here and the image proxy serves it back as a
+	// bindery-cover: reference. Lives beside image-cache in the data dir
+	// but outside it, because the image cache evicts by age and these have
+	// no upstream to refetch from.
+	coverStore := covers.NewStore(filepath.Join(cfg.DataDir, "covers"))
 	calibreImporter := calibre.NewImporter(authorRepo, authorAliasRepo, bookRepo, editionRepo, settingsRepo).
 		WithRunTracking(calibreImportRunRepo, calibreSnapshotRepo, calibreProvenanceRepo).
-		WithSeries(seriesRepo)
+		WithSeries(seriesRepo).
+		WithCoverStore(coverStore)
+	// Remote covers are downloaded here before calibredb or the plugin can
+	// be handed one.
+	calibreCovers := calibre.CoverSource{Store: coverStore, CacheDir: filepath.Join(cfg.DataDir, "calibre-covers")}
+	// Calibre deliveries (#2832): imports queue each ebook file and kick the
+	// worker, and a one minute scheduler job retries whatever is still
+	// pending, so a book imported while Calibre is closed arrives once it is
+	// back. The jobs group drains an in-flight pass before the database
+	// closes.
+	calibreDeliveryRepo := db.NewCalibreDeliveryRepo(database)
+	calibreDeliverer := calibre.NewDeliverer(calibreDeliveryRepo, bookRepo,
+		modeResolver, calibreLoadConfig, calibreAdders.For).
+		WithMetadata(authorRepo, editionRepo, seriesRepo).
+		WithCovers(calibreCovers).
+		WithJobs(bgJobs).
+		// In pull (#2833) the plugin fetches from /bridge/v1 and the
+		// push pass stands down.
+		WithTransport(func() calibre.Transport { return api.LoadCalibreTransport(appCtx, settingsRepo) })
+	importScanner.WithCalibreDeliveries(modeResolver, calibreDeliverer)
+	// Rows written by importers older than #2564 hold the library's host
+	// path in editions.image_url; rewrite them into servable references now
+	// that the store exists. Runs in the background so a slow or unmounted
+	// library volume never delays startup, and it is safe to run again.
+	bgJobs.Go("calibre-cover-repair", func(ctx context.Context) {
+		if _, err := calibreImporter.RepairLocalCovers(ctx); err != nil {
+			slog.Warn("calibre cover repair failed", "error", err)
+		}
+	})
 	absImporter := abs.NewImporter(authorRepo, authorAliasRepo, bookRepo, editionRepo, seriesRepo, settingsRepo, absImportRunRepo, absImportRunEntityRepo, absProvenanceRepo, absReviewRepo, absConflictRepo).
 		WithVersion(version).
 		WithStoragePaths(cfg.LibraryDir, cfg.AudiobookDir, rootFolderRepo).
@@ -531,6 +570,7 @@ func main() {
 	// Register the Calibre importer as the 24-hour sync job. The scheduler
 	// only fires the job when the syncer is non-nil, so no guard needed here.
 	sched.WithCalibreSyncer(calibreImporter)
+	sched.WithCalibreDeliverer(calibreDeliverer)
 
 	// Recommendation engine (24-hour job, gated on recommendations.enabled).
 	recRepo := db.NewRecommendationRepo(database)
@@ -547,7 +587,8 @@ func main() {
 			return api.GetHardcoverAPIToken(ctx, settingsRepo)
 		}).
 		WithAudiobookEnricher(metaAgg).
-		WithJobs(bgJobs) // drain a manual "Sync now" on shutdown (#1854)
+		WithSearcher(sched). // immediate search for books a sync makes wanted (#2722)
+		WithJobs(bgJobs)     // drain a manual "Sync now" on shutdown (#1854)
 	sched.WithHardcoverSyncer(hcSyncer)
 	sched.WithLogRepo(logRepo, cfg.LogRetentionDays)
 
@@ -605,7 +646,8 @@ func main() {
 		WithLifetimeCtx(appCtx)
 	userMgmtHandler := api.NewUserManagementHandler(userRepo).
 		WithLocalAuthEnabled(cfg.LocalAuthEnabled)
-	searchHandler := api.NewSearchHandler(metaAgg)
+	searchHandler := api.NewSearchHandler(metaAgg, bookRepo, authorRepo)
+	librarySearchHandler := api.NewLibrarySearchHandler(authorRepo, bookRepo, seriesRepo)
 	// Library-root containment checker (Wave 1 / Bundle B): used by the book
 	// and author delete handlers to refuse on-disk removal of any path that
 	// isn't inside a configured root. Defaults to the legacy single-root env
@@ -618,7 +660,8 @@ func main() {
 		WithEditionHydration(editionRepo).
 		WithRoots(libraryRoots).
 		WithLifetimeCtx(appCtx).
-		WithJobs(bgJobs) // drain an in-flight author catalogue sync on shutdown (#2371)
+		WithNotifier(notif). // bookAnnounced when a refresh or discovery adds books (#2236)
+		WithJobs(bgJobs)     // drain an in-flight author catalogue sync on shutdown (#2371)
 	authorAliasHandler := api.NewAuthorAliasHandler(authorRepo, authorAliasRepo)
 	bookHandler := api.NewBookHandler(bookRepo, metaAgg, historyRepo, sched).
 		WithSettings(settingsRepo).
@@ -642,6 +685,7 @@ func main() {
 		WithHealth(downloadHealth).
 		WithStoragePaths(cfg.DownloadDir, cfg.AudiobookDownloadDir).
 		WithDownloadPathRemap(cfg.DownloadPathRemap).
+		WithRoots(libraryRoots).
 		WithLifetimeCtx(appCtx).
 		WithSettings(settingsRepo)
 	queueHandler := api.NewQueueHandler(downloadRepo, dlClientRepo, bookRepo, historyRepo).
@@ -664,7 +708,6 @@ func main() {
 	importScanner.WithRootFolders(rootFolderRepo)
 	importScanner.WithSeriesRepo(seriesRepo)
 	importScanner.WithEditions(editionRepo)
-	importScanner.WithCalibreCoverCache(filepath.Join(cfg.DataDir, "calibre-covers"))
 
 	// Startup check: warn if the configured default root folder no longer exists on disk.
 	if s, _ := settingsRepo.Get(ctxBoot, api.SettingDefaultLibraryRootFolderID); s != nil && s.Value != "" {
@@ -682,6 +725,18 @@ func main() {
 	}
 
 	libraryHandler := api.NewLibraryHandler(importScanner).WithSettings(settingsRepo)
+	// Library adoption: the scan stores the books it could not match, and the
+	// Import page's "In your library" view acts on them. Library roots, not
+	// importRoots: adoption only registers files already in the library.
+	unmatchedUnitRepo := db.NewUnmatchedUnitRepo(database)
+	importScanner.WithUnmatchedUnits(unmatchedUnitRepo)
+	adoptionHandler := api.NewAdoptionHandler(unmatchedUnitRepo, bookRepo, authorRepo, authorHandler, libraryRoots, importScanner, settingsRepo)
+	// Any claim present at startup belongs to a process that is gone.
+	if n, err := adoptionHandler.RecoverStaleClaims(ctxBoot, 0); err != nil {
+		slog.Warn("library adoption: could not recover abandoned claims", "error", err)
+	} else if n > 0 {
+		slog.Info("library adoption: recovered abandoned claims", "count", n)
+	}
 	fileHandler := api.NewFileHandler(bookRepo, cfg.LibraryDir, cfg.AudiobookDir).
 		WithRootFolders(rootFolderRepo)
 	historyHandler := api.NewHistoryHandler(historyRepo, blocklistRepo, bookRepo)
@@ -700,6 +755,7 @@ func main() {
 	customFormatHandler := api.NewCustomFormatHandler(customFormatRepo)
 	bulkHandler := api.NewBulkHandler(authorRepo, bookRepo, blocklistRepo, sched).
 		WithSeriesRepo(seriesRepo).
+		WithSettingsRepo(settingsRepo).
 		WithLifetimeCtx(appCtx).
 		// Bulk "refresh" reuses the per-author catalogue fetch (metadata only,
 		// never auto-grabs). Resolve the default media type per call so newly
@@ -714,12 +770,19 @@ func main() {
 	authorRefreshHandler := api.NewAuthorRefreshHandler(authorRepo, func(a *models.Author) {
 		authorHandler.RefreshAuthorBooks(a, false, authorHandler.ResolveDefaultMediaType(appCtx))
 	}).WithSettings(settingsRepo)
+	// Scheduled release discovery (#2236): an hourly tick checks a share of the
+	// monitored authors, stopped while Refresh all or refresh selected runs.
+	sched.WithAuthorDiscoverer(newAuthorDiscoverer(authorHandler.DiscoverAuthorBooks, func() bool {
+		return authorRefreshHandler.Running() || bulkHandler.RefreshRunning()
+	}))
 	backupHandler := api.NewBackupHandler(database, cfg.DBPath, cfg.DataDir)
 	rootFolderHandler := api.NewRootFolderHandler(rootFolderRepo)
 	logHandler := api.NewLogHandler(ring).WithLogRepo(logRepo).WithDBLogHandler(logDBHandler)
 	prowlarrHandler := api.NewProwlarrHandler(prowlarrRepo, indexerRepo).WithSettings(settingsRepo)
 	calibreHandler := api.NewCalibreHandler(settingsRepo).
-		WithLifetimeCtx(appCtx)
+		WithLifetimeCtx(appCtx).
+		WithLibraryRoot(cfg.LibraryDir).
+		WithBookFiles(db.NewBookFileRepo(database))
 	grimmoryHandler := api.NewGrimmoryHandler(settingsRepo).WithVersion(version)
 	grimmorySyncer := grimmory.NewSyncer(bookRepo, grimmoryPusher).WithJobs(bgJobs) // drain mid-upload syncs on shutdown (#1458)
 	grimmorySyncHandler := api.NewGrimmorySyncHandler(grimmorySyncer, grimmoryLoadPushCfg).
@@ -736,17 +799,25 @@ func main() {
 		return api.LoadCalibreConfig(appCtx, settingsRepo)
 	})
 	calibreRunsHandler := api.NewCalibreRunsHandler(calibreImporter)
-	calibreSyncer := calibre.NewSyncer(bookRepo).WithMetadata(authorRepo, editionRepo)
+	// Push all queues books for the delivery worker (#2832) and reads its
+	// progress back from the ledger; the worker does the sending.
+	calibreSyncer := calibre.NewSyncer(bookRepo, calibreDeliveryRepo, calibreDeliverer).WithJobs(bgJobs)
+	calibreDeliveryHandler := api.NewCalibreDeliveryHandler(calibreDeliveryRepo, calibreDeliverer, bookRepo,
+		func() calibre.Mode { return api.LoadCalibreMode(appCtx, settingsRepo) }).
+		WithTransport(func() calibre.Transport { return api.LoadCalibreTransport(appCtx, settingsRepo) })
 	calibreSyncHandler := api.NewCalibreSyncHandler(
 		calibreSyncer,
 		func() calibre.Config { return api.LoadCalibreConfig(appCtx, settingsRepo) },
 		func() calibre.Mode { return api.LoadCalibreMode(appCtx, settingsRepo) },
-	)
+	).WithTransport(func() calibre.Transport { return api.LoadCalibreTransport(appCtx, settingsRepo) })
+	// Requester requests: approval adds through authorHandler's add cores.
+	requestHandler := api.NewRequestHandler(db.NewRequestRepo(database), bookRepo, authorRepo, settingsRepo, userRepo, metaAgg, authorHandler).
+		WithNotifier(notif)
 	recHandler := api.NewRecommendationHandler(recRepo, recEngine, authorRepo, bookRepo, sched).
 		WithFinder(seriesRepo, importScanner).
 		WithEditionHydration(editionRepo, metaAgg).
 		WithAppContext(appCtx)
-	imageProxyHandler := api.NewImageProxyHandler(cfg.DataDir)
+	imageProxyHandler := api.NewImageProxyHandler(cfg.DataDir).WithLocalCovers(coverStore)
 	imageProxyHandler.StartEviction(24 * time.Hour)
 	// Proxied cover URLs must carry the path prefix so they resolve under a
 	// subpath deploy (BINDERY_URL_BASE). No-op when URLBase is empty.
@@ -811,17 +882,13 @@ func main() {
 	sched.WithOperatorUserID(authProvider.OperatorUserID)
 
 	r.Route("/api", func(r chi.Router) {
-		r.Use(auth.Middleware(authProvider))
-		r.Use(auth.RequireXRequestedWith)
-		r.Use(auth.RequireCSRFToken(authProvider.SessionSecrets))
+		useAPIAuth(r, authProvider)
 
 		r.Get("/queue", queueHandler.ListArrCompatible)
 	})
 
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Use(auth.Middleware(authProvider))
-		r.Use(auth.RequireXRequestedWith)
-		r.Use(auth.RequireCSRFToken(authProvider.SessionSecrets))
+		useAPIAuth(r, authProvider)
 
 		// System
 		r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -885,16 +952,14 @@ func main() {
 			r.Post("/auth/session-secret/rotate", authHandler.RotateSessionSecret)
 			r.Put("/auth/oidc/providers", oidcHandler.SetProviders)
 			r.Put("/auth/mode", authHandler.SetMode)
-			r.Get("/auth/users", userMgmtHandler.List)
-			r.Post("/auth/users", userMgmtHandler.Create)
-			r.Delete("/auth/users/{id}", userMgmtHandler.Delete)
-			r.Put("/auth/users/{id}/role", userMgmtHandler.SetRole)
-			r.Put("/auth/users/{id}/reset-password", userMgmtHandler.ResetPassword)
 		})
+		registerUserAdminRoutes(r, userMgmtHandler)
 
 		// Metadata search
 		r.Get("/search/author", searchHandler.SearchAuthors)
 		r.Get("/search/book", searchHandler.SearchBooks)
+		// Library search (header typeahead, #2551): local catalogue only.
+		r.Get("/search/library", librarySearchHandler.Search)
 		r.Get("/book/lookup", searchHandler.Lookup)
 
 		// Authors
@@ -911,6 +976,7 @@ func main() {
 		r.Post("/author/{id}/catalogue-reconciliation", authorHandler.ApplyCatalogueReconciliation)
 		r.Get("/author/{id}/relink-upstream/candidates", authorHandler.RelinkCandidates)
 		r.Post("/author/{id}/relink-upstream", authorHandler.RelinkUpstream)
+		r.Get("/author/{id}/duplicate-candidates", authorHandler.DuplicateCandidates)
 		r.Get("/author/{id}/series", authorHandler.ListSeries)
 		r.Get("/author/{id}/aliases", authorAliasHandler.List)
 		r.Delete("/author/{id}/aliases/{aliasID}", authorAliasHandler.Delete)
@@ -950,6 +1016,11 @@ func main() {
 		r.Get("/queue", queueHandler.List)
 		r.Post("/queue/grab", queueHandler.Grab)
 		r.Post("/queue/{id}/retry-import", queueHandler.RetryImport)
+		// Retry the download itself: re-sends the release the row holds to the
+		// download client (#2295). Distinct from retry-import, which re-runs the
+		// import of files that are already on disk.
+		r.Post("/queue/{id}/retry", queueHandler.RetryDownload)
+		r.Post("/queue/bulk-retry", queueHandler.BulkRetry)
 		r.Post("/queue/bulk-delete", queueHandler.BulkDelete)
 		r.Delete("/queue/{id}", queueHandler.Delete)
 
@@ -1044,6 +1115,10 @@ func main() {
 		// Series
 		registerSeriesRoutes(r, seriesHandler)
 
+		// Requests from the requester role, and the admin queue (see
+		// registerRequestRoutes).
+		registerRequestRoutes(r, requestHandler)
+
 		// Recommendations
 		r.Get("/recommendations", recHandler.List)
 		r.Post("/recommendations/{id}/dismiss", recHandler.Dismiss)
@@ -1114,18 +1189,15 @@ func main() {
 		// System logs — admin-only (see registerSystemLogRoutes).
 		registerSystemLogRoutes(r, logHandler)
 
-		// Storage paths (read-only view of the env/config-driven dirs plus
-		// exists/writable/hardlink-able health, #1183). Admin-only: it reveals
-		// server filesystem layout and writability probes.
-		storageHandler := api.NewStorageHandler(cfg)
-		r.Group(func(r chi.Router) {
-			r.Use(auth.RequireAdmin)
-			r.Get("/system/storage", storageHandler.Get)
-		})
+		// Storage paths, admin-only (see registerStorageRoutes).
+		registerStorageRoutes(r, api.NewStorageHandler(cfg))
 
-		// Library
+		// Library. The scan status returns server filesystem paths, so it is
+		// admin only (#2361); see registerLibraryScanStatusRoute.
 		r.Post("/library/scan", libraryHandler.Scan)
-		r.Get("/library/scan/status", libraryHandler.ScanStatus)
+		registerLibraryScanStatusRoute(r, libraryHandler)
+		// Library adoption, admin only (see registerAdoptionRoutes).
+		registerAdoptionRoutes(r, adoptionHandler)
 
 		// Refresh metadata for ALL authors (background job, #863). Per-selection
 		// bulk refresh lives at /author/bulk; this is the "populate everything"
@@ -1140,7 +1212,7 @@ func main() {
 
 		// Calibre integration (probe + library import + bulk push) — all
 		// admin-only. See registerCalibreIntegrationRoutes.
-		registerCalibreIntegrationRoutes(r, calibreHandler, calibreImportHandler, calibreSyncHandler)
+		registerCalibreIntegrationRoutes(r, calibreHandler, calibreImportHandler, calibreSyncHandler, calibreDeliveryHandler)
 
 		// Calibre import run history + rollback (#643). Admin-only — a bad
 		// rollback can delete authors/books wholesale, so the destructive
@@ -1190,6 +1262,17 @@ func main() {
 		r.Get("/book/{id}", opdsHandler.Book)
 		r.Get("/book/{id}/file", opdsHandler.DownloadFile)
 	})
+
+	// Calibre bridge pull routes (#2833): the Calibre plugin connects out to
+	// Bindery and fetches its deliveries. Like /opds it sits at the root,
+	// inside trustedProxyMiddleware and outside the /api/v1 session and CSRF
+	// stack, because its only credential is the plugin API key as a Bearer
+	// token. Its failures count on a limiter of their own, so a plugin with
+	// a stale key cannot lock the admin out of the login form.
+	bridgeWindow := time.Duration(cfg.RateLimitWindowMinutes) * time.Minute
+	bridgeLimiter := auth.NewLoginLimiter(cfg.RateLimitMaxFailures, bridgeWindow)
+	calibreBridgeHandler := api.NewCalibreBridgeHandler(calibreDeliverer, fileHandler, settingsRepo, bridgeLimiter, bridgeWindow, version)
+	registerCalibreBridgeRoutes(r, calibreBridgeHandler)
 
 	// Serve embedded frontend
 	distFS, err := fs.Sub(webui.DistFS, "dist")
@@ -1247,20 +1330,8 @@ func main() {
 	// If BINDERY_URL_BASE is set, mount the entire router under that prefix.
 	// chi.Mount strips the prefix before dispatching so all inner routes and
 	// the SPA handler continue to work unchanged against un-prefixed paths.
-	var handler http.Handler = r
+	handler := mountUnderURLBase(r, cfg.URLBase)
 	if cfg.URLBase != "" {
-		outer := chi.NewRouter()
-		// Redirect bare prefix (no trailing slash) to prefix/ so the SPA
-		// bootstrap and asset resolution work correctly.
-		outer.Get(cfg.URLBase, http.RedirectHandler(cfg.URLBase+"/", http.StatusMovedPermanently).ServeHTTP)
-		// http.StripPrefix actually rewrites r.URL.Path before dispatch, so the
-		// inner router sees un-prefixed paths. chi.Mount only rewrites the
-		// routing-context path and leaves r.URL.Path prefixed, which breaks the
-		// static file handler and http.FileServer — they read r.URL.Path directly
-		// and would look up "<prefix>/assets/…" in the embedded FS, miss, and fall
-		// back to serving index.html (text/html) for every JS/CSS asset.
-		outer.Handle(cfg.URLBase+"/*", http.StripPrefix(cfg.URLBase, r))
-		handler = outer
 		slog.Info("serving under path prefix", "urlBase", cfg.URLBase)
 	}
 
